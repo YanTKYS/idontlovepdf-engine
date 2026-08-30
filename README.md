@@ -81,6 +81,18 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 
 これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。xref stream/object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。
 
+### 実PDF corpusの評価
+
+個人情報を含まないPDFを出力元別のディレクトリに20〜30件集め、次のコマンドで一括評価できます。
+
+```sh
+npm run assess:corpus -- --json --output tmp/assessed fixtures/real-pdf > assessment.json
+```
+
+ファイルまたはディレクトリを複数指定でき、ディレクトリ内の`.pdf`は再帰的に探索します。結果にはファイルごとの`load`（読込）、`extract`（本文run抽出）、`writeback`（既存の符号化済み文字による同一bytesの再書込み）、`save`、`reopen`（保存結果の再読込）とrun数、失敗段階が記録されます。`writebackMode`は現在常に`same-bytes`です。font subsetにない文字を仮定せず、最初のrunを同じbytesで書き戻して保存経路だけを検査するため、`writeback: true`は異なるテキストへの置換成功を意味しません。「日本」から「沖縄」のような別文字への置換は対象文書ごとに別途確認してください。
+
+`--output`を指定すると、保存・再読込に成功したファイルを`元ファイル名.入力パスの短いSHA-256.assessed.pdf`として確認用ディレクトリへ書き出し、結果の`outputFile`に記録します。異なる出力元に同名PDFがあっても衝突せず、入力パスが同じなら安定した名前になります。`readerDisplay`は常に`null`です。出力をAcrobat Reader等の独立したreaderで確認し、評価JSONへ結果を手動で追記してください。元PDFや生成物はライセンス・個人情報を確認したうえで管理し、実文書をこの公開パッケージへ同梱しない方針です。
+
 ## 開発
 
 ```sh
