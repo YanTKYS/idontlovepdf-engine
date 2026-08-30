@@ -43,7 +43,8 @@ const ERROR_CATEGORIES = [
   { pattern: /Malformed PDF (literal string|hex string)/i, label: "content stream解析失敗（文字列トークンが壊れている）" },
   { pattern: /Circular \/(Kids|Prev)/i, label: "PDF構造が循環している（破損の可能性）" },
   { pattern: /Maximum call stack size exceeded/i, label: "構造が深すぎる、または循環している" },
-  { pattern: /saved PDF contains no editable text runs/i, label: "再読込失敗（保存結果から本文runを取り出せない）" }
+  { pattern: /saved PDF contains no editable text runs/i, label: "再読込失敗（保存結果から本文runを取り出せない）" },
+  { pattern: /にまたがる一致のため、置換後の文字数/, label: "複数runにまたがるため現在の方式では置換不可" }
 ];
 
 /**

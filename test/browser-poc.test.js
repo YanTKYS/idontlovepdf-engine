@@ -78,7 +78,8 @@ test("classifies known engine errors into readable causes and keeps the raw mess
     ["reopen: saved PDF contains no editable text runs", "再読込失敗（保存結果から本文runを取り出せない）"],
     ["extract: Malformed PDF literal string", "content stream解析失敗（文字列トークンが壊れている）"],
     ["extract: Circular /Kids chain in the PDF page tree", "PDF構造が循環している（破損の可能性）"],
-    ["extract: Unsupported stream filter: FlateDecode with a /Predictor", "unsupported filter（未対応の圧縮・符号化）"]
+    ["extract: Unsupported stream filter: FlateDecode with a /Predictor", "unsupported filter（未対応の圧縮・符号化）"],
+    ["replace: 複数run（4run）にまたがる一致のため、置換後の文字数（3）が元の一致の文字数（4）と異なる自動置換には対応していません。", "複数runにまたがるため現在の方式では置換不可"]
   ];
   for (const [message, label] of cases) assert.equal(classifyError(message), label);
   assert.equal(classifyError("save: something entirely new"), "その他のエラー（原文を参照）");

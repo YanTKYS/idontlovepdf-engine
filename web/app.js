@@ -1,9 +1,10 @@
 /**
  * ブラウザPoCの画面制御。
  *
- * 判定ロジックは web/poc-core.js、PDF処理は ../src/ の自作モジュールが行う。
- * このファイルはDOM操作とファイル入出力だけを担当する。
- * fetch / XMLHttpRequest / WebSocket は使わない。選択されたPDFは端末外へ出ない。
+ * 判定ロジックは web/poc-core.js、検索・置換モデルは web/text-search.js、
+ * PDF処理は ../src/ の自作モジュールが行う。このファイルはDOM操作とファイル入出力
+ * だけを担当する。fetch / XMLHttpRequest / WebSocket は使わない。
+ * 選択されたPDFは端末外へ出ない（プレビューもBlob URLでこのブラウザ内に閉じる）。
  */
 
 import { PdfTextEditor } from "../src/index.js";
@@ -13,6 +14,7 @@ import {
   assessPdfBytes,
   classifyError,
   describeRun,
+  displayText,
   editedFileName,
   errorDetail,
   failedRecord,
@@ -23,6 +25,7 @@ import {
   summarize,
   toAssessmentJson
 } from "./poc-core.js";
+import { findMatches, matchFeasibility, planReplacement } from "./text-search.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -122,7 +125,31 @@ function setupTabs() {
 
 /* -------------------------------------------------- 機能1・2: 単一PDF検証 */
 
-const single = { name: null, bytes: null, runs: [], selectedId: null };
+const single = { name: null, bytes: null, runs: [], previewUrl: null, debugSelectedId: null };
+const search = { query: "", matches: [], selectedId: null };
+
+/* --------------------------------------------------------- PDFプレビュー */
+
+function showPreview(bytes) {
+  revokePreview();
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+  single.previewUrl = url;
+  const frame = $("pdf-preview");
+  frame.hidden = false;
+  frame.src = url;
+}
+
+function revokePreview() {
+  if (single.previewUrl) {
+    URL.revokeObjectURL(single.previewUrl);
+    single.previewUrl = null;
+  }
+  const frame = $("pdf-preview");
+  frame.hidden = true;
+  frame.removeAttribute("src");
+}
+
+/* ------------------------------------------------------- デバッグ: run一覧 */
 
 function renderRunRow(run) {
   const detail = describeRun(run);
@@ -131,7 +158,7 @@ function renderRunRow(run) {
   const radio = element("input", {
     attributes: { type: "radio", name: "selected-run", value: detail.id, "aria-label": `run ${detail.id} を選択` }
   });
-  radio.addEventListener("change", () => selectRun(detail));
+  radio.addEventListener("change", () => selectDebugRun(detail));
   row.append(element("td", {}, [radio]));
 
   row.append(element("td", { className: "mono", text: detail.id }));
@@ -164,27 +191,157 @@ function renderRunRow(run) {
   return row;
 }
 
-function selectRun(detail) {
-  single.selectedId = detail.id;
-  const target = $("replace-target");
+function selectDebugRun(detail) {
+  single.debugSelectedId = detail.id;
+  const target = $("debug-replace-target");
   clear(target);
   target.append(element("p", { text: `選択中のrun: ${detail.id}（object ${detail.objectNumber} / font ${detail.fontName ?? "なし"}）` }));
   target.append(element("p", { text: `元テキスト: ${detail.display}` }));
   if (!detail.decodable) {
     target.append(element("p", { className: "warn", text: "このrunはUnicodeへ完全に復号できていません。置換結果の確認には特に注意してください。" }));
   }
-  $("replace-input").disabled = false;
-  $("replace-run").disabled = false;
-  // 選択し直したら必ずそのrunの元テキストに戻す。前のrunの文字列が残っていると、
-  // 気づかないまま別のrunをその文字列で置換してしまう。
-  $("replace-input").value = detail.text;
+  $("debug-replace-input").disabled = false;
+  $("debug-replace-run").disabled = false;
+  $("debug-replace-input").value = detail.text;
 }
 
-function resetSingleReplaceUi() {
-  single.selectedId = null;
-  const target = $("replace-target");
+function resetDebugReplaceUi() {
+  single.debugSelectedId = null;
+  const target = $("debug-replace-target");
   clear(target);
   target.append(element("p", { text: "run一覧から1件選択してください。" }));
+  $("debug-replace-input").value = "";
+  $("debug-replace-input").disabled = true;
+  $("debug-replace-run").disabled = true;
+  hide($("debug-replace-error"));
+  hide($("debug-replace-result"));
+}
+
+async function runDebugReplacement() {
+  hide($("debug-replace-error"));
+  hide($("debug-replace-result"));
+  const id = single.debugSelectedId;
+  const replacement = $("debug-replace-input").value;
+  if (!id || !single.bytes) return;
+
+  let output;
+  try {
+    const editor = new PdfTextEditor(single.bytes.slice());
+    await editor.replaceText(id, replacement);
+    output = await editor.save();
+  } catch (error) {
+    const stage = /Unknown text run|ToUnicode|single-byte/.test(messageOf(error)) ? "replace" : "save";
+    showError($("debug-replace-error"), { title: "置換または保存に失敗しました", error, stage });
+    return;
+  }
+
+  try {
+    const reopened = await new PdfTextEditor(output).listTextRuns();
+    if (reopened.length === 0) throw new Error("saved PDF contains no editable text runs");
+  } catch (error) {
+    showError($("debug-replace-error"), { title: "保存後PDFの再読込に失敗しました", error, stage: "reopen" });
+    return;
+  }
+
+  const filename = editedFileName(single.name);
+  try {
+    saveLocally(output, filename);
+  } catch (error) {
+    showError($("debug-replace-error"), { title: "編集済みPDFのローカル保存に失敗しました", error, stage: "save" });
+    return;
+  }
+
+  const result = $("debug-replace-result");
+  clear(result);
+  result.hidden = false;
+  result.append(element("p", { className: "ok-title", text: `○ 成功: ${filename} をローカルへ保存しました。` }));
+  result.append(element("p", { text: `run ${id} を incremental update として追記しました（${output.length.toLocaleString("ja-JP")} バイト）。元のPDFファイルは変更していません。` }));
+  result.append(element("p", { className: "warn", text: "保存できたことと、Acrobat Reader等で意図どおり表示されることは別です。保存したPDFを独立したreaderで必ず確認してください。" }));
+}
+
+/* --------------------------------------------------------------- 検索・置換 */
+
+function matchLabel(match) {
+  return `${displayText(match.context.before)}${displayText(match.text)}${displayText(match.context.after)}`;
+}
+
+function renderSearchResults() {
+  const container = $("search-results");
+  clear(container);
+  const summary = $("search-summary");
+
+  if (single.runs.length === 0) {
+    summary.textContent = "本文runが0件のため検索できません。";
+    return;
+  }
+  if (!search.query) {
+    summary.textContent = "検索文字列を入力してください。";
+    return;
+  }
+  summary.textContent = `検索結果: ${search.matches.length} 件`;
+
+  search.matches.forEach((match, index) => {
+    const feasibility = matchFeasibility(match);
+    const row = element("div", { className: "match-row" });
+    const label = element("label", { attributes: { for: `match-${index}` } });
+
+    const radio = element("input", {
+      attributes: { type: "radio", name: "selected-match", value: match.id, id: `match-${index}` }
+    });
+    radio.addEventListener("change", () => selectMatch(match));
+    label.append(radio);
+
+    const body = element("div", { className: "match-body" });
+    body.append(element("span", { className: `chip chip-${feasibility.level === "ok" ? "ok" : "warn"}`, text: feasibility.label }));
+    body.append(element("span", { className: "match-context", text: `${index + 1}. ${matchLabel(match)}` }));
+    body.append(element("span", {
+      className: "sub mono",
+      text: `run: ${match.runSpan.map((r) => r.runId).join(" → ")}（${match.runSpan.length}run構成）`
+    }));
+    label.append(body);
+    row.append(label);
+    container.append(row);
+  });
+}
+
+function runSearch(query) {
+  search.query = query;
+  search.matches = query ? findMatches(single.runs, query) : [];
+  search.selectedId = null;
+  renderSearchResults();
+  resetMatchReplaceUi();
+}
+
+function selectMatch(match) {
+  search.selectedId = match.id;
+  hide($("replace-error"));
+  hide($("replace-result"));
+
+  const detail = $("match-detail");
+  clear(detail);
+  detail.hidden = false;
+  detail.append(element("p", { text: `選択中の一致: ${displayText(match.text)}` }));
+  detail.append(element("p", {
+    className: "sub mono",
+    text: `run: ${match.runSpan.map((r) => r.runId).join(" → ")}（${match.runSpan.length}run構成）`
+  }));
+  const feasibility = matchFeasibility(match);
+  detail.append(element("p", { text: feasibility.label }));
+  if (!match.singleRun) {
+    detail.append(element("p", {
+      className: "sub",
+      text: "複数runにまたがる一致です。置換後の文字数が元の一致（" + match.text.length + "文字）と完全に同じ場合のみ自動で置換します。異なる場合は「現在のPoCでは置換不可」と表示します。"
+    }));
+  }
+
+  $("replace-input").disabled = false;
+  $("replace-input").value = match.text;
+  $("replace-run").disabled = false;
+}
+
+function resetMatchReplaceUi() {
+  search.selectedId = null;
+  hide($("match-detail"));
   $("replace-input").value = "";
   $("replace-input").disabled = true;
   $("replace-run").disabled = true;
@@ -192,14 +349,77 @@ function resetSingleReplaceUi() {
   hide($("replace-result"));
 }
 
+async function runMatchReplacement() {
+  hide($("replace-error"));
+  hide($("replace-result"));
+  const match = search.matches.find((candidate) => candidate.id === search.selectedId);
+  const replacementText = $("replace-input").value;
+  if (!match || !single.bytes) return;
+
+  const plan = planReplacement(match, replacementText);
+  if (plan.kind === "unsupported") {
+    const detail = plan.reason === "length-mismatch"
+      ? `複数run（${match.runSpan.length}run）にまたがる一致のため、置換後の文字数（${replacementText.length}）が元の一致の文字数（${match.text.length}）と異なる自動置換には対応していません。`
+      : "この一致箇所は現在のPoCでは置換できません。";
+    showError($("replace-error"), { title: "この一致箇所は現在のPoCでは置換不可です", error: detail, stage: "replace" });
+    return;
+  }
+
+  // 置換のたびに元bytesの複製から新しいeditorを作る。元データには一切書き込まない。
+  let output;
+  try {
+    const editor = new PdfTextEditor(single.bytes.slice());
+    for (const update of plan.updates) await editor.replaceText(update.runId, update.newText);
+    output = await editor.save();
+  } catch (error) {
+    const stage = /Unknown text run|ToUnicode|single-byte/.test(messageOf(error)) ? "replace" : "save";
+    showError($("replace-error"), { title: "置換または保存に失敗しました", error, stage });
+    return;
+  }
+
+  // 保存結果を再度読み込めることを確認してからダウンロードする。
+  try {
+    const reopened = await new PdfTextEditor(output).listTextRuns();
+    if (reopened.length === 0) throw new Error("saved PDF contains no editable text runs");
+  } catch (error) {
+    showError($("replace-error"), { title: "保存後PDFの再読込に失敗しました", error, stage: "reopen" });
+    return;
+  }
+
+  const filename = editedFileName(single.name);
+  try {
+    saveLocally(output, filename);
+  } catch (error) {
+    showError($("replace-error"), { title: "編集済みPDFのローカル保存に失敗しました", error, stage: "save" });
+    return;
+  }
+
+  const result = $("replace-result");
+  clear(result);
+  result.hidden = false;
+  result.append(element("p", { className: "ok-title", text: `○ 成功: ${filename} をローカルへ保存しました。` }));
+  result.append(element("p", {
+    text: `${plan.updates.length}件のrunを更新し、保存後PDFの再読込を確認してから incremental update として追記しました（${output.length.toLocaleString("ja-JP")} バイト）。元のPDFファイルは変更していません。`
+  }));
+  result.append(element("p", { className: "warn", text: "保存できたことと、Acrobat Reader等で意図どおり表示されることは別です。保存したPDFを独立したreaderで必ず確認してください。" }));
+}
+
+/* --------------------------------------------------------------- PDF読込 */
+
 async function handleSingleFile(file) {
   single.name = file.name;
   single.bytes = null;
   single.runs = [];
-  resetSingleReplaceUi();
   hide($("single-error"));
   clear($("run-body"));
-  $("run-section").hidden = true;
+  revokePreview();
+  $("editor-grid").hidden = true;
+  $("preview-section").hidden = true;
+  $("search-section").hidden = true;
+  $("search-input").value = "";
+  $("search-input").disabled = true;
+  runSearch("");
+  resetDebugReplaceUi();
 
   const summary = $("single-summary");
   clear(summary);
@@ -213,6 +433,18 @@ async function handleSingleFile(file) {
     hide(summary);
     showError($("single-error"), { title: `${file.name}: ファイルの読み取りに失敗しました`, error, stage: "load" });
     return;
+  }
+
+  // editor-gridとプレビューは、この自作エンジンの解析結果とは独立に、読み取れた
+  // bytesがあれば表示する。エンジンが本文runを抽出できないPDFでも、目視確認の助けになる。
+  $("editor-grid").hidden = false;
+  $("preview-section").hidden = false;
+  try {
+    showPreview(bytes);
+  } catch {
+    // Blob/URL.createObjectURLが使えない環境でも、検索・置換自体は継続できる。
+    // preview-section自体（説明文）は表示したまま、iframeだけ非表示にする。
+    revokePreview();
   }
 
   let editor;
@@ -249,48 +481,16 @@ async function handleSingleFile(file) {
   if (undecodable) status.append(element("span", { className: "warn", text: ` / 復号不可を含むrun: ${undecodable} 件` }));
   summary.append(status);
   if (runs.length === 0) {
-    summary.append(element("p", { className: "warn", text: "本文runが0件です。テキストが画像化されている、または本PoCが解釈できない構造の可能性があります。" }));
+    summary.append(element("p", { className: "warn", text: "本文runが0件です。テキストが画像化されている、または本PoCが解釈できない構造の可能性があります。検索・置換は利用できません。" }));
   }
 
   const body = $("run-body");
   clear(body);
   for (const run of runs) body.append(renderRunRow(run));
-  $("run-section").hidden = runs.length === 0;
-}
 
-async function runReplacement() {
-  hide($("replace-error"));
-  hide($("replace-result"));
-  const id = single.selectedId;
-  const replacement = $("replace-input").value;
-  if (!id || !single.bytes) return;
-
-  // 置換のたびに元bytesの複製から新しいeditorを作る。元データには一切書き込まない。
-  let output;
-  try {
-    const editor = new PdfTextEditor(single.bytes.slice());
-    await editor.replaceText(id, replacement);
-    output = await editor.save();
-  } catch (error) {
-    const stage = /Unknown text run|ToUnicode|single-byte/.test(messageOf(error)) ? "replace" : "save";
-    showError($("replace-error"), { title: "置換または保存に失敗しました", error, stage });
-    return;
-  }
-
-  const filename = editedFileName(single.name);
-  try {
-    saveLocally(output, filename);
-  } catch (error) {
-    showError($("replace-error"), { title: "編集済みPDFのローカル保存に失敗しました", error, stage: "save" });
-    return;
-  }
-
-  const result = $("replace-result");
-  clear(result);
-  result.hidden = false;
-  result.append(element("p", { className: "ok-title", text: `○ 成功: ${filename} をローカルへ保存しました。` }));
-  result.append(element("p", { text: `run ${id} を incremental update として追記しました（${output.length.toLocaleString("ja-JP")} バイト）。元のPDFファイルは変更していません。` }));
-  result.append(element("p", { className: "warn", text: "保存できたことと、Acrobat Reader等で意図どおり表示されることは別です。保存したPDFを独立したreaderで必ず確認してください。" }));
+  $("search-section").hidden = false;
+  $("search-input").disabled = runs.length === 0;
+  runSearch("");
 }
 
 /* -------------------------------------------- 機能3: 複数PDFの一括互換性評価 */
@@ -405,7 +605,8 @@ function clearCorpus() {
 
 function main() {
   setupTabs();
-  resetSingleReplaceUi();
+  resetDebugReplaceUi();
+  resetMatchReplaceUi();
 
   setupDropZone($("single-drop"), $("single-input"), (files) => {
     void handleSingleFile(files[0]);
@@ -414,8 +615,14 @@ function main() {
     void handleCorpusFiles(files);
   }, { multiple: true });
 
+  $("search-input").addEventListener("input", (event) => {
+    runSearch(event.target.value);
+  });
   $("replace-run").addEventListener("click", () => {
-    void runReplacement();
+    void runMatchReplacement();
+  });
+  $("debug-replace-run").addEventListener("click", () => {
+    void runDebugReplacement();
   });
   $("download-json").addEventListener("click", () => {
     const json = toAssessmentJson(corpus.entries.map((entry) => entry.record));
