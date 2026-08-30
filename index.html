@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>idontlovepdf-engine Browser PoC / PDF本文編集エンジン 検証コンソール</title>
+<title>idontlovepdf-test Browser PoC / PDF本文編集エンジン 検証コンソール</title>
 <style>
   :root {
     color-scheme: light;
@@ -129,12 +129,70 @@
     flex: 1 1 22ch;
   }
   label { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; width: 100%; }
+
+  .editor-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: flex-start;
+  }
+  .editor-grid[hidden] { display: none; }
+  /* flexで並べるのは、プレビューと検索パネルがそれぞれ独立に非表示になり得るため
+     （プレビューはbytesが読めれば表示、検索欄は本文runが抽出できて初めて表示）。
+     gridで2列固定にすると、片方だけ非表示のときに空の列が残ってしまう。 */
+  .preview-pane, .search-pane { flex: 1 1 420px; min-width: 0; }
+  .preview-pane[hidden], .search-pane[hidden] { display: none; }
+  .preview-frame-wrap {
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--panel);
+  }
+  #pdf-preview {
+    display: block;
+    width: 100%;
+    height: min(70vh, 640px);
+    min-height: 320px;
+    border: 0;
+    background: #fff;
+  }
+  #pdf-preview[hidden] { display: none; }
+
+  .match-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+  .match-row {
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 8px 10px;
+  }
+  .match-row label {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    cursor: pointer;
+  }
+  .match-row input[type="radio"] { margin-top: 3px; flex: 0 0 auto; }
+  .match-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .match-context { word-break: break-word; }
+  .match-context strong { background: #fff6c9; }
+
+  details.debug {
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 6px 14px 14px;
+    margin: 20px 0;
+    background: var(--panel);
+  }
+  details.debug summary {
+    cursor: pointer;
+    padding: 8px 0;
+    font-weight: 700;
+  }
+  details.debug[open] summary { margin-bottom: 4px; }
 </style>
 </head>
 <body>
 <main>
 
-  <h1>idontlovepdf-engine Browser PoC</h1>
+  <h1>idontlovepdf-test Browser PoC</h1>
   <p class="sub">PDF本文編集エンジン 検証コンソール</p>
 
   <div class="notice">
@@ -161,7 +219,8 @@
 
   <!-- ================================================= 単一PDF検証 -->
   <section id="panel-single" role="tabpanel" aria-labelledby="tab-single">
-    <p>PDFを1件選択すると、<span class="mono">PdfTextEditor</span> を初期化し <span class="mono">listTextRuns()</span> の結果を一覧表示します。続けてrunを1件選び、日本語などへの置換を試せます。</p>
+    <p>PDFを1件選択すると、元PDFをこのブラウザ内でプレビューしながら、文字列を検索して一致箇所を置換できます。PDF内部の
+      run・objectNumber・bytesなどは「詳細・デバッグ情報」に折りたたんであります。</p>
 
     <div class="drop" id="single-drop">
       <p><strong>PDFファイルを1件選択</strong>、またはここへドラッグ＆ドロップ</p>
@@ -172,53 +231,91 @@
     <div class="block" id="single-summary" hidden></div>
     <div class="block error" id="single-error" hidden></div>
 
-    <div id="run-section" hidden>
-      <h2>本文run一覧</h2>
-      <p class="sub">
-        <span class="mono">text</span> はfontの <span class="mono">/ToUnicode</span> CMapによる復号結果です。復号できない箇所は
-        <span class="mono">U+FFFD</span> として表示され、そのrunに「復号不可を含む」と表示します（画面全体は停止しません）。
-        <span class="mono">bytes</span> は既定で先頭12バイトのみを表示し、「詳細」で全体を表示します。
-      </p>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">選択</th>
-              <th scope="col">id</th>
-              <th scope="col">objectNumber</th>
-              <th scope="col">fontName</th>
-              <th scope="col">text</th>
-              <th scope="col">文字数</th>
-              <th scope="col">bytes数</th>
-              <th scope="col">bytes (hex)</th>
-            </tr>
-          </thead>
-          <tbody id="run-body"></tbody>
-        </table>
+    <div class="editor-grid" id="editor-grid" hidden>
+      <div class="preview-pane" id="preview-section" hidden>
+        <h2>元PDFプレビュー</h2>
+        <div class="preview-frame-wrap">
+          <iframe id="pdf-preview" title="元PDFプレビュー" hidden></iframe>
+        </div>
+        <p class="sub">ブラウザ標準のPDF表示です。PDF本体はこのブラウザ内で<span class="mono">Blob URL</span>として表示するだけで、どこにも送信しません。
+          表示できないブラウザ・PDFでも、検索・置換機能自体は引き続き利用できます。プレビューが表示できないことは、
+          本PoCがPDFを解析できないことを意味しません（逆も同様です。読み取れたPDFはエンジンの解析結果に関わらずここに表示を試みます）。</p>
+      </div>
+      <div class="search-pane" id="search-section" hidden>
+        <h2>テキスト検索・置換</h2>
+          <p class="sub">
+            <span class="mono">令和8年度</span> のようにPDF内部で複数run（例: <span class="mono">令</span> / <span class="mono">和</span> /
+            <span class="mono">8</span> / <span class="mono">年度</span>）へ分かれている文字列も、連続した1つの検索単位として一致させます。
+          </p>
+          <div class="actions">
+            <label for="search-input">検索文字列
+              <input id="search-input" type="text" placeholder="検索する文字列" disabled>
+            </label>
+          </div>
+          <p class="sub" id="search-summary"></p>
+          <div class="match-list" id="search-results"></div>
+
+          <div class="block" id="match-detail" hidden></div>
+          <div class="actions">
+            <label for="replace-input">置換後
+              <input id="replace-input" type="text" placeholder="置換後の文字列" disabled>
+            </label>
+          </div>
+          <div class="actions">
+            <button id="replace-run" type="button" disabled>置換してPDFを保存</button>
+          </div>
+          <div class="block error" id="replace-error" hidden></div>
+          <div class="block" id="replace-result" hidden></div>
+          <p class="sub">
+            置換は元PDFのバイト列の複製に対して行い、<span class="mono">replaceText()</span> → <span class="mono">save()</span> →
+            保存結果の再読込確認（reopen）を経て、成功した場合だけ<span class="mono">元ファイル名.edited.pdf</span>としてローカル保存します。
+            <strong>元のPDFファイルは変更しません。</strong>複数runにまたがる一致は、置換後の文字数が元の一致と同じ場合のみ自動対応します。
+            それ以外は「現在のPoCでは置換不可」と表示します。
+          </p>
+        </div>
       </div>
 
-      <h2>日本語置換テスト</h2>
-      <p class="sub">
-        例: 元テキスト <span class="mono">令和8年度</span> → 置換後 <span class="mono">令和9年度</span>。
-        置換は元PDFのバイト列の複製に対して行い、<span class="mono">replaceText()</span> → <span class="mono">save()</span> の結果を
-        <span class="mono">元ファイル名.edited.pdf</span> としてローカル保存します。<strong>元のPDFファイルは変更しません。</strong>
-      </p>
-      <div class="block" id="replace-target"></div>
-      <div class="actions">
-        <label for="replace-input">置換後テキスト
-          <input id="replace-input" type="text" placeholder="置換後の文字列" disabled>
-        </label>
-      </div>
-      <div class="actions">
-        <button id="replace-run" type="button" disabled>置換して編集済PDFを保存</button>
-      </div>
-      <div class="block error" id="replace-error" hidden></div>
-      <div class="block" id="replace-result" hidden></div>
-      <p class="sub">
-        置換にはCMapの逆引きが必要です。CMapに存在しない文字（既存fontにglyphがない文字）を指定すると失敗します。
-        失敗内容はエラー原文つきで表示し、元PDFが変更されていないことも併せて表示します。
-      </p>
-    </div>
+      <details class="debug" id="debug-section">
+        <summary>詳細・デバッグ情報 ▼</summary>
+
+        <h3>本文run一覧</h3>
+        <p class="sub">
+          <span class="mono">text</span> はfontの <span class="mono">/ToUnicode</span> CMapによる復号結果です。復号できない箇所は
+          <span class="mono">U+FFFD</span> として表示され、そのrunに「復号不可を含む」と表示します（画面全体は停止しません）。
+          <span class="mono">bytes</span> は既定で先頭12バイトのみを表示し、「詳細」で全体を表示します。
+          ここでのrun直接選択・置換は検証用で、通常操作には使いません。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">選択</th>
+                <th scope="col">id</th>
+                <th scope="col">objectNumber</th>
+                <th scope="col">fontName</th>
+                <th scope="col">text</th>
+                <th scope="col">文字数</th>
+                <th scope="col">bytes数</th>
+                <th scope="col">bytes (hex)</th>
+              </tr>
+            </thead>
+            <tbody id="run-body"></tbody>
+          </table>
+        </div>
+
+        <h3>runを直接選択して置換（デバッグ用）</h3>
+        <div class="block" id="debug-replace-target"></div>
+        <div class="actions">
+          <label for="debug-replace-input">置換後テキスト
+            <input id="debug-replace-input" type="text" placeholder="置換後の文字列" disabled>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="debug-replace-run" type="button" disabled>置換して編集済PDFを保存</button>
+        </div>
+        <div class="block error" id="debug-replace-error" hidden></div>
+        <div class="block" id="debug-replace-result" hidden></div>
+      </details>
   </section>
 
   <!-- ================================================= 複数PDF評価 -->
@@ -281,6 +378,7 @@
     <li>本文runなし（テキストが画像化されている場合を含む）</li>
     <li>ToUnicodeなし / CMap逆引き失敗（glyph不足の可能性）</li>
     <li>保存失敗 / 再読込失敗</li>
+    <li>複数runにまたがるため現在の方式では置換不可（置換後の文字数が元の一致と異なる場合）</li>
   </ul>
 
   <p class="sub">

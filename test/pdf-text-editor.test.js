@@ -50,6 +50,16 @@ test("lists literal and hexadecimal text-showing operands", async () => {
   ]);
 });
 
+test("numbers each BT ... ET block with its own textObjectId, shared by runs within it", async () => {
+  const editor = new PdfTextEditor(makePdf("BT (First) Tj (block) Tj ET BT (Second block) Tj ET"));
+  const runs = await editor.listTextRuns();
+  assert.deepEqual(runs.map(({ text, textObjectId }) => ({ text, textObjectId })), [
+    { text: "First", textObjectId: 0 },
+    { text: "block", textObjectId: 0 },
+    { text: "Second block", textObjectId: 1 }
+  ]);
+});
+
 test("writes an incremental update and can reopen its result", async () => {
   const editor = new PdfTextEditor(makePdf("BT (Old\\(text\\)) Tj ET"));
   await editor.replaceText("4:0", "New text");

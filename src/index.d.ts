@@ -1,6 +1,8 @@
 export interface PdfTextRun {
   readonly id: string;
   readonly objectNumber: number;
+  /** Index of the enclosing `BT ... ET` block within its content stream, counted from 0. */
+  readonly textObjectId: number;
   readonly fontName: string | null;
   readonly text: string;
   readonly bytes: Uint8Array;

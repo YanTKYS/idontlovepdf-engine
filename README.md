@@ -49,7 +49,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 
 ### `await editor.listTextRuns()`
 
-`{ id, objectNumber, fontName, text, bytes }` の配列を返します。利用中のfontに`/ToUnicode` CMapがあれば`text`をUnicodeへ復号します。CMapがなければ単一バイト表示にフォールバックするため、確実な調査には`bytes`も確認してください。
+`{ id, objectNumber, textObjectId, fontName, text, bytes }` の配列を返します。`textObjectId`は、そのrunが属する`BT ... ET`ブロックを、content stream内での出現順に0から採番したものです。同じ`objectNumber`でも別の`BT ... ET`（PDF上の別位置へ独立して移動して描画されることが多い）なら異なる`textObjectId`になります。利用中のfontに`/ToUnicode` CMapがあれば`text`をUnicodeへ復号します。CMapがなければ単一バイト表示にフォールバックするため、確実な調査には`bytes`も確認してください。
 
 ### `await editor.replaceText(id, replacement)`
 
@@ -85,6 +85,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - `/Kids`が循環したPDFをstack overflowではなく明示的なエラーとして報告すること
 - 新しいxrefセクションの`f`エントリが、古いセクションの`n`エントリを打ち消すこと
 - `bfrange`の変換先配列が範囲より短い場合と、範囲が2バイトcodespaceを超える場合に、例外やハングを起こさないこと
+- 同じcontent stream内に複数の`BT ... ET`ブロックがあっても、各runへ出現順の`textObjectId`（`BT`ごとに0から採番）が正しく振られ、ブロックをまたいでも同じ`textObjectId`のrunは同一ブロック内で連番になること
 
 これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。xref stream/object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。
 
@@ -110,19 +111,36 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 
 | ファイル | 役割 |
 | --- | --- |
-| `index.html` | 検証画面（説明・タブ・表・置換UI） |
+| `index.html` | 検証画面（説明・タブ・プレビュー・検索・置換UI・デバッグ情報） |
 | `web/app.js` | DOM操作とファイル入出力のみ |
 | `web/poc-core.js` | DOM非依存の表示整形とエラー分類。Nodeのテストからも読み込む |
+| `web/text-search.js` | DOM非依存の文字列検索・置換モデル。Nodeのテストからも読み込む |
 | `src/assessment.js` | 評価パイプライン本体。Node版CLIとブラウザPoCで共有する |
 
-### 単一PDF編集テスト
+### 単一PDF検証: PDFプレビュー＋文字列検索・置換
+
+主操作は「runを直接選択して編集」ではなく「文字列を検索し、一致した箇所を置換」です。PDF内部構造（run・objectNumber・bytesなど）は通常操作からは隠し、「詳細・デバッグ情報」を開いたときだけ確認できます。
 
 1. 「単一PDF検証」タブでPDFを1件選ぶ（ドラッグ＆ドロップ可）
-2. `PdfTextEditor`初期化と`listTextRuns()`を実行し、`id` / `objectNumber` / `fontName` / `text` / 文字数 / bytes数 / bytes（hex）を一覧表示
-3. run一覧から1件選び、置換後テキストを入力
-4. `replaceText()` → `save()` を実行し、`元ファイル名.edited.pdf`としてローカル保存
+2. 選択した元PDFを、ブラウザ標準のPDF表示で`<iframe>`にプレビューする（Blob URL、送信なし）
+3. `PdfTextEditor`初期化と`listTextRuns()`を実行し、検索欄を有効化する
+4. 検索文字列を入力すると、一致箇所を一覧表示する（一致件数・前後の文脈・置換可否バッジ・構成run）
+5. 一致を1件選ぶと置換後テキスト欄にその一致テキストが入り、置換後の文字列を編集できる
+6. 「置換してPDFを保存」を押すと、`replaceText()` → `save()` → 保存結果の再読込確認（reopen）の順に検証し、成功した場合だけ`元ファイル名.edited.pdf`としてローカル保存する
 
-`text`はfontの`/ToUnicode` CMapによる復号結果です。復号できないrunがあってもPoC全体は止めず、そのrunに「復号不可を含む」と表示します。bytesは既定で先頭12バイトのみ表示し、「詳細」で全体を表示します。置換は常に元バイト列の複製に対して行うため、**元のPDFファイルは変更されません**。CMapに置換文字がない場合などは、失敗した段階・推定される原因・エラー原文・元PDFが無変更であることを表示します（エラーは握り潰しません）。
+**PDFプレビュー。** 選択したPDFは`Blob`から`URL.createObjectURL()`で作った`blob:` URLを`<iframe>`に読み込むだけで、外部PDF.jsなどは追加していません。新しいPDFを選ぶたびに古いBlob URLは`URL.revokeObjectURL()`で破棄します。プレビューは自作エンジンの解析結果とは独立して、ファイルの読み取りに成功していれば表示を試みます。プレビューが表示できないブラウザ・PDFでも検索・置換機能自体は利用でき、逆に自作エンジンが本文runを抽出できないPDF（xref stream未対応など）でもプレビューは表示を試みます。**プレビュー表示の成否とPDF解析の成否は独立した別の事実です。**
+
+**文字列検索。** PDF内部では、"令和8年度" が `令` / `和` / `8` / `年度` のように複数の`Tj`オペランドへ分かれて格納されていることがあります。検索は`listTextRuns()`の結果を**同じcontent stream（`objectNumber`）由来・同じ`BT ... ET`ブロック（`textObjectId`）由来・かつ出現順が連続しているrun**だけを連結した区間ごとに行うため、①複数runにまたがる文字列を1つの検索語として一致させつつ、②別のcontent streamの末尾と次のstreamの先頭を連結して誤一致することを防ぎ、③**同じcontent stream内でも別の`BT ... ET`（ページ上の別位置へ独立して移動して描画されることが多い）を跨いだ連結**も防ぎます。③は`objectNumber`だけでは区別できないため、`src/content-stream.js`が`BT`ごとに採番する`textObjectId`をrunへ持たせ、検索側もこれを区切りに使っています。一致ごとに、構成するrun ID・run数・前後の文脈を保持し、画面にも表示します。
+
+**置換可否バッジ。** 一致が単一run内に収まる場合は常に「○ 単一run（構造上置換可能）」です（部分一致でもrun全体を「一致前 + 置換後 + 一致後」で書き換える1回の`replaceText()`呼び出しで済みます）。「構造上」と限定しているのは、ToUnicodeなし・CMap逆引き不可・置換文字のglyphなしといった理由で実際の`replaceText()`が失敗することがあり、このバッジは複数run分割ルールの対象外であることしか保証しないためです。複数runにまたがる一致は「△ Nrunに分割されています」と表示し、**置換後の文字列が元の一致と同じ文字数の場合に限り**、元の各runが一致へ提供していた文字数と同じ割合で置換文字列を分割し、runごとに`replaceText()`を呼びます。文字数が異なる場合は、content streamの再構成やレイアウト調整が必要になり本PoCの範囲を超えるため、「この一致箇所は現在のPoCでは置換不可です」（分類ラベル: 複数runにまたがるため現在の方式では置換不可）と表示し、置換を実行しません。CMap逆引きの可否など実際に`replaceText()`を試さないと分からないものは事前判定せず、実行時エラーとして表示します。
+
+**保存前のreopen確認。** 置換後は`save()`の結果を新しい`PdfTextEditor`で読み込み直し、本文runが取得できることを確認してから初めてダウンロードします。再読込に失敗した場合はダウンロードせず「保存後PDFの再読込に失敗しました」と表示します。**自作エンジンで再読込できたことは、Acrobat Reader等で正常表示できることを意味しません。**保存した編集済PDFは独立したreaderで必ず確認してください。
+
+`text`はfontの`/ToUnicode` CMapによる復号結果です。復号できないrunがあってもPoC全体は止めず、「詳細・デバッグ情報」のrun一覧でそのrunに「復号不可を含む」と表示します。置換は常に元バイト列の複製に対して行うため、**元のPDFファイルは変更されません**。失敗時は、失敗した段階・推定される原因・エラー原文・元PDFが無変更であることを表示します（エラーは握り潰しません）。
+
+**詳細・デバッグ情報。** `<details>`内に、従来どおりの本文run一覧（`id` / `objectNumber` / `fontName` / `text` / 文字数 / bytes数 / bytes hex、既定で折りたたみ）と、run一覧から1件を直接選んで置換する検証用UIを残しています。通常操作には使いませんが、検索・置換モデルが内部でどのrunを操作しているかを確認する用途で利用できます。
+
+`web/text-search.js`の自動テスト（`test/text-search.test.js`）では、単一run内の一致、複数runにまたがる一致、一致なし、別content stream境界を跨がないこと、**同じcontent stream内の別`BT ... ET`（`textObjectId`）を跨がないこと**、同じ文字列の複数一致、置換後の文字数一致・不一致による自動対応可否、実際のPDFに対する検索→置換→save→reopenの一連を回帰検証しています。
 
 ### 複数PDF corpus評価
 
@@ -175,4 +193,4 @@ npm test
 npm run check
 ```
 
-`npm run check`は`src/`、`scripts/`に加えてブラウザPoCの`web/`とテストも構文検査します。`web/poc-core.js`はDOMに依存しないため、ブラウザPoCの純粋関数（段階表示、エラー分類、run整形、assessment.json生成、一括評価）は`test/browser-poc.test.js`でNodeから直接検証しています。DOMテスト環境は追加していません。
+`npm run check`は`src/`、`scripts/`に加えてブラウザPoCの`web/`とテストも構文検査します。`web/poc-core.js`と`web/text-search.js`はどちらもDOMに依存しないため、ブラウザPoCの純粋関数（段階表示、エラー分類、run整形、assessment.json生成、一括評価、文字列検索・複数run置換計画）は`test/browser-poc.test.js`と`test/text-search.test.js`でNodeから直接検証しています。DOMテスト環境は追加していません。
