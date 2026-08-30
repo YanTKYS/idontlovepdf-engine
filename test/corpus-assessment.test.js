@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,12 +8,12 @@ import { assessCorpus, assessFile } from "../scripts/assess-corpus.js";
 
 const encode = (value) => new TextEncoder().encode(value);
 
-function minimalPdf() {
+function minimalPdf(text = "Corpus") {
   const objects = [
     "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
     "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
     "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n",
-    "4 0 obj\n<< /Length 18 >>\nstream\nBT (Corpus) Tj ET\nendstream\nendobj\n"
+    `4 0 obj\n<< /Length ${text.length + 12} >>\nstream\nBT (${text}) Tj ET\nendstream\nendobj\n`
   ];
   let source = "%PDF-1.4\n";
   const offsets = [];
@@ -35,10 +35,30 @@ test("assesses load through saved-PDF reopen and reports failures by stage", asy
 
   const success = await assessFile(good);
   assert.deepEqual(
-    [success.load, success.extract, success.replace, success.save, success.reopen, success.runCount, success.error],
-    [true, true, true, true, true, 1, null]
+    [success.load, success.extract, success.writeback, success.writebackMode, success.save, success.reopen, success.runCount, success.error],
+    [true, true, true, "same-bytes", true, true, 1, null]
   );
   const results = await assessCorpus([directory]);
   assert.equal(results.length, 2);
   assert.match(results.find((result) => result.file === bad).error, /^load: Input is not a PDF/);
+});
+
+test("writes same-named source PDFs to distinct stable output paths", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pdf-corpus-collision-"));
+  const word = join(directory, "word");
+  const excel = join(directory, "excel");
+  const output = join(directory, "assessed");
+  await Promise.all([mkdir(word), mkdir(excel)]);
+  await Promise.all([
+    writeFile(join(word, "sample.pdf"), minimalPdf("Word")),
+    writeFile(join(excel, "sample.pdf"), minimalPdf("Excel"))
+  ]);
+
+  const results = await assessCorpus([word, excel], output);
+  assert.equal(results.length, 2);
+  assert.equal(new Set(results.map((result) => result.outputFile)).size, 2);
+  assert.ok(results.every((result) => /sample\.[a-f0-9]{12}\.assessed\.pdf$/.test(result.outputFile)));
+  await Promise.all(results.map((result) => readFile(result.outputFile)));
+  const repeated = await assessCorpus([word, excel], output);
+  assert.deepEqual(repeated.map((result) => result.outputFile), results.map((result) => result.outputFile));
 });

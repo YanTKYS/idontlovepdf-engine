@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +12,8 @@ function failure(file, stage, error, partial = {}) {
     file,
     load: false,
     extract: false,
-    replace: false,
+    writeback: false,
+    writebackMode: "same-bytes",
     save: false,
     reopen: false,
     readerDisplay: null,
@@ -45,14 +47,14 @@ export async function assessFile(path, outputDirectory = null) {
     // assuming that a subset font contains any additional glyphs.
     await editor.replaceText(runs[0].id, runs[0].bytes);
   } catch (error) {
-    return failure(file, "replace", error, { load: true, extract: true, runCount: runs.length });
+    return failure(file, "writeback", error, { load: true, extract: true, runCount: runs.length });
   }
 
   let output;
   try {
     output = await editor.save();
   } catch (error) {
-    return failure(file, "save", error, { load: true, extract: true, replace: true, runCount: runs.length });
+    return failure(file, "save", error, { load: true, extract: true, writeback: true, runCount: runs.length });
   }
 
   try {
@@ -60,14 +62,15 @@ export async function assessFile(path, outputDirectory = null) {
     if (reopenedRuns.length === 0) throw new Error("saved PDF contains no editable text runs");
   } catch (error) {
     return failure(file, "reopen", error, {
-      load: true, extract: true, replace: true, save: true, runCount: runs.length
+      load: true, extract: true, writeback: true, save: true, runCount: runs.length
     });
   }
 
   let outputFile = null;
   if (outputDirectory) {
     await mkdir(outputDirectory, { recursive: true });
-    outputFile = join(resolve(outputDirectory), `${basename(file, extname(file))}.assessed.pdf`);
+    const pathHash = createHash("sha256").update(file).digest("hex").slice(0, 12);
+    outputFile = join(resolve(outputDirectory), `${basename(file, extname(file))}.${pathHash}.assessed.pdf`);
     await writeFile(outputFile, output);
   }
 
@@ -75,7 +78,8 @@ export async function assessFile(path, outputDirectory = null) {
     file,
     load: true,
     extract: true,
-    replace: true,
+    writeback: true,
+    writebackMode: "same-bytes",
     save: true,
     reopen: true,
     readerDisplay: null,
@@ -99,7 +103,7 @@ export async function assessCorpus(paths, outputDirectory = null) {
 }
 
 function summary(results) {
-  const stages = ["load", "extract", "replace", "save", "reopen"];
+  const stages = ["load", "extract", "writeback", "save", "reopen"];
   return Object.fromEntries(stages.map((stage) => [stage, results.filter((result) => result[stage]).length]));
 }
 
@@ -122,8 +126,8 @@ async function main() {
   const results = await assessCorpus(paths, outputDirectory);
   if (json) console.log(JSON.stringify({ total: results.length, summary: summary(results), results }, null, 2));
   else {
-    console.table(results.map(({ file, load, extract, replace, save, reopen, runCount, error }) => ({
-      file, load, extract, replace, save, reopen, runCount, error: error ?? ""
+    console.table(results.map(({ file, load, extract, writeback, writebackMode, save, reopen, runCount, error }) => ({
+      file, load, extract, writeback, writebackMode, save, reopen, runCount, error: error ?? ""
     })));
     console.log({ total: results.length, ...summary(results) });
     console.log("readerDisplay is intentionally manual: open each saved candidate in Acrobat Reader or another independent reader.");
