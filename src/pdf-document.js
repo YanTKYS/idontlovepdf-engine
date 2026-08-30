@@ -47,10 +47,23 @@ function filters(dictionary) {
   return single ? [single] : [];
 }
 
+/**
+ * Flate streams may be predictor-encoded through /DecodeParms. Inflating one and
+ * treating the result as content would silently yield mangled text, so it is
+ * reported as unsupported instead.
+ */
+function hasPredictor(dictionary) {
+  const parameters = dictionary.match(/\/DecodeParms\s*(?:\[[^\]]*?)?<<(.*?)>>/s)?.[1] ?? "";
+  return Number(parameters.match(/\/Predictor\s+(\d+)/)?.[1] ?? 1) > 1;
+}
+
 async function decodeStream(object) {
   const applied = filters(object.dictionary);
   if (applied.length === 0) return object.data;
-  if (applied.length === 1 && applied[0] === "FlateDecode") return inflate(object.data);
+  if (applied.length === 1 && applied[0] === "FlateDecode") {
+    if (hasPredictor(object.dictionary)) throw new Error("Unsupported stream filter: FlateDecode with a /Predictor");
+    return inflate(object.data);
+  }
   throw new Error(`Unsupported stream filter: ${applied.join(", ")}`);
 }
 
@@ -92,7 +105,13 @@ export class PdfTextEditor {
   async listTextRuns() {
     if (!this.streams) {
       this.streams = [];
+      const seen = new Set();
       for (const { object, resources } of this.document.pageContentObjects()) {
+        // One content stream can be shared by several pages, and /Contents may even
+        // list it twice. Run ids are keyed by object number, so scanning it more than
+        // once would hand out duplicate ids and append the object twice on save.
+        if (seen.has(object.number)) continue;
+        seen.add(object.number);
         const decoded = await decodeStream(object);
         const runs = scanTextRuns(decoded);
         if (runs.length) this.streams.push({ object, decoded, runs, fontMaps: await loadFontMaps(resources, this.document) });
@@ -109,8 +128,8 @@ export class PdfTextEditor {
 
   async replaceText(id, replacement) {
     const runs = await this.listTextRuns();
-    if (!runs.some((run) => run.id === id)) throw new Error(`Unknown text run: ${id}`);
     const run = runs.find((candidate) => candidate.id === id);
+    if (!run) throw new Error(`Unknown text run: ${id}`);
     const stream = this.streams.find((candidate) => candidate.object.number === run.objectNumber);
     const mappings = stream.fontMaps.get(run.fontName);
     const bytes = typeof replacement === "string"

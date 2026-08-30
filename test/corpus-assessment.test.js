@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { assessCorpus, assessFile } from "../scripts/assess-corpus.js";
+import { assessCorpus, assessFile, parseArguments } from "../scripts/assess-corpus.js";
 
 const encode = (value) => new TextEncoder().encode(value);
 
@@ -61,4 +61,30 @@ test("writes same-named source PDFs to distinct stable output paths", async () =
   await Promise.all(results.map((result) => readFile(result.outputFile)));
   const repeated = await assessCorpus([word, excel], output);
   assert.deepEqual(repeated.map((result) => result.outputFile), results.map((result) => result.outputFile));
+});
+
+test("parses the CLI arguments without swallowing the first path", () => {
+  // `indexOf("--output")` returns -1 when the option is absent, and the old parser
+  // then dropped the argument at index 0 as if it were that option's value.
+  assert.deepEqual(parseArguments(["corpus"]), { json: false, outputDirectory: null, paths: ["corpus"], error: null });
+  assert.deepEqual(parseArguments(["corpus", "--json"]), { json: true, outputDirectory: null, paths: ["corpus"], error: null });
+  assert.deepEqual(
+    parseArguments(["--output", "out", "word", "excel"]),
+    { json: false, outputDirectory: "out", paths: ["word", "excel"], error: null }
+  );
+  assert.deepEqual(
+    parseArguments(["corpus", "--output", "out", "--json"]),
+    { json: true, outputDirectory: "out", paths: ["corpus"], error: null }
+  );
+  assert.equal(parseArguments(["corpus", "--output"]).error, "--output requires a directory");
+  assert.match(parseArguments([]).error, /^Usage: /);
+  assert.match(parseArguments(["--json"]).error, /^Usage: /);
+});
+
+test("records an unreadable file as a load failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pdf-corpus-missing-"));
+  const result = await assessFile(join(directory, "absent.pdf"));
+  assert.equal(result.load, false);
+  assert.equal(result.outputFile, null);
+  assert.match(result.error, /^load: /);
 });
