@@ -1,5 +1,11 @@
 const latin1 = new TextDecoder("latin1");
 
+/**
+ * A bfrange cannot span more than the 2-byte codespace that ToUnicode CMaps use.
+ * Anything wider is malformed, and expanding it entry by entry would hang the tab.
+ */
+const MAX_RANGE_LENGTH = 0x10000;
+
 function utf16be(hex) {
   const units = [];
   for (let index = 0; index < hex.length; index += 4) units.push(Number.parseInt(hex.slice(index, index + 4), 16));
@@ -22,10 +28,13 @@ export function parseToUnicodeCMap(bytes) {
     for (const match of block[1].matchAll(/<([0-9a-f]+)>\s*<([0-9a-f]+)>\s*(?:<([0-9a-f]+)>|\[([^\]]+)\])/gi)) {
       const start = BigInt(`0x${match[1]}`);
       const end = BigInt(`0x${match[2]}`);
+      if (end < start || end - start >= BigInt(MAX_RANGE_LENGTH)) continue;
       const destinations = match[4] ? [...match[4].matchAll(/<([0-9a-f]+)>/gi)].map((item) => item[1]) : null;
       for (let offset = 0n; start + offset <= end; offset += 1n) {
         const sourceCode = (start + offset).toString(16).padStart(match[1].length, "0");
-        const destination = destinations?.[Number(offset)] ?? incrementHex(match[3], offset);
+        // A destination array shorter than the range leaves the tail unmapped; it must
+        // not fall through to the single-destination form, which is absent here.
+        const destination = destinations ? destinations[Number(offset)] : incrementHex(match[3], offset);
         if (destination) mappings.set(sourceCode, utf16be(destination));
       }
     }

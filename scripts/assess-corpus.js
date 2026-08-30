@@ -5,88 +5,30 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { PdfTextEditor } from "../src/index.js";
+import { STAGES, assessPdfBytes, failedRecord, summarize } from "../src/assessment.js";
 
-function failure(file, stage, error, partial = {}) {
-  return {
-    file,
-    load: false,
-    extract: false,
-    writeback: false,
-    writebackMode: "same-bytes",
-    save: false,
-    reopen: false,
-    readerDisplay: null,
-    runCount: 0,
-    ...partial,
-    error: `${stage}: ${error instanceof Error ? error.message : String(error)}`
-  };
-}
-
+/**
+ * Assesses one PDF and, when an output directory is given, writes the edited result
+ * next to a hash of the source path so that same-named PDFs from different folders
+ * keep distinct, stable output names.
+ */
 export async function assessFile(path, outputDirectory = null) {
   const file = resolve(path);
-  let editor;
+  let bytes;
   try {
-    editor = new PdfTextEditor(await readFile(file));
+    bytes = await readFile(file);
   } catch (error) {
-    return failure(file, "load", error);
+    return { ...failedRecord(file, "load", error), outputFile: null };
   }
 
-  let runs;
-  try {
-    runs = await editor.listTextRuns();
-  } catch (error) {
-    return failure(file, "extract", error, { load: true });
-  }
-  if (runs.length === 0) {
-    return failure(file, "extract", "no editable text-showing operands found", { load: true });
-  }
+  const { record, output } = await assessPdfBytes(file, bytes);
+  if (!output || !outputDirectory) return { ...record, outputFile: null };
 
-  try {
-    // Reusing the original encoded bytes tests the complete replacement path without
-    // assuming that a subset font contains any additional glyphs.
-    await editor.replaceText(runs[0].id, runs[0].bytes);
-  } catch (error) {
-    return failure(file, "writeback", error, { load: true, extract: true, runCount: runs.length });
-  }
-
-  let output;
-  try {
-    output = await editor.save();
-  } catch (error) {
-    return failure(file, "save", error, { load: true, extract: true, writeback: true, runCount: runs.length });
-  }
-
-  try {
-    const reopenedRuns = await new PdfTextEditor(output).listTextRuns();
-    if (reopenedRuns.length === 0) throw new Error("saved PDF contains no editable text runs");
-  } catch (error) {
-    return failure(file, "reopen", error, {
-      load: true, extract: true, writeback: true, save: true, runCount: runs.length
-    });
-  }
-
-  let outputFile = null;
-  if (outputDirectory) {
-    await mkdir(outputDirectory, { recursive: true });
-    const pathHash = createHash("sha256").update(file).digest("hex").slice(0, 12);
-    outputFile = join(resolve(outputDirectory), `${basename(file, extname(file))}.${pathHash}.assessed.pdf`);
-    await writeFile(outputFile, output);
-  }
-
-  return {
-    file,
-    load: true,
-    extract: true,
-    writeback: true,
-    writebackMode: "same-bytes",
-    save: true,
-    reopen: true,
-    readerDisplay: null,
-    outputFile,
-    runCount: runs.length,
-    error: null
-  };
+  await mkdir(outputDirectory, { recursive: true });
+  const pathHash = createHash("sha256").update(file).digest("hex").slice(0, 12);
+  const outputFile = join(resolve(outputDirectory), `${basename(file, extname(file))}.${pathHash}.assessed.pdf`);
+  await writeFile(outputFile, output);
+  return { ...record, outputFile };
 }
 
 async function pdfFiles(path) {
@@ -99,37 +41,55 @@ async function pdfFiles(path) {
 
 export async function assessCorpus(paths, outputDirectory = null) {
   const files = [...new Set((await Promise.all(paths.map(pdfFiles))).flat())].sort();
-  return Promise.all(files.map((file) => assessFile(file, outputDirectory)));
+  // Sequential on purpose: a corpus can be large, and each file holds its original
+  // bytes, the inflated streams and the edited result in memory while it is assessed.
+  const results = [];
+  for (const file of files) results.push(await assessFile(file, outputDirectory));
+  return results;
 }
 
-function summary(results) {
-  const stages = ["load", "extract", "writeback", "save", "reopen"];
-  return Object.fromEntries(stages.map((stage) => [stage, results.filter((result) => result[stage]).length]));
+/**
+ * Splits `[--json] [--output DIR] <path>...`. The option indices are collected first
+ * so that an absent `--output` cannot make `indexOf` return -1 and silently consume
+ * the argument at index 0 as if it were the option's value.
+ */
+export function parseArguments(args) {
+  const consumed = new Set();
+  let json = false;
+  let outputDirectory = null;
+  for (const [index, argument] of args.entries()) {
+    if (consumed.has(index)) continue;
+    if (argument === "--json") {
+      json = true;
+      consumed.add(index);
+    } else if (argument === "--output") {
+      outputDirectory = args[index + 1] ?? null;
+      consumed.add(index);
+      if (outputDirectory !== null) consumed.add(index + 1);
+    }
+  }
+  const paths = args.filter((argument, index) => !consumed.has(index));
+  const error = args.includes("--output") && !outputDirectory
+    ? "--output requires a directory"
+    : (paths.length === 0 ? "Usage: npm run assess:corpus -- [--json] [--output DIR] <PDF-or-directory> [...]" : null);
+  return { json, outputDirectory, paths, error };
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  const json = args.includes("--json");
-  const outputIndex = args.indexOf("--output");
-  const outputDirectory = outputIndex < 0 ? null : args[outputIndex + 1];
-  if (outputIndex >= 0 && !outputDirectory) {
-    console.error("--output requires a directory");
-    process.exitCode = 2;
-    return;
-  }
-  const paths = args.filter((argument, index) => argument !== "--json" && index !== outputIndex && index !== outputIndex + 1);
-  if (paths.length === 0) {
-    console.error("Usage: npm run assess:corpus -- [--json] [--output DIR] <PDF-or-directory> [...]");
+  const { json, outputDirectory, paths, error } = parseArguments(process.argv.slice(2));
+  if (error) {
+    console.error(error);
     process.exitCode = 2;
     return;
   }
   const results = await assessCorpus(paths, outputDirectory);
-  if (json) console.log(JSON.stringify({ total: results.length, summary: summary(results), results }, null, 2));
+  if (json) console.log(JSON.stringify({ total: results.length, summary: summarize(results), results }, null, 2));
   else {
-    console.table(results.map(({ file, load, extract, writeback, writebackMode, save, reopen, runCount, error }) => ({
-      file, load, extract, writeback, writebackMode, save, reopen, runCount, error: error ?? ""
+    console.table(results.map(({ file, load, extract, writeback, writebackMode, save, reopen, runCount, error: reason }) => ({
+      file, load, extract, writeback, writebackMode, save, reopen, runCount, error: reason ?? ""
     })));
-    console.log({ total: results.length, ...summary(results) });
+    console.log({ total: results.length, ...summarize(results) });
+    console.log(`stages: ${STAGES.join(" -> ")}`);
     console.log("readerDisplay is intentionally manual: open each saved candidate in Acrobat Reader or another independent reader.");
   }
   if (results.length === 0) process.exitCode = 2;

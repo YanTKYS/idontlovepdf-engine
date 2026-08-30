@@ -15,6 +15,8 @@ import {
   describeRun,
   editedFileName,
   errorDetail,
+  failedRecord,
+  messageOf,
   stageFromError,
   stageStatuses,
   statusText,
@@ -51,10 +53,6 @@ function saveLocally(bytes, filename, type = "application/pdf") {
 
 async function readBytes(file) {
   return new Uint8Array(await file.arrayBuffer());
-}
-
-function messageOf(error) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /** 失敗内容を、原文・分類・「元PDFは無変更」の順で表示する。 */
@@ -97,6 +95,8 @@ function setupDropZone(zone, input, onFiles, { multiple = false } = {}) {
   });
   input.addEventListener("change", () => {
     const files = [...input.files];
+    // 同じファイルを続けて選ぶと change が発火しないため、毎回選択状態を捨てる。
+    input.value = "";
     if (files.length) onFiles(multiple ? files : files.slice(0, 1));
   });
 }
@@ -175,7 +175,9 @@ function selectRun(detail) {
   }
   $("replace-input").disabled = false;
   $("replace-run").disabled = false;
-  if (!$("replace-input").value) $("replace-input").value = detail.text;
+  // 選択し直したら必ずそのrunの元テキストに戻す。前のrunの文字列が残っていると、
+  // 気づかないまま別のrunをその文字列で置換してしまう。
+  $("replace-input").value = detail.text;
 }
 
 function resetSingleReplaceUi() {
@@ -242,7 +244,7 @@ async function handleSingleFile(file) {
   ]));
   const status = element("p", { className: "status-line" });
   status.append(element("span", { text: "load: " }), statusChip(true));
-  status.append(element("span", { text: " extract: " }), statusChip(true));
+  status.append(element("span", { text: " extract: " }), statusChip(runs.length > 0));
   status.append(element("span", { text: ` 本文run: ${runs.length} 件` }));
   if (undecodable) status.append(element("span", { className: "warn", text: ` / 復号不可を含むrun: ${undecodable} 件` }));
   summary.append(status);
@@ -293,7 +295,7 @@ async function runReplacement() {
 
 /* -------------------------------------------- 機能3: 複数PDFの一括互換性評価 */
 
-const corpus = { entries: [] };
+const corpus = { entries: [], running: false };
 
 function assessmentRow(entry) {
   const { record, output } = entry;
@@ -350,34 +352,17 @@ async function handleCorpusFiles(files) {
   progress.hidden = false;
   $("assess-section").hidden = false;
 
-  for (const [index, file] of files.entries()) {
-    progress.textContent = `評価中 ${index + 1} / ${files.length}: ${file.name}`;
-    let entry;
-    try {
-      entry = await assessPdfBytes(file.name, await readBytes(file));
-    } catch (error) {
-      // 想定外の例外もPoCを止めず、load失敗として記録する。
-      entry = {
-        record: {
-          file: file.name,
-          load: false,
-          extract: false,
-          writeback: false,
-          writebackMode: WRITEBACK_MODE,
-          save: false,
-          reopen: false,
-          readerDisplay: null,
-          runCount: 0,
-          error: `load: ${messageOf(error)}`
-        },
-        output: null
-      };
-    }
-    corpus.entries.push(entry);
-    body.append(assessmentRow(entry));
-    renderCorpusSummary();
-    // 大量選択時に画面が固まらないよう1件ごとに描画へ制御を返す。
-    await new Promise((resolve) => setTimeout(resolve, 0));
+  // 評価中の追加投入は結果とprogress表示が混ざるため受け付けない。
+  if (corpus.running) {
+    progress.textContent = `評価中のため ${files.length} 件は追加しませんでした。完了後にもう一度選択してください。`;
+    return;
+  }
+  corpus.running = true;
+  $("clear-corpus").disabled = true;
+  try {
+    await assessSequentially(files, body, progress);
+  } finally {
+    corpus.running = false;
   }
 
   progress.textContent = `評価完了: ${corpus.entries.length} 件（今回 ${files.length} 件を追加）`;
@@ -385,7 +370,26 @@ async function handleCorpusFiles(files) {
   $("clear-corpus").disabled = corpus.entries.length === 0;
 }
 
+/** 1件ずつ評価し、行を追記する。1件ごとに描画へ制御を返して画面が固まらないようにする。 */
+async function assessSequentially(files, body, progress) {
+  for (const [index, file] of files.entries()) {
+    progress.textContent = `評価中 ${index + 1} / ${files.length}: ${file.name}`;
+    let entry;
+    try {
+      entry = await assessPdfBytes(file.name, await readBytes(file));
+    } catch (error) {
+      // ファイル読み取り自体の失敗など想定外の例外もPoCを止めず、load失敗として記録する。
+      entry = { record: failedRecord(file.name, "load", error), output: null };
+    }
+    corpus.entries.push(entry);
+    body.append(assessmentRow(entry));
+    renderCorpusSummary();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
 function clearCorpus() {
+  if (corpus.running) return;
   corpus.entries = [];
   clear($("assess-body"));
   hide($("multi-summary"));

@@ -6,13 +6,11 @@
  * ネットワークアクセス（fetch / XMLHttpRequest / WebSocket）は一切行わない。
  */
 
-import { PdfTextEditor } from "../src/index.js";
+// 評価パイプライン（load/extract/writeback/save/reopen）は Node版 CLI と共有する。
+// この画面固有なのは「どう見せるか」だけ。
+import { STAGES, WRITEBACK_MODE, assessPdfBytes, failedRecord, messageOf, summarize } from "../src/assessment.js";
 
-/** 一括評価のwriteback方式。Node版 scripts/assess-corpus.js と同じ意味。 */
-export const WRITEBACK_MODE = "same-bytes";
-
-/** 評価段階。表示順もこの順に揃える。 */
-export const STAGES = ["load", "extract", "writeback", "save", "reopen"];
+export { STAGES, WRITEBACK_MODE, assessPdfBytes, failedRecord, messageOf, summarize };
 
 /** assessment.json に必ず含める項目。 */
 export const ASSESSMENT_FIELDS = [
@@ -42,6 +40,9 @@ const ERROR_CATEGORIES = [
   { pattern: /must contain \/Root and \/Size|has no \/Pages reference/i, label: "PDF構造が想定外（Root/Pagesをたどれない）" },
   { pattern: /length does not end at endstream|has no valid \/Length/i, label: "stream長の解析失敗" },
   { pattern: /Unknown text run/i, label: "run IDが存在しない" },
+  { pattern: /Malformed PDF (literal string|hex string)/i, label: "content stream解析失敗（文字列トークンが壊れている）" },
+  { pattern: /Circular \/(Kids|Prev)/i, label: "PDF構造が循環している（破損の可能性）" },
+  { pattern: /Maximum call stack size exceeded/i, label: "構造が深すぎる、または循環している" },
   { pattern: /saved PDF contains no editable text runs/i, label: "再読込失敗（保存結果から本文runを取り出せない）" }
 ];
 
@@ -125,103 +126,9 @@ export function describeRun(run) {
     byteCount: run.bytes?.length ?? 0,
     hexPreview: formatHex(run.bytes, 12),
     hexFull: formatHex(run.bytes),
-    decodable: text.length > 0 && !text.includes("�")
+    // 空のPDF文字列 `()` は「復号できなかった」ではなく本当に空。U+FFFD の有無だけで判定する。
+    decodable: !text.includes("�")
   };
-}
-
-function failure(file, stage, error, partial = {}) {
-  return {
-    file,
-    load: false,
-    extract: false,
-    writeback: false,
-    writebackMode: WRITEBACK_MODE,
-    save: false,
-    reopen: false,
-    readerDisplay: null,
-    runCount: 0,
-    ...partial,
-    error: `${stage}: ${error instanceof Error ? error.message : String(error)}`
-  };
-}
-
-/**
- * 1件のPDFについて load / extract / writeback / save / reopen を評価する。
- * Node版 assessFile と同じ段階・同じwriteback方式（最初のrunへ元と同じbytesを書き戻す）。
- *
- * 戻り値の `output` は保存に成功した編集済みPDF。assessment.jsonには含めない。
- */
-export async function assessPdfBytes(file, bytes) {
-  let editor;
-  try {
-    editor = new PdfTextEditor(bytes);
-  } catch (error) {
-    return { record: failure(file, "load", error), output: null };
-  }
-
-  let runs;
-  try {
-    runs = await editor.listTextRuns();
-  } catch (error) {
-    return { record: failure(file, "extract", error, { load: true }), output: null };
-  }
-  if (runs.length === 0) {
-    return { record: failure(file, "extract", "no editable text-showing operands found", { load: true }), output: null };
-  }
-
-  try {
-    // 元の符号化済みbytesを書き戻すことで、subset fontに追加のglyphがあると仮定せずに
-    // 置換から保存までの経路だけを検査する。別文字への置換成功は意味しない。
-    await editor.replaceText(runs[0].id, runs[0].bytes);
-  } catch (error) {
-    return {
-      record: failure(file, "writeback", error, { load: true, extract: true, runCount: runs.length }),
-      output: null
-    };
-  }
-
-  let output;
-  try {
-    output = await editor.save();
-  } catch (error) {
-    return {
-      record: failure(file, "save", error, { load: true, extract: true, writeback: true, runCount: runs.length }),
-      output: null
-    };
-  }
-
-  try {
-    const reopened = await new PdfTextEditor(output).listTextRuns();
-    if (reopened.length === 0) throw new Error("saved PDF contains no editable text runs");
-  } catch (error) {
-    return {
-      record: failure(file, "reopen", error, {
-        load: true, extract: true, writeback: true, save: true, runCount: runs.length
-      }),
-      output: null
-    };
-  }
-
-  return {
-    record: {
-      file,
-      load: true,
-      extract: true,
-      writeback: true,
-      writebackMode: WRITEBACK_MODE,
-      save: true,
-      reopen: true,
-      readerDisplay: null,
-      runCount: runs.length,
-      error: null
-    },
-    output
-  };
-}
-
-/** 段階ごとの成功件数。Node版 summary と同じ形。 */
-export function summarize(records) {
-  return Object.fromEntries(STAGES.map((stage) => [stage, records.filter((record) => record[stage]).length]));
 }
 
 /** assessment.json 本文を作る。readerDisplay は常に null（人間が別途確認する）。 */

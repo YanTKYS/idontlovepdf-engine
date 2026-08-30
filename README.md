@@ -66,7 +66,9 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 ## 制約と次の段階
 
 - ページ上の座標、フォント名、文字サイズはまだ公開していません。
-- `/ASCII85Decode`、画像化された文字、暗号化PDF、xref stream、object streamは未対応です。
+- `/ASCII85Decode`、画像化された文字、暗号化PDF、xref stream、object streamは未対応です。`/FlateDecode`に`/DecodeParms`の`/Predictor`が付く場合も、誤った本文を出さないよう未対応として報告します。
+- inline image（`BI ... ID ... EI`）の画像データは本文走査から除外します。画像そのものは編集対象外です。
+- 1ページの`/Contents`が複数streamに分かれている場合、各streamを独立に走査します。`BT`〜`ET`がstream境界をまたぐと、そのrunは列挙されません。
 - 置換後の文字幅に応じた再レイアウトはしません。元と近い幅のテキスト置換が主用途です。
 - CMapは`bfchar`と`bfrange`の基本形に対応しますが、複雑なCMap継承やfont内glyphの存在確認は未対応です。
 - 製品相当には、operator の graphics/text state を追跡し、座標ベースの選択、フォント subset の再生成、行組みを追加する必要があります。
@@ -78,6 +80,11 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - content stream内に`endobj stream endstream`が文字として現れてもxrefと`/Length`で正しく解析できること
 - `BT ... ET`を含む非ページstreamを本文として列挙しないこと
 - Type 0 fontの`/ToUnicode` CMapで日本語を復号し、別の日本語へ置換して再読込みできること
+- inline imageの画像データを本文として読まず、その前後のrunを正しく列挙できること
+- 複数ページが同じcontent streamを共有していても、runを重複させずincremental updateへ1回だけ追記すること
+- `/Kids`が循環したPDFをstack overflowではなく明示的なエラーとして報告すること
+- 新しいxrefセクションの`f`エントリが、古いセクションの`n`エントリを打ち消すこと
+- `bfrange`の変換先配列が範囲より短い場合と、範囲が2バイトcodespaceを超える場合に、例外やハングを起こさないこと
 
 これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。xref stream/object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。
 
@@ -105,7 +112,8 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 | --- | --- |
 | `index.html` | 検証画面（説明・タブ・表・置換UI） |
 | `web/app.js` | DOM操作とファイル入出力のみ |
-| `web/poc-core.js` | DOM非依存の判定・整形・一括評価。Nodeのテストからも読み込む |
+| `web/poc-core.js` | DOM非依存の表示整形とエラー分類。Nodeのテストからも読み込む |
+| `src/assessment.js` | 評価パイプライン本体。Node版CLIとブラウザPoCで共有する |
 
 ### 単一PDF編集テスト
 

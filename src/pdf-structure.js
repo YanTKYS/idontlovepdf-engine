@@ -1,19 +1,6 @@
+import { skipWhite as skipSpace } from "./syntax.js";
+
 const latin1 = new TextDecoder("latin1");
-
-function isWhite(byte) {
-  return byte === 0 || byte === 9 || byte === 10 || byte === 12 || byte === 13 || byte === 32;
-}
-
-function skipSpace(bytes, position) {
-  let cursor = position;
-  while (cursor < bytes.length) {
-    if (isWhite(bytes[cursor])) cursor += 1;
-    else if (bytes[cursor] === 0x25) {
-      while (cursor < bytes.length && bytes[cursor] !== 10 && bytes[cursor] !== 13) cursor += 1;
-    } else break;
-  }
-  return cursor;
-}
 
 function readInteger(bytes, position) {
   const start = skipSpace(bytes, position);
@@ -114,10 +101,11 @@ function parseXrefSection(bytes, offset) {
       const line = latin1.decode(bytes.subarray(cursor, lineEnd));
       const match = line.match(/^(\d{10})\s+(\d{5})\s+([nf])/);
       if (!match) throw new Error(`Malformed xref entry for object ${first.value + index}`);
-      if (match[3] === "n") entries.push({
+      entries.push({
         number: first.value + index,
         generation: Number(match[2]),
-        offset: Number(match[1])
+        offset: Number(match[1]),
+        free: match[3] === "f"
       });
       cursor = lineEnd;
     }
@@ -126,15 +114,24 @@ function parseXrefSection(bytes, offset) {
 
 function collectXref(bytes) {
   const entries = new Map();
+  // Sections are walked newest first, so the first entry seen for an object wins —
+  // including a free one, which deletes the object instead of exposing the stale
+  // offset that an older section still carries for it.
+  const decided = new Set();
   const visited = new Set();
-  let offset = findLastStartXref(bytes);
+  const startXref = findLastStartXref(bytes);
+  let offset = startXref;
   let latestTrailer;
   while (offset || !visited.size) {
     if (visited.has(offset)) throw new Error("Circular /Prev chain in PDF trailer");
     visited.add(offset);
     const section = parseXrefSection(bytes, offset);
     latestTrailer ??= section.trailer;
-    for (const entry of section.entries) if (!entries.has(entry.number)) entries.set(entry.number, entry);
+    for (const entry of section.entries) {
+      if (decided.has(entry.number)) continue;
+      decided.add(entry.number);
+      if (!entry.free) entries.set(entry.number, entry);
+    }
     offset = directInteger(section.trailer, "Prev");
     if (!offset) break;
   }
@@ -142,7 +139,7 @@ function collectXref(bytes) {
   const size = directInteger(latestTrailer, "Size");
   if (!root || !size) throw new Error("PDF trailer must contain /Root and /Size");
   if (/\/Encrypt\b/.test(latestTrailer)) throw new Error("Encrypted PDFs are not supported");
-  return { entries, root, size, previousXref: findLastStartXref(bytes) };
+  return { entries, root, size, previousXref: startXref };
 }
 
 function extractDictionary(bytes, position) {
@@ -216,7 +213,15 @@ export class PdfStructure {
     const pagesReference = reference(catalog.dictionary, "Pages");
     if (!pagesReference) throw new Error("PDF catalog has no /Pages reference");
     const result = [];
+    const ancestors = new Set();
+    const visited = new Set();
     const visit = (pageReference, inheritedResources = null) => {
+      if (ancestors.has(pageReference.number)) throw new Error("Circular /Kids chain in the PDF page tree");
+      // A node reachable by more than one path is walked once; without this a page
+      // tree that repeats a node would report its content streams several times.
+      if (visited.has(pageReference.number)) return;
+      visited.add(pageReference.number);
+      ancestors.add(pageReference.number);
       const page = this.object(pageReference);
       const resourcesReference = reference(page.dictionary, "Resources");
       const resources = resourcesReference
@@ -230,6 +235,7 @@ export class PdfStructure {
           resources: resources ?? { dictionary: page.dictionary }
         });
       }
+      ancestors.delete(pageReference.number);
     };
     visit(pagesReference);
     return result;

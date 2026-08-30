@@ -75,7 +75,10 @@ test("classifies known engine errors into readable causes and keeps the raw mess
     ["extract: PDF object 12 is missing from the xref table", "object stream未対応の可能性（xrefに実体がない）"],
     ["extract: no editable text-showing operands found", "本文runなし"],
     ["writeback: The existing PDF font has no ToUnicode code for \"沖\"", "CMap逆引き失敗（既存fontにその文字のglyphがない可能性）"],
-    ["reopen: saved PDF contains no editable text runs", "再読込失敗（保存結果から本文runを取り出せない）"]
+    ["reopen: saved PDF contains no editable text runs", "再読込失敗（保存結果から本文runを取り出せない）"],
+    ["extract: Malformed PDF literal string", "content stream解析失敗（文字列トークンが壊れている）"],
+    ["extract: Circular /Kids chain in the PDF page tree", "PDF構造が循環している（破損の可能性）"],
+    ["extract: Unsupported stream filter: FlateDecode with a /Predictor", "unsupported filter（未対応の圧縮・符号化）"]
   ];
   for (const [message, label] of cases) assert.equal(classifyError(message), label);
   assert.equal(classifyError("save: something entirely new"), "その他のエラー（原文を参照）");
@@ -112,7 +115,11 @@ test("summarises run bytes and marks runs that did not decode", () => {
 
   const control = describeRun({ id: "4:2", objectNumber: 4, fontName: "F1", text: "ab", bytes: Uint8Array.of(97, 1, 98) });
   assert.equal(control.display, "a·b");
-  assert.equal(describeRun({ id: "4:3", objectNumber: 4, fontName: "F1", text: "", bytes: Uint8Array.of() }).display, "(空文字列)");
+
+  // An empty PDF string `()` really is empty; it did not fail to decode.
+  const empty = describeRun({ id: "4:3", objectNumber: 4, fontName: "F1", text: "", bytes: Uint8Array.of() });
+  assert.equal(empty.display, "(空文字列)");
+  assert.equal(empty.decodable, true);
 });
 
 test("builds assessment.json with the required fields and manual readerDisplay", async () => {

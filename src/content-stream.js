@@ -1,20 +1,6 @@
-const whitespace = new Set([0, 9, 10, 12, 13, 32]);
+import { isRegular, isWhite, skipWhite } from "./syntax.js";
 
-function isWhite(byte) {
-  return whitespace.has(byte);
-}
-
-function skipWhite(bytes, start) {
-  let cursor = start;
-  while (cursor < bytes.length) {
-    if (isWhite(bytes[cursor])) {
-      cursor += 1;
-    } else if (bytes[cursor] === 0x25) {
-      while (cursor < bytes.length && bytes[cursor] !== 10 && bytes[cursor] !== 13) cursor += 1;
-    } else break;
-  }
-  return cursor;
-}
+const latin1 = new TextDecoder("latin1");
 
 function readLiteral(bytes, start) {
   let depth = 1;
@@ -24,7 +10,7 @@ function readLiteral(bytes, start) {
     const byte = bytes[cursor++];
     if (byte === 0x5c) {
       if (cursor >= bytes.length) break;
-      let escaped = bytes[cursor++];
+      const escaped = bytes[cursor++];
       const simple = { 0x6e: 10, 0x72: 13, 0x74: 9, 0x62: 8, 0x66: 12 };
       if (simple[escaped] !== undefined) value.push(simple[escaped]);
       else if (escaped === 10) continue;
@@ -81,6 +67,36 @@ function encodeHex(value) {
   return new TextEncoder().encode(`<${[...value].map((byte) => byte.toString(16).padStart(2, "0")).join("")}>`);
 }
 
+/**
+ * Skips an inline image (`BI … ID <binary> EI`). The binary data between `ID` and
+ * `EI` is not PDF syntax: left to the tokenizer its bytes are read as literal
+ * strings, which both invents text runs that do not exist and aborts the whole
+ * scan when the image happens to contain an unbalanced `(`.
+ *
+ * `start` is the offset just past the `BI` operator; the returned offset is just
+ * past the closing `EI`, or the end of the stream when the image is truncated.
+ */
+function skipInlineImage(bytes, start) {
+  let cursor = start;
+  while (cursor < bytes.length) {
+    const isIdOperator = bytes[cursor] === 0x49 && bytes[cursor + 1] === 0x44
+      && !isRegular(bytes[cursor - 1]) && !isRegular(bytes[cursor + 2]);
+    if (isIdOperator) break;
+    cursor += 1;
+  }
+  if (cursor >= bytes.length) return bytes.length;
+  cursor += 2;
+  // Exactly one whitespace byte separates ID from the image data.
+  if (isWhite(bytes[cursor])) cursor += 1;
+  while (cursor < bytes.length) {
+    const isEiOperator = bytes[cursor] === 0x45 && bytes[cursor + 1] === 0x49
+      && isWhite(bytes[cursor - 1]) && !isRegular(bytes[cursor + 2]);
+    if (isEiOperator) return cursor + 2;
+    cursor += 1;
+  }
+  return bytes.length;
+}
+
 export function scanTextRuns(bytes) {
   const strings = [];
   const runs = [];
@@ -105,18 +121,22 @@ export function scanTextRuns(bytes) {
     }
     if (bytes[cursor] === 0x2f) {
       const start = ++cursor;
-      while (cursor < bytes.length && !isWhite(bytes[cursor]) && !"()<>[]{}/%".includes(String.fromCharCode(bytes[cursor]))) cursor += 1;
-      lastName = new TextDecoder("latin1").decode(bytes.subarray(start, cursor));
+      while (isRegular(bytes[cursor])) cursor += 1;
+      lastName = latin1.decode(bytes.subarray(start, cursor));
       continue;
     }
     const start = cursor;
-    while (cursor < bytes.length && !isWhite(bytes[cursor]) && !"()<>[]{}/%".includes(String.fromCharCode(bytes[cursor]))) cursor += 1;
+    while (isRegular(bytes[cursor])) cursor += 1;
     if (cursor === start) {
       cursor += 1;
       continue;
     }
-    const operator = new TextDecoder("latin1").decode(bytes.subarray(start, cursor));
-    if (operator === "BT") {
+    const operator = latin1.decode(bytes.subarray(start, cursor));
+    if (operator === "BI") {
+      cursor = skipInlineImage(bytes, cursor);
+      strings.length = 0;
+      lastName = null;
+    } else if (operator === "BT") {
       inText = true;
       currentFont = null;
       strings.length = 0;
