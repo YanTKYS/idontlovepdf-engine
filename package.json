@@ -1,0 +1,22 @@
+{
+  "name": "@idontlovepdf/local-text-editor",
+  "version": "0.1.0",
+  "description": "Offline, browser-native prototype for replacing text in existing PDF content streams",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": ["src", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/pdf-document.js && node --check src/content-stream.js"
+  },
+  "keywords": ["pdf", "offline", "browser", "text-editing"],
+  "license": "MIT",
+  "engines": { "node": ">=18" }
+}
