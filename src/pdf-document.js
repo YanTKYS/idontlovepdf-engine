@@ -1,4 +1,6 @@
 import { replaceTextRuns, scanTextRuns } from "./content-stream.js";
+import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
+import { PdfStructure, reference } from "./pdf-structure.js";
 
 const encoder = new TextEncoder();
 const latin1 = new TextDecoder("latin1");
@@ -38,43 +40,6 @@ function concat(chunks) {
   return result;
 }
 
-function parseDocument(bytes) {
-  const source = latin1.decode(bytes);
-  if (!source.startsWith("%PDF-")) throw new Error("Input is not a PDF document");
-  const objectsByNumber = new Map();
-  const pattern = /(?:^|[\r\n])(\d+)\s+(\d+)\s+obj\b/g;
-  for (let match; (match = pattern.exec(source));) {
-    const bodyStart = pattern.lastIndex;
-    const end = source.indexOf("endobj", bodyStart);
-    if (end < 0) throw new Error(`PDF object ${match[1]} is not terminated`);
-    const streamKeyword = source.indexOf("stream", bodyStart);
-    if (streamKeyword < 0 || streamKeyword > end) continue;
-    let streamStart = streamKeyword + 6;
-    if (source[streamStart] === "\r" && source[streamStart + 1] === "\n") streamStart += 2;
-    else if (source[streamStart] === "\r" || source[streamStart] === "\n") streamStart += 1;
-    const streamEnd = source.lastIndexOf("endstream", end);
-    if (streamEnd < streamStart) continue;
-    let dataEnd = streamEnd;
-    if (source[dataEnd - 1] === "\n") dataEnd -= 1;
-    if (source[dataEnd - 1] === "\r") dataEnd -= 1;
-    objectsByNumber.set(Number(match[1]), {
-      number: Number(match[1]), generation: Number(match[2]),
-      dictionary: source.slice(bodyStart, streamKeyword).trim(),
-      data: bytes.slice(streamStart, dataEnd)
-    });
-  }
-  const starts = [...source.matchAll(/startxref\s+(\d+)\s+%%EOF/g)];
-  if (!starts.length) throw new Error("PDF startxref was not found");
-  const trailers = [...source.matchAll(/trailer\s*<<(.*?)>>/gs)];
-  if (!trailers.length) throw new Error("Cross-reference streams are not supported by this prototype");
-  const trailer = trailers.at(-1)[1];
-  const root = trailer.match(/\/Root\s+(\d+\s+\d+\s+R)/)?.[1];
-  const size = Number(trailer.match(/\/Size\s+(\d+)/)?.[1]);
-  if (!root || !size) throw new Error("PDF trailer must contain /Root and /Size");
-  if (/\/Encrypt\b/.test(trailer)) throw new Error("Encrypted PDFs are not supported");
-  return { objects: [...objectsByNumber.values()], root, size, previousXref: Number(starts.at(-1)[1]) };
-}
-
 function filters(dictionary) {
   const array = dictionary.match(/\/Filter\s*\[(.*?)\]/s)?.[1];
   if (array) return [...array.matchAll(/\/([A-Za-z0-9]+)/g)].map((match) => match[1]);
@@ -90,17 +55,36 @@ async function decodeStream(object) {
 }
 
 function replacementDictionary(dictionary, length) {
-  if (/\/Length\s+\d+\s+\d+\s+R/.test(dictionary)) {
-    throw new Error("Indirect stream /Length values are not supported");
-  }
+  if (/\/Length\s+\d+\s+\d+\s+R/.test(dictionary)) return dictionary.replace(/\/Length\s+\d+\s+\d+\s+R/, `/Length ${length}`);
   if (/\/Length\s+\d+/.test(dictionary)) return dictionary.replace(/\/Length\s+\d+/, `/Length ${length}`);
   return dictionary.replace(/>>\s*$/, `/Length ${length} >>`);
+}
+
+function fontReferences(resources, structure) {
+  const indirect = reference(resources.dictionary, "Font");
+  const fontDictionary = indirect ? structure.object(indirect).dictionary : resources.dictionary.match(/\/Font\s*<<(.*?)>>/s)?.[1] ?? "";
+  return new Map([...fontDictionary.matchAll(/\/([^\s/<>{}\[\]()]+)\s+(\d+)\s+(\d+)\s+R/g)].map((match) => [
+    match[1], { number: Number(match[2]), generation: Number(match[3]) }
+  ]));
+}
+
+async function loadFontMaps(resources, structure) {
+  const result = new Map();
+  for (const [name, fontReference] of fontReferences(resources, structure)) {
+    const font = structure.object(fontReference);
+    const toUnicode = reference(font.dictionary, "ToUnicode");
+    if (!toUnicode) continue;
+    const cmapObject = structure.object(toUnicode);
+    result.set(name, parseToUnicodeCMap(await decodeStream(cmapObject)));
+  }
+  return result;
 }
 
 export class PdfTextEditor {
   constructor(input) {
     this.bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-    this.document = parseDocument(this.bytes);
+    if (latin1.decode(this.bytes.subarray(0, 5)) !== "%PDF-") throw new Error("Input is not a PDF document");
+    this.document = new PdfStructure(this.bytes);
     this.streams = null;
     this.pending = new Map();
   }
@@ -108,16 +92,17 @@ export class PdfTextEditor {
   async listTextRuns() {
     if (!this.streams) {
       this.streams = [];
-      for (const object of this.document.objects) {
+      for (const { object, resources } of this.document.pageContentObjects()) {
         const decoded = await decodeStream(object);
         const runs = scanTextRuns(decoded);
-        if (runs.length) this.streams.push({ object, decoded, runs });
+        if (runs.length) this.streams.push({ object, decoded, runs, fontMaps: await loadFontMaps(resources, this.document) });
       }
     }
     return this.streams.flatMap((stream) => stream.runs.map((run, runIndex) => ({
       id: `${stream.object.number}:${runIndex}`,
       objectNumber: stream.object.number,
-      text: latin1.decode(run.value),
+      text: decodeWithCMap(run.value, stream.fontMaps.get(run.fontName)),
+      fontName: run.fontName,
       bytes: run.value.slice()
     })));
   }
@@ -125,7 +110,12 @@ export class PdfTextEditor {
   async replaceText(id, replacement) {
     const runs = await this.listTextRuns();
     if (!runs.some((run) => run.id === id)) throw new Error(`Unknown text run: ${id}`);
-    const bytes = typeof replacement === "string" ? encodeSingleByte(replacement) : replacement;
+    const run = runs.find((candidate) => candidate.id === id);
+    const stream = this.streams.find((candidate) => candidate.object.number === run.objectNumber);
+    const mappings = stream.fontMaps.get(run.fontName);
+    const bytes = typeof replacement === "string"
+      ? (mappings ? encodeWithCMap(replacement, mappings) : encodeSingleByte(replacement))
+      : replacement;
     this.pending.set(id, Uint8Array.from(bytes));
     return this;
   }
@@ -161,7 +151,7 @@ export class PdfTextEditor {
       chunks.push(encoder.encode(`${entry.number} 1\n${String(entry.offset).padStart(10, "0")} ${String(entry.generation).padStart(5, "0")} n \n`));
     }
     chunks.push(encoder.encode(
-      `trailer\n<< /Size ${this.document.size} /Root ${this.document.root} /Prev ${this.document.previousXref} >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+      `trailer\n<< /Size ${this.document.size} /Root ${this.document.root.number} ${this.document.root.generation} R /Prev ${this.document.previousXref} >>\nstartxref\n${xrefOffset}\n%%EOF\n`
     ));
     return concat(chunks);
   }

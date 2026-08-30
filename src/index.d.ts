@@ -1,6 +1,7 @@
 export interface PdfTextRun {
   readonly id: string;
   readonly objectNumber: number;
+  readonly fontName: string | null;
   readonly text: string;
   readonly bytes: Uint8Array;
 }

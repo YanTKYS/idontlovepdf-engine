@@ -86,6 +86,8 @@ export function scanTextRuns(bytes) {
   const runs = [];
   let cursor = 0;
   let inText = false;
+  let currentFont = null;
+  let lastName = null;
   while (cursor < bytes.length) {
     cursor = skipWhite(bytes, cursor);
     if (cursor >= bytes.length) break;
@@ -101,6 +103,12 @@ export function scanTextRuns(bytes) {
       cursor = token.end;
       continue;
     }
+    if (bytes[cursor] === 0x2f) {
+      const start = ++cursor;
+      while (cursor < bytes.length && !isWhite(bytes[cursor]) && !"()<>[]{}/%".includes(String.fromCharCode(bytes[cursor]))) cursor += 1;
+      lastName = new TextDecoder("latin1").decode(bytes.subarray(start, cursor));
+      continue;
+    }
     const start = cursor;
     while (cursor < bytes.length && !isWhite(bytes[cursor]) && !"()<>[]{}/%".includes(String.fromCharCode(bytes[cursor]))) cursor += 1;
     if (cursor === start) {
@@ -110,14 +118,21 @@ export function scanTextRuns(bytes) {
     const operator = new TextDecoder("latin1").decode(bytes.subarray(start, cursor));
     if (operator === "BT") {
       inText = true;
+      currentFont = null;
       strings.length = 0;
     } else if (operator === "ET") {
       inText = false;
       strings.length = 0;
-    } else if (inText && (operator === "Tj" || operator === "'" || operator === "\"" || operator === "TJ")) {
-      for (const string of strings) runs.push(string);
+    } else if (inText && operator === "Tf") {
+      currentFont = lastName;
       strings.length = 0;
-    } else if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(operator)) strings.length = 0;
+    } else if (inText && (operator === "Tj" || operator === "'" || operator === "\"" || operator === "TJ")) {
+      for (const string of strings) runs.push({ ...string, fontName: currentFont });
+      strings.length = 0;
+    } else if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(operator)) {
+      strings.length = 0;
+      lastName = null;
+    }
   }
   return runs;
 }
