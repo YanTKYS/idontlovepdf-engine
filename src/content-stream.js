@@ -104,6 +104,11 @@ export function scanTextRuns(bytes) {
   let inText = false;
   let currentFont = null;
   let lastName = null;
+  // Two `BT ... ET` blocks in the same content stream are usually positioned
+  // independently (a new `Td`/`Tm` moves the text cursor elsewhere on the page), so
+  // their runs must never be treated as adjacent text. Each `BT` gets its own id;
+  // callers that concatenate runs into searchable text must also split on it.
+  let textObjectId = -1;
   while (cursor < bytes.length) {
     cursor = skipWhite(bytes, cursor);
     if (cursor >= bytes.length) break;
@@ -139,6 +144,7 @@ export function scanTextRuns(bytes) {
     } else if (operator === "BT") {
       inText = true;
       currentFont = null;
+      textObjectId += 1;
       strings.length = 0;
     } else if (operator === "ET") {
       inText = false;
@@ -147,7 +153,7 @@ export function scanTextRuns(bytes) {
       currentFont = lastName;
       strings.length = 0;
     } else if (inText && (operator === "Tj" || operator === "'" || operator === "\"" || operator === "TJ")) {
-      for (const string of strings) runs.push({ ...string, fontName: currentFont });
+      for (const string of strings) runs.push({ ...string, fontName: currentFont, textObjectId });
       strings.length = 0;
     } else if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(operator)) {
       strings.length = 0;

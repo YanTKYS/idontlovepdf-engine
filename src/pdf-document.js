@@ -120,6 +120,7 @@ export class PdfTextEditor {
     return this.streams.flatMap((stream) => stream.runs.map((run, runIndex) => ({
       id: `${stream.object.number}:${runIndex}`,
       objectNumber: stream.object.number,
+      textObjectId: run.textObjectId,
       text: decodeWithCMap(run.value, stream.fontMaps.get(run.fontName)),
       fontName: run.fontName,
       bytes: run.value.slice()

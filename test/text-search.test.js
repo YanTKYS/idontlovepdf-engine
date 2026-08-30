@@ -4,7 +4,9 @@ import test from "node:test";
 import { findMatches, matchFeasibility, planReplacement } from "../web/text-search.js";
 import { PdfTextEditor } from "../src/index.js";
 
-const run = (id, objectNumber, text, fontName = null) => ({ id, objectNumber, fontName, text, bytes: Uint8Array.of() });
+const run = (id, objectNumber, text, { fontName = null, textObjectId = 0 } = {}) => (
+  { id, objectNumber, textObjectId, fontName, text, bytes: Uint8Array.of() }
+);
 
 test("finds a match fully contained in a single run", () => {
   const runs = [run("4:0", 4, "令和8年度")];
@@ -51,6 +53,21 @@ test("does not match across a content stream boundary", () => {
   assert.equal(findMatches(runs, "8年度").length, 1);
 });
 
+test("does not match across a BT...ET boundary within the same content stream", () => {
+  // Two separate text objects in the same content stream are usually positioned
+  // independently on the page (a fresh Td/Tm moves the cursor), so concatenating
+  // "令和8" from one BT...ET and "年度" from a later, unrelated one must not produce
+  // a false match for "令和8年度" — even though both runs share objectNumber 28.
+  const runs = [
+    run("28:0", 28, "令和8", { textObjectId: 0 }),
+    run("28:1", 28, "年度", { textObjectId: 1 })
+  ];
+  assert.deepEqual(findMatches(runs, "令和8年度"), []);
+  // Each text object is still searchable on its own.
+  assert.equal(findMatches(runs, "令和8").length, 1);
+  assert.equal(findMatches(runs, "年度").length, 1);
+});
+
 test("finds every occurrence of a repeated string", () => {
   const runs = [run("4:0", 4, "令和8年度、令和8年度、令和8年度")];
   const matches = findMatches(runs, "令和8年度");
@@ -67,7 +84,7 @@ test("builds readable context around a match", () => {
 
 test("marks a single-run match as unconditionally replaceable and a multi-run match as conditional", () => {
   const single = findMatches([run("4:0", 4, "令和8年度")], "令和8年度")[0];
-  assert.deepEqual(matchFeasibility(single), { level: "ok", label: "○ 置換可能" });
+  assert.deepEqual(matchFeasibility(single), { level: "ok", label: "○ 単一run（構造上置換可能）" });
 
   const multi = findMatches([run("28:0", 28, "令"), run("28:1", 28, "和")], "令和")[0];
   assert.equal(matchFeasibility(multi).level, "conditional");
@@ -152,6 +169,22 @@ test("finds and replaces a query split across several runs, then reopens the sav
   // The runs outside the match must be untouched.
   assert.equal(reopenedRuns[0].text, "Before");
   assert.equal(reopenedRuns.at(-1).text, "After");
+});
+
+test("does not match across two independently positioned BT...ET blocks in a real PDF", async () => {
+  // "Housing address" is drawn near the top of the page and "John Smith" lower down,
+  // via two separate text objects sharing one content stream. Without textObjectId,
+  // buildSegments() concatenated them into "Housing addressJohn Smith", so a search
+  // for text spanning the join (e.g. "address John") matched two unrelated PDF
+  // locations. Regression for that: see PR review on web/text-search.js.
+  const content = "BT /F1 12 Tf 72 700 Td (Housing address) Tj ET\nBT /F1 12 Tf 72 100 Td (John Smith) Tj ET";
+  const editor = new PdfTextEditor(buildSingleStreamPdf(content));
+  const runs = await editor.listTextRuns();
+
+  assert.deepEqual(runs.map((r) => r.textObjectId), [0, 1]);
+  assert.deepEqual(findMatches(runs, "address John"), []);
+  assert.equal(findMatches(runs, "Housing address").length, 1);
+  assert.equal(findMatches(runs, "John Smith").length, 1);
 });
 
 test("rejects a multi-run replacement whose length does not match, without touching the PDF", async () => {

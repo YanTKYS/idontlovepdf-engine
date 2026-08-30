@@ -13,18 +13,24 @@ const CONTEXT_RADIUS = 12;
 /**
  * runを検索対象の「区間」へ束ねる。
  *
- * 同じcontent stream（`objectNumber`）由来で、かつ出現順が連続しているrunだけを
- * 連結する。`listTextRuns()` は content stream ごとにrunをまとめてから並べて返すため
- * （オブジェクト番号ごとに1回だけ走査する）、同じ`objectNumber`のrunは既に連続してお
- * り、`objectNumber`が変わった時点で区切れば「別streamの末尾と次streamの先頭」が連結
- * されることはない。
+ * 同じcontent stream（`objectNumber`）由来で、かつ同じ`BT ... ET`（`textObjectId`）
+ * 由来で、出現順が連続しているrunだけを連結する。`objectNumber`だけで区切ると、同じ
+ * content stream内で別の位置へ移動して開始した別の`BT ... ET`（例: ページ上部の
+ * "令和8" とページ下部の "年度" が同じstreamに収まっている場合）まで1本の文字列として
+ * 連結してしまい、PDF上では無関係な箇所同士が誤って一致してしまう。`textObjectId`は
+ * `BT`が現れるたびに採番される（`src/content-stream.js`）ため、これも区切りに使うこと
+ * で、別の`BT ... ET`ブロックを跨いだ連結を防ぐ。
+ *
+ * `listTextRuns()` は content stream ごとにrunをまとめてから並べて返すため（オブジェ
+ * クト番号ごとに1回だけ走査する）、同じ`objectNumber`・同じ`textObjectId`のrunは既に
+ * 連続しており、いずれかが変わった時点で区切れば境界を跨いだ誤連結は起きない。
  */
 function buildSegments(runs) {
   const segments = [];
   let current = null;
   for (const run of runs) {
-    if (!current || current.objectNumber !== run.objectNumber) {
-      current = { objectNumber: run.objectNumber, text: "", runOffsets: [] };
+    if (!current || current.objectNumber !== run.objectNumber || current.textObjectId !== run.textObjectId) {
+      current = { objectNumber: run.objectNumber, textObjectId: run.textObjectId, text: "", runOffsets: [] };
       segments.push(current);
     }
     const start = current.text.length;
@@ -74,8 +80,11 @@ export function findMatches(runs, query) {
       const end = index + query.length;
       const runSpan = runSpanFor(segment, index, end);
       matches.push({
-        id: `${segment.objectNumber}:${index}`,
+        // A content stream can hold several segments (one per BT ... ET block), so
+        // objectNumber alone no longer identifies a segment; textObjectId disambiguates.
+        id: `${segment.objectNumber}:${segment.textObjectId}:${index}`,
         objectNumber: segment.objectNumber,
+        textObjectId: segment.textObjectId,
         text: segment.text.slice(index, end),
         start: index,
         end,
@@ -95,7 +104,10 @@ export function findMatches(runs, query) {
  * （その場合は実行時エラーとして表示する）。
  */
 export function matchFeasibility(match) {
-  if (match.singleRun) return { level: "ok", label: "○ 置換可能" };
+  // "構造上" is deliberate: a single run can still fail at replaceText() time (no
+  // ToUnicode, no reverse CMap entry, a glyph missing from the existing font). This
+  // badge only reports that the match doesn't need the multi-run splitting rule below.
+  if (match.singleRun) return { level: "ok", label: "○ 単一run（構造上置換可能）" };
   return {
     level: "conditional",
     label: `△ ${match.runSpan.length}runに分割されています（置換後の文字数が元の一致と同じ場合のみ自動対応）`
