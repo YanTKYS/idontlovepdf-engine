@@ -373,7 +373,7 @@
   <h2>判別できる主な失敗理由</h2>
   <p class="sub">エラーは分類ラベルと原文の両方を表示します。次のような原因を区別できます。</p>
   <ul class="sub">
-    <li>xref stream未対応 / object stream未対応の可能性</li>
+    <li>xref stream解析失敗（破損した/W・/Index・stream長など） / object stream未対応（xref streamのtype 2 entry）</li>
     <li>暗号化PDF / unsupported filter（未対応の圧縮・符号化）</li>
     <li>本文runなし（テキストが画像化されている場合を含む）</li>
     <li>ToUnicodeなし / CMap逆引き失敗（glyph不足の可能性）</li>

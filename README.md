@@ -10,6 +10,7 @@
 - literal string と hexadecimal string、および `TJ` 配列に対応
 - 無圧縮および `/FlateDecode` content stream に対応
 - classic xrefとstreamの `/Length`からオブジェクト境界を解析（本文中の`endobj`等を境界と誤認しない）
+- PDF 1.5以降の**cross-reference stream**（`/Type /XRef`）に対応。classic xrefとの`/Prev`混在も可
 - Catalog → Pages → Page → Contentsをたどり、ページ本文以外のstreamを除外
 - 既存フォントの`/ToUnicode` CMap（`bfchar`・`bfrange`）によるUnicode復号と再エンコード
 - 元ファイルを壊さず、PDF incremental update として変更を追記
@@ -45,7 +46,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 
 ### `new PdfTextEditor(input)`
 
-`ArrayBuffer` または `Uint8Array` の PDF を読み込みます。暗号化 PDF と xref stream のみで構成された PDF は、この試作では対象外です。
+`ArrayBuffer` または `Uint8Array` の PDF を読み込みます。classic xref table・cross-reference stream・両者が`/Prev`で混在する構成のいずれにも対応します。暗号化PDFは対象外です。xref解析自体はFlateDecodeの展開を含み非同期になり得るため、コンストラクタは同期のまま、実際の解析は最初の`listTextRuns()`（内部的には`replaceText()`・`save()`も経由）呼び出し時に遅延して行われます。
 
 ### `await editor.listTextRuns()`
 
@@ -66,7 +67,8 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 ## 制約と次の段階
 
 - ページ上の座標、フォント名、文字サイズはまだ公開していません。
-- `/ASCII85Decode`、画像化された文字、暗号化PDF、xref stream、object streamは未対応です。`/FlateDecode`に`/DecodeParms`の`/Predictor`が付く場合も、誤った本文を出さないよう未対応として報告します。
+- `/ASCII85Decode`、画像化された文字、暗号化PDFは未対応です。`/FlateDecode`に`/DecodeParms`の`/Predictor`が付く場合も、誤った本文を出さないよう未対応として報告します。
+- cross-reference streamのtype 2 entry（object stream内のobject）は、xref解析自体は失敗させず内部的に保持しますが、そのobjectへ実際にアクセスした時点で「Object streams are not supported」という明確なエラーになります。object stream（`/ObjStm`）そのものの実装はまだ行っていません。Catalog / Pages / Contentsなど今回必要なobjectがtype 1（通常のindirect object）であれば処理を継続できます。
 - inline image（`BI ... ID ... EI`）の画像データは本文走査から除外します。画像そのものは編集対象外です。
 - 1ページの`/Contents`が複数streamに分かれている場合、各streamを独立に走査します。`BT`〜`ET`がstream境界をまたぐと、そのrunは列挙されません。
 - 置換後の文字幅に応じた再レイアウトはしません。元と近い幅のテキスト置換が主用途です。
@@ -86,8 +88,15 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - 新しいxrefセクションの`f`エントリが、古いセクションの`n`エントリを打ち消すこと
 - `bfrange`の変換先配列が範囲より短い場合と、範囲が2バイトcodespaceを超える場合に、例外やハングを起こさないこと
 - 同じcontent stream内に複数の`BT ... ET`ブロックがあっても、各runへ出現順の`textObjectId`（`BT`ごとに0から採番）が正しく振られ、ブロックをまたいでも同じ`textObjectId`のrunは同一ブロック内で連番になること
+- cross-reference streamからtype 1 objectを取得し、Catalog → Pages → Page → Contentsをたどって本文runを取得できること（無圧縮・`/FlateDecode`圧縮の両方）
+- `/Index`省略時に`[0 /Size]`として解析されること、および部分的・非連続なobject番号範囲を指定する`/Index`を正しく解析できること
+- 新しいxref streamのtype 0（free）entryが、古いclassic xref sectionのobjectを無効化すること
+- classic xrefとcross-reference streamが`/Prev`で混在していても、最新版のobjectを正しくたどれること（`save()`が生成するincremental updateは常にclassic xrefのため、xref stream由来のPDFを保存・再読込みするたびにこの経路を通ります）
+- type 2 entry（object stream内のobject）が存在してもxref解析全体は失敗させず、そのobjectへ実際にアクセスした場合にのみ明確なエラーになること
+- 不正な`/W`・奇数個の`/Index`・`/W`と`/Index`が示す長さに合わないstreamで、ハングや過大なメモリ確保をせず例外になること
+- cross-reference stream由来のPDFで`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること
 
-これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。xref stream/object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。
+これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。
 
 ### 実PDF corpusの評価
 
@@ -116,6 +125,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 | `web/poc-core.js` | DOM非依存の表示整形とエラー分類。Nodeのテストからも読み込む |
 | `web/text-search.js` | DOM非依存の文字列検索・置換モデル。Nodeのテストからも読み込む |
 | `src/assessment.js` | 評価パイプライン本体。Node版CLIとブラウザPoCで共有する |
+| `src/flate.js` | `/FlateDecode`の展開・`/Filter`解釈。content stream・CMap stream・cross-reference streamで共有する |
 
 ### 単一PDF検証: PDFプレビュー＋文字列検索・置換
 
@@ -128,7 +138,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 5. 一致を1件選ぶと置換後テキスト欄にその一致テキストが入り、置換後の文字列を編集できる
 6. 「置換してPDFを保存」を押すと、`replaceText()` → `save()` → 保存結果の再読込確認（reopen）の順に検証し、成功した場合だけ`元ファイル名.edited.pdf`としてローカル保存する
 
-**PDFプレビュー。** 選択したPDFは`Blob`から`URL.createObjectURL()`で作った`blob:` URLを`<iframe>`に読み込むだけで、外部PDF.jsなどは追加していません。新しいPDFを選ぶたびに古いBlob URLは`URL.revokeObjectURL()`で破棄します。プレビューは自作エンジンの解析結果とは独立して、ファイルの読み取りに成功していれば表示を試みます。プレビューが表示できないブラウザ・PDFでも検索・置換機能自体は利用でき、逆に自作エンジンが本文runを抽出できないPDF（xref stream未対応など）でもプレビューは表示を試みます。**プレビュー表示の成否とPDF解析の成否は独立した別の事実です。**
+**PDFプレビュー。** 選択したPDFは`Blob`から`URL.createObjectURL()`で作った`blob:` URLを`<iframe>`に読み込むだけで、外部PDF.jsなどは追加していません。新しいPDFを選ぶたびに古いBlob URLは`URL.revokeObjectURL()`で破棄します。プレビューは自作エンジンの解析結果とは独立して、ファイルの読み取りに成功していれば表示を試みます。プレビューが表示できないブラウザ・PDFでも検索・置換機能自体は利用でき、逆に自作エンジンが本文runを抽出できないPDF（暗号化PDF、object streamにしか実体がないPDFなど）でもプレビューは表示を試みます。**プレビュー表示の成否とPDF解析の成否は独立した別の事実です。**
 
 **文字列検索。** PDF内部では、"令和8年度" が `令` / `和` / `8` / `年度` のように複数の`Tj`オペランドへ分かれて格納されていることがあります。検索は`listTextRuns()`の結果を**同じcontent stream（`objectNumber`）由来・同じ`BT ... ET`ブロック（`textObjectId`）由来・かつ出現順が連続しているrun**だけを連結した区間ごとに行うため、①複数runにまたがる文字列を1つの検索語として一致させつつ、②別のcontent streamの末尾と次のstreamの先頭を連結して誤一致することを防ぎ、③**同じcontent stream内でも別の`BT ... ET`（ページ上の別位置へ独立して移動して描画されることが多い）を跨いだ連結**も防ぎます。③は`objectNumber`だけでは区別できないため、`src/content-stream.js`が`BT`ごとに採番する`textObjectId`をrunへ持たせ、検索側もこれを区切りに使っています。一致ごとに、構成するrun ID・run数・前後の文脈を保持し、画面にも表示します。
 
@@ -171,7 +181,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 
 `readerDisplay`はブラウザPoCでも自動判定せず、常に`null`です。**保存できたことと、意図どおり表示されることは別です。**保存した編集済PDFをAcrobat Reader等の独立したPDF readerで開いて確認し、結果は人間がJSONへ追記してください。
 
-失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream未対応、object stream未対応の可能性、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
+失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream解析失敗（破損した`/W`・`/Index`・stream長など）、object stream未対応（xref streamのtype 2 entry）、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
 
 このPoCの成功は、**一般的なPDFすべてへの対応を保証しません。**失敗するPDFがあることを前提に、出力元ごとの傾向を確かめるための画面です。
 

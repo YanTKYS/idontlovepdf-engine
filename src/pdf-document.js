@@ -1,5 +1,6 @@
 import { replaceTextRuns, scanTextRuns } from "./content-stream.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
+import { deflate, decodeStreamBytes, filters } from "./flate.js";
 import { PdfStructure, reference } from "./pdf-structure.js";
 
 const encoder = new TextEncoder();
@@ -15,21 +16,6 @@ function encodeSingleByte(text) {
   return bytes;
 }
 
-async function transformWithStream(bytes, format, StreamClass) {
-  const stream = new Blob([bytes]).stream().pipeThrough(new StreamClass(format));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-async function inflate(bytes) {
-  if (typeof DecompressionStream === "undefined") throw new Error("FlateDecode requires the browser DecompressionStream API");
-  return transformWithStream(bytes, "deflate", DecompressionStream);
-}
-
-async function deflate(bytes) {
-  if (typeof CompressionStream === "undefined") throw new Error("FlateDecode requires the browser CompressionStream API");
-  return transformWithStream(bytes, "deflate", CompressionStream);
-}
-
 function concat(chunks) {
   const result = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0));
   let offset = 0;
@@ -40,31 +26,8 @@ function concat(chunks) {
   return result;
 }
 
-function filters(dictionary) {
-  const array = dictionary.match(/\/Filter\s*\[(.*?)\]/s)?.[1];
-  if (array) return [...array.matchAll(/\/([A-Za-z0-9]+)/g)].map((match) => match[1]);
-  const single = dictionary.match(/\/Filter\s*\/([A-Za-z0-9]+)/)?.[1];
-  return single ? [single] : [];
-}
-
-/**
- * Flate streams may be predictor-encoded through /DecodeParms. Inflating one and
- * treating the result as content would silently yield mangled text, so it is
- * reported as unsupported instead.
- */
-function hasPredictor(dictionary) {
-  const parameters = dictionary.match(/\/DecodeParms\s*(?:\[[^\]]*?)?<<(.*?)>>/s)?.[1] ?? "";
-  return Number(parameters.match(/\/Predictor\s+(\d+)/)?.[1] ?? 1) > 1;
-}
-
-async function decodeStream(object) {
-  const applied = filters(object.dictionary);
-  if (applied.length === 0) return object.data;
-  if (applied.length === 1 && applied[0] === "FlateDecode") {
-    if (hasPredictor(object.dictionary)) throw new Error("Unsupported stream filter: FlateDecode with a /Predictor");
-    return inflate(object.data);
-  }
-  throw new Error(`Unsupported stream filter: ${applied.join(", ")}`);
+function decodeStream(object) {
+  return decodeStreamBytes(object.dictionary, object.data);
 }
 
 function replacementDictionary(dictionary, length) {
@@ -104,6 +67,10 @@ export class PdfTextEditor {
 
   async listTextRuns() {
     if (!this.streams) {
+      // The xref table may live in an xref stream, which needs Flate decompression
+      // (async) to read. Resolving it here, on first use, keeps the constructor
+      // itself synchronous and free of I/O.
+      await this.document.ensureXref();
       this.streams = [];
       const seen = new Set();
       for (const { object, resources } of this.document.pageContentObjects()) {

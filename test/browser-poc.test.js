@@ -69,10 +69,12 @@ test("reports the failing stage without throwing and leaves later stages unattem
 
 test("classifies known engine errors into readable causes and keeps the raw message", () => {
   const cases = [
-    ["extract: Cross-reference streams are not supported by this prototype", "xref stream未対応"],
     ["load: Encrypted PDFs are not supported", "暗号化PDF"],
     ["extract: Unsupported stream filter: ASCII85Decode", "unsupported filter（未対応の圧縮・符号化）"],
-    ["extract: PDF object 12 is missing from the xref table", "object stream未対応の可能性（xrefに実体がない）"],
+    ["extract: PDF object 12 is missing from the xref table", "objectがxrefに存在しない（破損の可能性）"],
+    ["extract: Object streams are not supported (PDF object 12 is stored in object stream 7)", "object stream未対応（xref streamのtype 2 entry）"],
+    ["extract: Cross-reference stream has an invalid /W", "xref stream解析失敗（/W・/Index・stream長など）"],
+    ["extract: Cross-reference stream length does not match /W and /Index", "xref stream解析失敗（/W・/Index・stream長など）"],
     ["extract: no editable text-showing operands found", "本文runなし"],
     ["writeback: The existing PDF font has no ToUnicode code for \"沖\"", "CMap逆引き失敗（既存fontにその文字のglyphがない可能性）"],
     ["reopen: saved PDF contains no editable text runs", "再読込失敗（保存結果から本文runを取り出せない）"],
