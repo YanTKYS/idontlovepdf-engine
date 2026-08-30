@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>idontlovepdf-engine Browser PoC / PDF本文編集エンジン 検証コンソール</title>
+<style>
+  :root {
+    color-scheme: light;
+    --line: #c9ced6;
+    --ink: #16191d;
+    --muted: #5a6472;
+    --ok: #0f6b3d;
+    --ng: #a01818;
+    --warn: #7a4b00;
+    --panel: #f5f6f8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    color: var(--ink);
+    background: #fff;
+    font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Kaku Gothic ProN", "Noto Sans JP", Meiryo, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  main { max-width: 1180px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 24px 0 8px; }
+  h3 { font-size: 14px; margin: 16px 0 6px; }
+  p { margin: 6px 0; }
+  ul { margin: 6px 0; padding-left: 20px; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
+  .sub { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace; }
+  .num { text-align: right; }
+  .warn { color: var(--warn); }
+
+  .notice {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    padding: 10px 14px;
+    border-radius: 4px;
+  }
+  .notice.privacy { border-left: 4px solid var(--ok); }
+
+  .tabs { display: flex; gap: 8px; margin: 16px 0 0; flex-wrap: wrap; }
+  .tabs button {
+    font: inherit;
+    padding: 8px 16px;
+    border: 1px solid var(--line);
+    border-bottom-width: 3px;
+    background: #fff;
+    cursor: pointer;
+    border-radius: 4px 4px 0 0;
+  }
+  .tabs button.active { border-bottom-color: var(--ink); font-weight: 700; background: var(--panel); }
+
+  .drop {
+    border: 2px dashed var(--line);
+    border-radius: 6px;
+    padding: 18px;
+    text-align: center;
+    cursor: pointer;
+    background: #fff;
+  }
+  .drop.dragging { border-color: var(--ink); background: var(--panel); }
+  .drop p { margin: 4px 0; }
+
+  .block { border: 1px solid var(--line); border-radius: 4px; padding: 10px 14px; margin: 12px 0; }
+  .block[hidden] { display: none; }
+  .error { border-color: var(--ng); background: #fdf3f3; }
+  .error-title { color: var(--ng); font-weight: 700; margin-top: 0; }
+  .ok-title { color: var(--ok); font-weight: 700; margin-top: 0; }
+  .error-raw { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-word; }
+  .status-line { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+
+  .chip {
+    display: inline-block;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 0 6px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .chip-ok { color: var(--ok); border-color: var(--ok); background: #f2f9f5; }
+  .chip-ng { color: var(--ng); border-color: var(--ng); background: #fdf3f3; }
+  .chip-skip { color: var(--muted); }
+  .chip-warn { color: var(--warn); border-color: var(--warn); background: #fdf8ef; margin-left: 6px; }
+
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: var(--panel); white-space: nowrap; position: sticky; top: 0; }
+  tbody tr:hover { background: #fafbfc; }
+  .run-text { max-width: 34ch; word-break: break-all; }
+  .bytes { max-width: 30ch; word-break: break-all; font-size: 12px; }
+  .filename { max-width: 26ch; word-break: break-all; }
+  .error-cell { max-width: 38ch; word-break: break-word; font-size: 12px; }
+
+  button.link {
+    font: inherit;
+    font-size: 12px;
+    color: #0b4fa8;
+    background: none;
+    border: 0;
+    padding: 0 0 0 6px;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+  .actions button, .primary {
+    font: inherit;
+    padding: 6px 14px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: #fff;
+    cursor: pointer;
+  }
+  .actions button:disabled { color: var(--muted); cursor: not-allowed; background: var(--panel); }
+  input[type="text"] {
+    font: inherit;
+    padding: 6px 8px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    min-width: 22ch;
+    flex: 1 1 22ch;
+  }
+  label { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; width: 100%; }
+</style>
+</head>
+<body>
+<main>
+
+  <h1>idontlovepdf-engine Browser PoC</h1>
+  <p class="sub">PDF本文編集エンジン 検証コンソール</p>
+
+  <div class="notice">
+    <ul>
+      <li>自作PDF本文編集モジュール（<span class="mono">src/</span>）の<strong>検証用画面</strong>です。一般職員向けの完成UIではありません。</li>
+      <li>PDF本体は<strong>このブラウザ内だけで処理</strong>します。</li>
+      <li>GitHub、外部API、その他サーバーへの<strong>PDF送信は行いません</strong>。</li>
+      <li>現在は<strong>PoC</strong>（試作）段階です。</li>
+      <li><strong>一般的なPDFすべてへの対応は保証しません。</strong>失敗するPDFがあることが前提の検証ツールです。</li>
+    </ul>
+  </div>
+
+  <div class="notice privacy">
+    <p><strong>プライバシー:</strong> 選択したPDFはこのブラウザ内で処理されます。本ツールからGitHub、外部API、その他サーバーへのPDF送信は行いません。画面表示（HTML / CSS / JavaScript）のみGitHub Pagesから配信され、PDFの中身は<span class="mono">File</span> → <span class="mono">ArrayBuffer</span> → <span class="mono">Uint8Array</span> として端末内で完結します。編集結果の保存もブラウザのダウンロード機能によるローカル保存です。</p>
+    <p class="sub">実装上も、外部CDN・外部フォント・外部APIを使わず、<span class="mono">fetch()</span> / <span class="mono">XMLHttpRequest</span> / <span class="mono">WebSocket</span> を一切含みません。</p>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button id="tab-single" class="active" type="button" role="tab" aria-selected="true" aria-controls="panel-single">単一PDF検証</button>
+    <button id="tab-multi" type="button" role="tab" aria-selected="false" aria-controls="panel-multi">複数PDF評価</button>
+  </div>
+
+  <hr>
+
+  <!-- ================================================= 単一PDF検証 -->
+  <section id="panel-single" role="tabpanel" aria-labelledby="tab-single">
+    <p>PDFを1件選択すると、<span class="mono">PdfTextEditor</span> を初期化し <span class="mono">listTextRuns()</span> の結果を一覧表示します。続けてrunを1件選び、日本語などへの置換を試せます。</p>
+
+    <div class="drop" id="single-drop">
+      <p><strong>PDFファイルを1件選択</strong>、またはここへドラッグ＆ドロップ</p>
+      <input id="single-input" type="file" accept="application/pdf,.pdf">
+      <p class="sub">選択したファイルは送信されません。</p>
+    </div>
+
+    <div class="block" id="single-summary" hidden></div>
+    <div class="block error" id="single-error" hidden></div>
+
+    <div id="run-section" hidden>
+      <h2>本文run一覧</h2>
+      <p class="sub">
+        <span class="mono">text</span> はfontの <span class="mono">/ToUnicode</span> CMapによる復号結果です。復号できない箇所は
+        <span class="mono">U+FFFD</span> として表示され、そのrunに「復号不可を含む」と表示します（画面全体は停止しません）。
+        <span class="mono">bytes</span> は既定で先頭12バイトのみを表示し、「詳細」で全体を表示します。
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">選択</th>
+              <th scope="col">id</th>
+              <th scope="col">objectNumber</th>
+              <th scope="col">fontName</th>
+              <th scope="col">text</th>
+              <th scope="col">文字数</th>
+              <th scope="col">bytes数</th>
+              <th scope="col">bytes (hex)</th>
+            </tr>
+          </thead>
+          <tbody id="run-body"></tbody>
+        </table>
+      </div>
+
+      <h2>日本語置換テスト</h2>
+      <p class="sub">
+        例: 元テキスト <span class="mono">令和8年度</span> → 置換後 <span class="mono">令和9年度</span>。
+        置換は元PDFのバイト列の複製に対して行い、<span class="mono">replaceText()</span> → <span class="mono">save()</span> の結果を
+        <span class="mono">元ファイル名.edited.pdf</span> としてローカル保存します。<strong>元のPDFファイルは変更しません。</strong>
+      </p>
+      <div class="block" id="replace-target"></div>
+      <div class="actions">
+        <label for="replace-input">置換後テキスト
+          <input id="replace-input" type="text" placeholder="置換後の文字列" disabled>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="replace-run" type="button" disabled>置換して編集済PDFを保存</button>
+      </div>
+      <div class="block error" id="replace-error" hidden></div>
+      <div class="block" id="replace-result" hidden></div>
+      <p class="sub">
+        置換にはCMapの逆引きが必要です。CMapに存在しない文字（既存fontにglyphがない文字）を指定すると失敗します。
+        失敗内容はエラー原文つきで表示し、元PDFが変更されていないことも併せて表示します。
+      </p>
+    </div>
+  </section>
+
+  <!-- ================================================= 複数PDF評価 -->
+  <section id="panel-multi" role="tabpanel" aria-labelledby="tab-multi" hidden>
+    <p>複数のPDFを選択し、Node版 <span class="mono">scripts/assess-corpus.js</span> と同じ段階（<span class="mono">load</span> / <span class="mono">extract</span> / <span class="mono">writeback</span> / <span class="mono">save</span> / <span class="mono">reopen</span>）で一括評価します。</p>
+
+    <div class="notice">
+      <p><strong>writebackMode: <span class="mono" id="writeback-mode">same-bytes</span></strong></p>
+      <p><strong><span class="mono">writeback: true</span> は「別文字への置換に成功した」という意味ではありません。</strong>
+        最初のrunに<strong>元と同じbytes</strong>を書き戻し、置換から保存までの経路だけを検査しています。
+        「日本」→「沖縄」のような別文字への置換可否は、単一PDF検証タブで文書ごとに確認してください。</p>
+      <p><span class="mono">readerDisplay</span> は自動判定しません（常に <span class="mono">null</span>）。Acrobat Reader等の独立したPDF readerでの表示確認は人間が行ってください。</p>
+    </div>
+
+    <div class="drop" id="multi-drop">
+      <p><strong>PDFファイルを複数選択</strong>、またはここへドラッグ＆ドロップ</p>
+      <input id="multi-input" type="file" accept="application/pdf,.pdf" multiple>
+      <p class="sub">選択したファイルは送信されません。すべてこのブラウザ内で評価します。</p>
+    </div>
+
+    <p id="multi-progress" class="sub" hidden></p>
+    <div class="block" id="multi-summary" hidden></div>
+
+    <div id="assess-section" hidden>
+      <h2>一括評価結果</h2>
+      <p class="sub">○ 成功 / × 失敗 / - 未実施。失敗した段階より後ろは「- 未実施」です。編集済PDFは行ごとに手動で保存します（自動ダウンロードはしません）。</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">PDF</th>
+              <th scope="col">load</th>
+              <th scope="col">extract</th>
+              <th scope="col">writeback</th>
+              <th scope="col">save</th>
+              <th scope="col">reopen</th>
+              <th scope="col">runs</th>
+              <th scope="col">error</th>
+              <th scope="col">編集済PDF</th>
+            </tr>
+          </thead>
+          <tbody id="assess-body"></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="download-json" type="button" disabled>assessment.json を保存</button>
+        <button id="clear-corpus" type="button" disabled>評価結果を消去</button>
+      </div>
+      <p class="sub">assessment.json には各PDFの <span class="mono">file</span> / <span class="mono">load</span> / <span class="mono">extract</span> / <span class="mono">writeback</span> / <span class="mono">writebackMode</span> / <span class="mono">save</span> / <span class="mono">reopen</span> / <span class="mono">runCount</span> / <span class="mono">readerDisplay</span> / <span class="mono">error</span> を記録します。<span class="mono">readerDisplay</span> は独立readerで確認したうえで手動追記してください。</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <h2>判別できる主な失敗理由</h2>
+  <p class="sub">エラーは分類ラベルと原文の両方を表示します。次のような原因を区別できます。</p>
+  <ul class="sub">
+    <li>xref stream未対応 / object stream未対応の可能性</li>
+    <li>暗号化PDF / unsupported filter（未対応の圧縮・符号化）</li>
+    <li>本文runなし（テキストが画像化されている場合を含む）</li>
+    <li>ToUnicodeなし / CMap逆引き失敗（glyph不足の可能性）</li>
+    <li>保存失敗 / 再読込失敗</li>
+  </ul>
+
+  <p class="sub">
+    このページはES Modulesで <span class="mono">./src/index.js</span> を直接読み込みます（bundleなし）。<span class="mono">file://</span> で直接開くとモジュール読込みがブラウザに拒否されるため、GitHub Pagesまたはローカルの静的HTTPサーバー経由で開いてください。
+  </p>
+
+  <noscript>
+    <p class="warn">この検証コンソールはJavaScriptを使ってブラウザ内でPDFを処理します。JavaScriptを有効にしてください。</p>
+  </noscript>
+
+</main>
+<script type="module" src="./web/app.js"></script>
+</body>
+</html>

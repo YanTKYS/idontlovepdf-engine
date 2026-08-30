@@ -93,9 +93,78 @@ npm run assess:corpus -- --json --output tmp/assessed fixtures/real-pdf > assess
 
 `--output`を指定すると、保存・再読込に成功したファイルを`元ファイル名.入力パスの短いSHA-256.assessed.pdf`として確認用ディレクトリへ書き出し、結果の`outputFile`に記録します。異なる出力元に同名PDFがあっても衝突せず、入力パスが同じなら安定した名前になります。`readerDisplay`は常に`null`です。出力をAcrobat Reader等の独立したreaderで確認し、評価JSONへ結果を手動で追記してください。元PDFや生成物はライセンス・個人情報を確認したうえで管理し、実文書をこの公開パッケージへ同梱しない方針です。
 
+## GitHub PagesブラウザPoC
+
+`index.html`は、この自作モジュールが**実PDFでどこまで通用するかをブラウザ内で確認するための検証コンソール**です。GitHub Pagesで公開すれば、URLを開くだけで手元の実PDFを検証できます。製品版でも一般職員向けの完成UIでもなく、`idontlovepdf`本体への組込みも行っていません。
+
+**PDFはブラウザ内だけで処理します。** GitHub Pagesは画面（HTML / CSS / JavaScript）の配信にのみ使い、選択したPDFはGitHub・外部API・その他サーバーへ送信しません。ブラウザPoCのコードには`fetch()`、`XMLHttpRequest`、`WebSocket`、外部CDN、外部フォント、外部APIを含みません。PDFは`<input type="file">`またはドラッグ＆ドロップから`File` → `ArrayBuffer` → `Uint8Array`として読み込み、編集結果の保存もブラウザのダウンロード機能によるローカル保存です。
+
+bundle工程は追加していません。`index.html`はES Modulesとして`web/app.js`を読み込み、そこから`src/index.js`の`PdfTextEditor`を直接利用します。Node専用CLI（`scripts/assess-corpus.js`）とブラウザ用コード（`web/`）は分けています。
+
+| ファイル | 役割 |
+| --- | --- |
+| `index.html` | 検証画面（説明・タブ・表・置換UI） |
+| `web/app.js` | DOM操作とファイル入出力のみ |
+| `web/poc-core.js` | DOM非依存の判定・整形・一括評価。Nodeのテストからも読み込む |
+
+### 単一PDF編集テスト
+
+1. 「単一PDF検証」タブでPDFを1件選ぶ（ドラッグ＆ドロップ可）
+2. `PdfTextEditor`初期化と`listTextRuns()`を実行し、`id` / `objectNumber` / `fontName` / `text` / 文字数 / bytes数 / bytes（hex）を一覧表示
+3. run一覧から1件選び、置換後テキストを入力
+4. `replaceText()` → `save()` を実行し、`元ファイル名.edited.pdf`としてローカル保存
+
+`text`はfontの`/ToUnicode` CMapによる復号結果です。復号できないrunがあってもPoC全体は止めず、そのrunに「復号不可を含む」と表示します。bytesは既定で先頭12バイトのみ表示し、「詳細」で全体を表示します。置換は常に元バイト列の複製に対して行うため、**元のPDFファイルは変更されません**。CMapに置換文字がない場合などは、失敗した段階・推定される原因・エラー原文・元PDFが無変更であることを表示します（エラーは握り潰しません）。
+
+### 複数PDF corpus評価
+
+1. 「複数PDF評価」タブでPDFを複数選ぶ
+2. 各PDFについて`load` / `extract` / `writeback` / `save` / `reopen`を評価し、表に追記
+3. 成功・失敗は色だけでなく「○ 成功」「× 失敗」「- 未実施」の文字でも示します
+4. 「assessment.json を保存」でJSONをローカル保存
+5. `save`・`reopen`に成功した行は「編集済PDFを保存」から個別に保存（自動ダウンロードはしません）
+
+評価段階はNode版`npm run assess:corpus`と揃えてあります。`writebackMode`は`same-bytes`で、**最初のrunに元と同じbytesを書き戻す方式です。`writeback: true`は別文字への置換に成功したことを意味しません。**別文字への置換可否は単一PDF検証タブで文書ごとに確認してください。
+
+`assessment.json`は各PDFについて次を含みます。
+
+```json
+{
+  "file": "sample.pdf",
+  "load": true,
+  "extract": true,
+  "writeback": true,
+  "writebackMode": "same-bytes",
+  "save": true,
+  "reopen": true,
+  "runCount": 12,
+  "readerDisplay": null,
+  "error": null
+}
+```
+
+`readerDisplay`はブラウザPoCでも自動判定せず、常に`null`です。**保存できたことと、意図どおり表示されることは別です。**保存した編集済PDFをAcrobat Reader等の独立したPDF readerで開いて確認し、結果は人間がJSONへ追記してください。
+
+失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream未対応、object stream未対応の可能性、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
+
+このPoCの成功は、**一般的なPDFすべてへの対応を保証しません。**失敗するPDFがあることを前提に、出力元ごとの傾向を確かめるための画面です。
+
+### GitHub Pagesでの公開
+
+リポジトリの **Settings** → **Pages** → **Source** で **Deploy from a branch** を選び、Branchに **`main`** と **`/ (root)`** を指定して保存します。数十秒後に`https://<ユーザー名>.github.io/idontlovepdf-test/`で開けます。Pagesの有効化はGitHub側の設定操作だけで、リポジトリ側に追加の設定ファイルは不要です（`.nojekyll`のみ、配信を素通しにするために置いています）。
+
+手元で確認する場合は、ES Modulesの制約により`file://`で直接開けません。リポジトリ直下で静的HTTPサーバーを起動してください。
+
+```sh
+python3 -m http.server 8000
+# ブラウザで http://localhost:8000/ を開く
+```
+
 ## 開発
 
 ```sh
 npm test
 npm run check
 ```
+
+`npm run check`は`src/`、`scripts/`に加えてブラウザPoCの`web/`とテストも構文検査します。`web/poc-core.js`はDOMに依存しないため、ブラウザPoCの純粋関数（段階表示、エラー分類、run整形、assessment.json生成、一括評価）は`test/browser-poc.test.js`でNodeから直接検証しています。DOMテスト環境は追加していません。

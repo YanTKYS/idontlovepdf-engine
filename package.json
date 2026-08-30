@@ -14,7 +14,7 @@
   "files": ["src", "README.md", "LICENSE"],
   "scripts": {
     "test": "node --test",
-    "check": "for file in src/*.js scripts/*.js; do node --check \"$file\"; done",
+    "check": "for file in src/*.js scripts/*.js web/*.js test/*.js; do node --check \"$file\"; done",
     "assess:corpus": "node scripts/assess-corpus.js"
   },
   "keywords": ["pdf", "offline", "browser", "text-editing"],
