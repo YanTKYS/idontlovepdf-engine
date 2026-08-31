@@ -17,13 +17,28 @@ import { skipWhite } from "./syntax.js";
 // large loop or allocation, not to model any real PDF limit.
 const MAX_OBJECT_COUNT = 1_000_000;
 
+/**
+ * Reads one `objectNumber` or `offset` field from the header. Returns `null` only
+ * when there is no digit at all at this position (the caller decides what that
+ * means contextually, e.g. "header is incomplete"). A digit sequence that *is*
+ * present but whose accumulated value would exceed Number.MAX_SAFE_INTEGER throws
+ * immediately instead of continuing to accumulate a value that has silently lost
+ * precision -- a header value this large is never a real object number or byte
+ * offset, only a malformed or hostile one, and must not be quietly rounded into
+ * some other, smaller-looking number.
+ */
 function readUnsignedInteger(bytes, position) {
   const start = skipWhite(bytes, position);
   let cursor = start;
   while (bytes[cursor] >= 0x30 && bytes[cursor] <= 0x39) cursor += 1;
   if (cursor === start) return null;
   let value = 0;
-  for (let index = start; index < cursor; index += 1) value = value * 10 + (bytes[index] - 0x30);
+  for (let index = start; index < cursor; index += 1) {
+    value = value * 10 + (bytes[index] - 0x30);
+    if (!Number.isSafeInteger(value)) {
+      throw new Error("Object stream header contains an object number or offset outside the safe integer range");
+    }
+  }
   return { value, end: cursor };
 }
 

@@ -1,6 +1,7 @@
-import { skipWhite as skipSpace } from "./syntax.js";
+import { isRegular, skipWhite as skipSpace } from "./syntax.js";
+import { readHex, readLiteral } from "./content-stream.js";
 import { decodeStreamBytes } from "./flate.js";
-import { firstIdBytes } from "./pdf-dictionary-text.js";
+import { firstIdBytes, parseStrictInteger, readToken } from "./pdf-dictionary-text.js";
 import { parseObjectStream } from "./object-stream.js";
 
 /**
@@ -74,6 +75,39 @@ function dictionaryEnd(bytes, position) {
     } else cursor += 1;
   }
   if (depth) throw new Error("Unterminated PDF dictionary");
+  return cursor;
+}
+
+/**
+ * Finds the end of a PDF array `[ ... ]`, tracking `[`/`]` depth (arrays can nest)
+ * while skipping over literal strings, nested dictionaries, and hex strings the same
+ * way dictionaryEnd() does -- an unescaped `]` inside a string, or one that closes a
+ * nested array/dictionary, must not be mistaken for this array's own end. Used only
+ * by interpretCompressedObject() below, to find an Object Stream entry's boundary
+ * when it is an array rather than a dictionary; the array's contents are kept as raw
+ * text (see that function), not parsed element by element.
+ */
+function arrayEnd(bytes, position) {
+  if (bytes[position] !== 0x5b) throw new Error("Expected a PDF array");
+  let cursor = position + 1;
+  let depth = 1;
+  while (cursor < bytes.length && depth) {
+    if (bytes[cursor] === 0x25) cursor = skipSpace(bytes, cursor);
+    else if (bytes[cursor] === 0x28) cursor = skipLiteral(bytes, cursor);
+    else if (bytes[cursor] === 0x3c && bytes[cursor + 1] === 0x3c) cursor = dictionaryEnd(bytes, cursor);
+    else if (bytes[cursor] === 0x3c) {
+      cursor += 1;
+      while (cursor < bytes.length && bytes[cursor] !== 0x3e) cursor += 1;
+      cursor += 1;
+    } else if (bytes[cursor] === 0x5b) {
+      depth += 1;
+      cursor += 1;
+    } else if (bytes[cursor] === 0x5d) {
+      depth -= 1;
+      cursor += 1;
+    } else cursor += 1;
+  }
+  if (depth) throw new Error("Unterminated PDF array");
   return cursor;
 }
 
@@ -320,6 +354,25 @@ async function collectXref(bytes) {
   return { entries, root, size, previousXref: startXref, encryptReference, idBytes };
 }
 
+/**
+ * Reads `/key` from an Object Stream's dictionary as a strict PDF integer -- the
+ * whole token, not just a leading run of digits (unlike directInteger(), used
+ * elsewhere in this file for structural values this parser already trusts more,
+ * e.g. /Size or /Prev). `/N 3.5` or `/First 12foo` must be rejected outright, not
+ * silently read as 3 or 12: a compressed object's byte range is computed directly
+ * from these two values, so a truncated misread here would not just misreport a
+ * diagnostic field, it would slice the wrong bytes out of the stream. Throws
+ * immediately (naming the actual offending token) rather than returning something
+ * parseObjectStream() would have to reject a second time with a vaguer message.
+ */
+function strictObjectStreamInteger(dictionaryText, key, streamNumber) {
+  const token = readToken(dictionaryText, key);
+  if (token === undefined) throw new Error(`Object stream ${streamNumber} has no /${key}`);
+  const value = parseStrictInteger(token);
+  if (value === null) throw new Error(`Malformed object stream /${key}: ${token}`);
+  return value;
+}
+
 function parseReferenceArray(text, key) {
   const array = text.match(new RegExp(`/${key}\\s*\\[(.*?)\\]`, "s"))?.[1];
   if (array) return [...array.matchAll(/(\d+)\s+(\d+)\s+R/g)].map((match) => ({ number: Number(match[1]), generation: Number(match[2]) }));
@@ -329,19 +382,64 @@ function parseReferenceArray(text, key) {
 
 /**
  * Interprets one Object Stream entry's raw bytes (see parseObjectStream() in
- * object-stream.js) as a PDF object, in the same `{ number, generation, dictionary,
- * data, value }` shape object() returns for a type 1 object. Per PDF spec 7.5.7, a
- * compressed object is never a stream, and this codebase only ever needs to resolve
- * dictionary-shaped compressed objects (Catalog/Pages/Page/Resources/Font -- see
- * pageContentObjects() and pdf-document.js's font/resource lookups); anything else
- * is rejected explicitly rather than guessed at.
+ * object-stream.js) as a PDF object, in a shape compatible with what object()
+ * returns for a type 1 object (`{ number, generation, dictionary, data, value }`),
+ * plus `rawValue` for the value shapes that model doesn't otherwise have a field
+ * for. Per PDF spec 7.5.7, a compressed object is never a stream (and, in practice,
+ * never a bare indirect reference on its own either -- a reference is only ever a
+ * component of some other value); every other ordinary object shape -- dictionary,
+ * array, name, string, number, boolean, null -- is legal here and handled below.
+ * This codebase's own resolution needs (Catalog/Pages/Page/Resources/Font -- see
+ * pageContentObjects() and pdf-document.js's font/resource lookups) only ever
+ * exercise the dictionary case, but a compressed object that happens to be
+ * something else is still resolved correctly rather than rejected as unsupported;
+ * only a genuinely disallowed shape (a stream) is rejected, and explicitly.
  */
 function interpretCompressedObject(entry, streamNumber) {
-  const dictionary = extractDictionary(entry.bytes, 0);
-  if (!dictionary) {
-    throw new Error(`Object stream ${streamNumber}: compressed object ${entry.objectNumber} is not a dictionary (only dictionary-shaped compressed objects are supported)`);
+  const base = { number: entry.objectNumber, generation: 0, dictionary: "", data: null, value: null, rawValue: null };
+  const bytes = entry.bytes;
+  const start = skipSpace(bytes, 0);
+  const byte = bytes[start];
+
+  if (byte === 0x3c && bytes[start + 1] === 0x3c) {
+    const dictionary = extractDictionary(bytes, start);
+    if (!dictionary) throw new Error(`Object stream ${streamNumber}: malformed dictionary for compressed object ${entry.objectNumber}`);
+    // A dictionary immediately followed by "stream" would be a stream object, which
+    // PDF spec 7.5.7 explicitly disallows inside an Object Stream -- rejected here
+    // rather than silently treated as if the stream keyword were not there.
+    if (keywordAt(bytes, skipSpace(bytes, dictionary.end), "stream")) {
+      throw new Error(`Object stream ${streamNumber}: compressed object ${entry.objectNumber} is a stream object, which is not permitted inside an Object Stream`);
+    }
+    return { ...base, dictionary: dictionary.text };
   }
-  return { number: entry.objectNumber, generation: 0, dictionary: dictionary.text, data: null, value: null };
+  if (byte === 0x5b) {
+    return { ...base, rawValue: decodeBinaryString(bytes.subarray(start, arrayEnd(bytes, start))) };
+  }
+  if (byte === 0x2f) {
+    let cursor = start + 1;
+    while (isRegular(bytes[cursor])) cursor += 1;
+    return { ...base, rawValue: decodeBinaryString(bytes.subarray(start, cursor)) };
+  }
+  if (byte === 0x28) {
+    return { ...base, rawValue: readLiteral(bytes, start).value };
+  }
+  if (byte === 0x3c) {
+    return { ...base, rawValue: readHex(bytes, start).value };
+  }
+  if (keywordAt(bytes, start, "true")) return { ...base, value: true };
+  if (keywordAt(bytes, start, "false")) return { ...base, value: false };
+  if (keywordAt(bytes, start, "null")) return { ...base, value: null, rawValue: "null" };
+  if (byte === 0x2b || byte === 0x2d || byte === 0x2e || (byte >= 0x30 && byte <= 0x39)) {
+    let cursor = start + (bytes[start] === 0x2b || bytes[start] === 0x2d ? 1 : 0);
+    while ((bytes[cursor] >= 0x30 && bytes[cursor] <= 0x39) || bytes[cursor] === 0x2e) cursor += 1;
+    const value = Number(decodeBinaryString(bytes.subarray(start, cursor)));
+    if (!Number.isFinite(value)) throw new Error(`Object stream ${streamNumber}: malformed number for compressed object ${entry.objectNumber}`);
+    return { ...base, value };
+  }
+  throw new Error(
+    `Object stream ${streamNumber}: compressed object ${entry.objectNumber} has an unsupported or malformed value ` +
+    "(a stream object is never valid inside an Object Stream)"
+  );
 }
 
 export class PdfStructure {
@@ -487,8 +585,8 @@ export class PdfStructure {
     if (!/\/Type\s*\/ObjStm\b/.test(objectStream.dictionary)) {
       throw new Error(`PDF object ${streamNumber} is not an object stream (expected /Type /ObjStm)`);
     }
-    const objectCount = directInteger(objectStream.dictionary, "N");
-    const firstOffset = directInteger(objectStream.dictionary, "First");
+    const objectCount = strictObjectStreamInteger(objectStream.dictionary, "N", streamNumber);
+    const firstOffset = strictObjectStreamInteger(objectStream.dictionary, "First", streamNumber);
     const rawData = security
       ? await decrypt(security, { objectNumber: objectStream.number, generation: objectStream.generation, bytes: objectStream.data })
       : objectStream.data;

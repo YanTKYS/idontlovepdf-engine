@@ -166,7 +166,17 @@ function buildObjStmPdf({
   objStmNumber,
   rootNumber = 1,
   usePredictor = false,
-  encrypt = null
+  encrypt = null,
+  // Overrides for deliberately building a malformed Object Stream without corrupting
+  // any byte offset computed elsewhere in this function: post-hoc string-splicing the
+  // fully-assembled PDF only works when the replacement is the exact same length as
+  // the original (see the /N-mismatch test below), which does not generalize to
+  // tokens like "/N 3.5" or "/First 12abc" that are a different length than the
+  // well-formed text they replace. Supplying the (possibly malformed) content
+  // directly here instead means every downstream offset -- the xref stream's own
+  // entries, /startxref -- is still computed correctly from the true final bytes.
+  objStmDictionaryOverride = null,
+  objStmBodyOverride = null
 }) {
   const header = encode("%PDF-1.6\n");
   const chunks = [header];
@@ -221,7 +231,7 @@ function buildObjStmPdf({
     place(object.number, object.dictionary, streamBytes);
   }
 
-  const { decoded, firstOffset } = buildObjStmBody(compressedObjects);
+  const { decoded, firstOffset } = objStmBodyOverride ?? buildObjStmBody(compressedObjects);
   let filtered = usePredictor ? pngUpEncode(decoded, 8) : decoded;
   filtered = deflateSync(filtered);
 
@@ -230,7 +240,8 @@ function buildObjStmPdf({
   const objStmData = encrypt ? aesEncrypt(deriveObjectKey(fileKey, objStmNumber, 0), filtered) : filtered;
 
   const predictorClause = usePredictor ? ` /DecodeParms << /Predictor 12 /Columns 8 >>` : "";
-  place(objStmNumber, `/Type /ObjStm /N ${compressedObjects.length} /First ${firstOffset} /Filter /FlateDecode${predictorClause}`, objStmData);
+  const objStmDictionary = objStmDictionaryOverride ?? `/Type /ObjStm /N ${compressedObjects.length} /First ${firstOffset} /Filter /FlateDecode${predictorClause}`;
+  place(objStmNumber, objStmDictionary, objStmData);
 
   let encryptObjNumber = null;
   if (encrypt) {
@@ -426,6 +437,145 @@ test("rejects an object stream whose declared /N does not match how many objects
   const editor = new PdfTextEditor(corrupted);
   await editor.document.ensureXref();
   await assert.rejects(editor.document.resolveObject(100), /Object stream header is incomplete/);
+});
+
+/* ------------------- strict /N and /First integer validation (read from real dictionary text) */
+/* These exercise the actual read path (PdfTextEditor -> PdfStructure#decodeObjectStream ->
+ * strictObjectStreamInteger()), not just parseObjectStream() in isolation -- a malformed
+ * token must be rejected outright, never truncated to whatever digits happen to lead it. */
+
+test("rejects an object stream whose /N is a non-integer token (3.5) read from real dictionary text", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "<< /Marker /A >>" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1,
+    objStmDictionaryOverride: "/Type /ObjStm /N 3.5 /First 0 /Filter /FlateDecode"
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.decodeObjectStream(5, null, null), /Malformed object stream \/N: 3\.5/);
+});
+
+test("rejects an object stream whose /N is a non-integer token (3foo) read from real dictionary text", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "<< /Marker /A >>" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1,
+    objStmDictionaryOverride: "/Type /ObjStm /N 3foo /First 0 /Filter /FlateDecode"
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.decodeObjectStream(5, null, null), /Malformed object stream \/N: 3foo/);
+});
+
+test("rejects an object stream whose /First is a non-integer token (12.5) read from real dictionary text", async () => {
+  const { decoded, firstOffset } = buildObjStmBody([{ number: 100, dictionary: "<< /Marker /A >>" }]);
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "<< /Marker /A >>" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1,
+    objStmDictionaryOverride: `/Type /ObjStm /N 1 /First 12.5 /Filter /FlateDecode`,
+    objStmBodyOverride: { decoded, firstOffset }
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.decodeObjectStream(5, null, null), /Malformed object stream \/First: 12\.5/);
+});
+
+test("rejects an object stream whose /First is a non-integer token (12abc) read from real dictionary text", async () => {
+  const { decoded, firstOffset } = buildObjStmBody([{ number: 100, dictionary: "<< /Marker /A >>" }]);
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "<< /Marker /A >>" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1,
+    objStmDictionaryOverride: `/Type /ObjStm /N 1 /First 12abc /Filter /FlateDecode`,
+    objStmBodyOverride: { decoded, firstOffset }
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.decodeObjectStream(5, null, null), /Malformed object stream \/First: 12abc/);
+});
+
+test("rejects an object stream header whose objectNumber field exceeds the safe integer range", async () => {
+  const headerText = "99999999999999999999 0\n";
+  const bodyText = "<< /Marker /A >>";
+  const decoded = encode(headerText + bodyText);
+  const firstOffset = encode(headerText).length;
+  const pdf = buildObjStmPdf({
+    compressedObjects: [],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1,
+    objStmDictionaryOverride: `/Type /ObjStm /N 1 /First ${firstOffset} /Filter /FlateDecode`,
+    objStmBodyOverride: { decoded, firstOffset }
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.decodeObjectStream(5, null, null), /outside the safe integer range/);
+});
+
+test("rejects an object stream header whose offset field exceeds the safe integer range", async () => {
+  const headerText = "1 99999999999999999999\n";
+  const bodyText = "<< /Marker /A >>";
+  const decoded = encode(headerText + bodyText);
+  const firstOffset = encode(headerText).length;
+  const pdf = buildObjStmPdf({
+    compressedObjects: [],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1,
+    objStmDictionaryOverride: `/Type /ObjStm /N 1 /First ${firstOffset} /Filter /FlateDecode`,
+    objStmBodyOverride: { decoded, firstOffset }
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.decodeObjectStream(5, null, null), /outside the safe integer range/);
+});
+
+/* ------------------------------------------------------------- non-dictionary compressed objects */
+/* PDF spec 7.5.7 permits any non-stream object inside an Object Stream, not just dictionaries --
+ * only a stream object (and, in practice, a bare standalone reference) is disallowed. */
+
+test("resolves non-dictionary compressed objects: array, number, name, string, boolean, null", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [
+      { number: 100, dictionary: "[1 2 3]" },
+      { number: 101, dictionary: "42" },
+      { number: 102, dictionary: "/Foo" },
+      { number: 103, dictionary: "(hello)" },
+      { number: 104, dictionary: "true" },
+      { number: 105, dictionary: "null" }
+    ],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  assert.equal((await editor.document.resolveObject(100)).rawValue, "[1 2 3]");
+  assert.equal((await editor.document.resolveObject(101)).value, 42);
+  assert.equal((await editor.document.resolveObject(102)).rawValue, "/Foo");
+  assert.deepEqual((await editor.document.resolveObject(103)).rawValue, encode("hello"));
+  assert.equal((await editor.document.resolveObject(104)).value, true);
+  const nullObject = await editor.document.resolveObject(105);
+  assert.equal(nullObject.value, null);
+  assert.equal(nullObject.rawValue, "null");
+});
+
+test("rejects a compressed object that is itself a stream object (disallowed inside an Object Stream)", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "<< /Length 3 >>\nstream\nabc\nendstream" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.resolveObject(100), /is a stream object, which is not permitted/);
 });
 
 /* --------------------------------------------------------------------- FlateDecode / Predictor */

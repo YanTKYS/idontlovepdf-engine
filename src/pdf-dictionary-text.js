@@ -45,6 +45,30 @@ export function booleanValue(text, key, fallback) {
 }
 
 /**
+ * Reads the full token following `/key` -- up to whitespace or a PDF delimiter, not
+ * just a leading run of digits. A value like `12.5` or `12foo` must be rejected as a
+ * whole rather than silently truncated to whatever digits happen to come first (the
+ * more lenient `directInteger()` in pdf-structure.js, used for structural values
+ * like /Size and /Prev, does exactly that truncation -- fine for values this parser
+ * already trusts, but not for anything a malformed or hostile PDF controls more
+ * directly). Returns `undefined` when `/key` is not present at all, so a caller can
+ * tell "absent, use a default" apart from "present but malformed, reject" --
+ * `parseStrictInteger()` below handles the latter.
+ */
+export function readToken(text, key) {
+  if (!text) return undefined;
+  const match = text.match(new RegExp(`/${key}\\s+([^\\s()<>\\[\\]{}/%]*)`));
+  return match ? match[1] : undefined;
+}
+
+/** A PDF integer is an optionally signed digit sequence -- no decimal point, nothing else. */
+export function parseStrictInteger(token) {
+  if (!/^[+-]?\d+$/.test(token)) return null;
+  const value = Number(token);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+/**
  * Extracts every top-level `/Name << ... >>` entry from `text` (e.g. each named
  * filter inside `/CF`), tracking `<<`/`>>` nesting depth so a filter's own nested
  * dictionaries don't confuse where it ends.

@@ -10,6 +10,8 @@
  * inflated bytes and the stream's own dictionary text.
  */
 
+import { parseStrictInteger, readToken } from "./pdf-dictionary-text.js";
+
 // Sanity bound on a single row's byte count. Real PDF predictor rows are at most a
 // few thousand bytes (image width x components x bytes-per-sample); this exists only
 // to reject obviously bogus /Columns//Colors/BitsPerComponent combinations before
@@ -23,27 +25,6 @@ function readDecodeParmsText(dictionary) {
   // so only the single-dictionary forms need handling here.
   const arrayForm = dictionary.match(/\/DecodeParms\s*\[\s*(<<[\s\S]*?>>)\s*\]/)?.[1];
   return arrayForm ?? dictionary.match(/\/DecodeParms\s*(<<[\s\S]*?>>)/)?.[1] ?? null;
-}
-
-/**
- * Reads the full token following `/key` — up to whitespace or a PDF delimiter — not
- * just a leading run of digits. A value like `12.5` or `foo` must be rejected as a
- * whole rather than silently truncated to whatever digits happen to come first (a
- * naive `\d+` pattern would read `/Predictor 12.5` as 12 and drop the rest). Returns
- * `undefined` when the key is not present at all, so callers can tell "absent, use
- * the default" apart from "present but malformed, reject".
- */
-function readToken(text, key) {
-  if (!text) return undefined;
-  const match = text.match(new RegExp(`/${key}\\s+([^\\s()<>\\[\\]{}/%]*)`));
-  return match ? match[1] : undefined;
-}
-
-/** A PDF integer is an optionally signed digit sequence — no decimal point, nothing else. */
-function parseStrictInteger(token) {
-  if (!/^[+-]?\d+$/.test(token)) return null;
-  const value = Number(token);
-  return Number.isSafeInteger(value) ? value : null;
 }
 
 /** Reads /Predictor, /Columns, /Colors, /BitsPerComponent, applying the PDF spec's defaults. */
