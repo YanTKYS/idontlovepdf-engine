@@ -56,9 +56,14 @@ function replacementDictionary(dictionary, length) {
   return withoutDecodeParms.replace(/>>\s*$/, `/Length ${length} >>`);
 }
 
-function fontReferences(resources, structure) {
+// The /Font sub-dictionary of /Resources can itself be an indirect object, and
+// (like Resources, Pages, and Page) that indirect object can be compressed inside
+// an Object Stream -- so this resolves it the same way pageContentObjects() does.
+async function fontReferences(resources, structure, security) {
   const indirect = reference(resources.dictionary, "Font");
-  const fontDictionary = indirect ? structure.object(indirect).dictionary : resources.dictionary.match(/\/Font\s*<<(.*?)>>/s)?.[1] ?? "";
+  const fontDictionary = indirect
+    ? (await structure.resolveObject(indirect, security, decryptStreamBytes)).dictionary
+    : resources.dictionary.match(/\/Font\s*<<(.*?)>>/s)?.[1] ?? "";
   return new Map([...fontDictionary.matchAll(/\/([^\s/<>{}\[\]()]+)\s+(\d+)\s+(\d+)\s+R/g)].map((match) => [
     match[1], { number: Number(match[2]), generation: Number(match[3]) }
   ]));
@@ -66,8 +71,12 @@ function fontReferences(resources, structure) {
 
 async function loadFontMaps(resources, structure, security) {
   const result = new Map();
-  for (const [name, fontReference] of fontReferences(resources, structure)) {
-    const font = structure.object(fontReference);
+  // A font dictionary can itself be compressed (a common PDF-writer optimization);
+  // its own /ToUnicode target, however, is always a stream, and streams are never
+  // stored in an Object Stream (PDF spec 7.5.7), so that lookup stays on the
+  // synchronous, unchanged structure.object().
+  for (const [name, fontReference] of await fontReferences(resources, structure, security)) {
+    const font = await structure.resolveObject(fontReference, security, decryptStreamBytes);
     const toUnicode = reference(font.dictionary, "ToUnicode");
     if (!toUnicode) continue;
     const cmapObject = structure.object(toUnicode);
@@ -122,7 +131,7 @@ export class PdfTextEditor {
       }
       this.streams = [];
       const seen = new Set();
-      for (const { object, resources } of this.document.pageContentObjects()) {
+      for (const { object, resources } of await this.document.pageContentObjects(this.security, decryptStreamBytes)) {
         // One content stream can be shared by several pages, and /Contents may even
         // list it twice. Run ids are keyed by object number, so scanning it more than
         // once would hand out duplicate ids and append the object twice on save.

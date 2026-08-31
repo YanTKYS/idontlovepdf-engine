@@ -94,8 +94,13 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
   - **`/P`の権限判定は認証と独立に行います。** `/P`は符号付き32bit整数として解釈し、印刷・文書変更・内容コピー・注釈の4項目に加え、`/R >= 3`の場合のみフォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷の4項目を判定します（`/R 2`ではこの4項目を`null`のまま返し、bitを読んで推測しません）。認証に成功していても、文書変更（modify）permissionがない場合`replaceText()`は明確なエラーで拒否します。検索（`listTextRuns()`）は権限に関わらず利用できます。
   - **保存（`save()`）は、暗号化PDFに対する実際の変更がある場合は拒否します。** 再暗号化・`/O`/`/U`の再計算・トレーラーの更新を伴う実装は、認証・復号を成立させる今回のスコープには含めていません。保留中の変更が0件なら（元のPDFをそのまま返すだけなので）暗号化PDFでも成功します。
   - パスワードは`analyzeEncryption()`が返す診断・`assessment.json`・エラーメッセージのいずれにも一切含めません。ローカルストレージ（`localStorage`・`sessionStorage`）への保存、URLへの混入、外部送信も行いません（ブラウザPoCのパスワード入力欄も参照）。
-  - 実装しないもの（意図的なスコープ外）: `/R 2`・`/R 3`・`/R 5`・`/R 6`、`/AESV3`（AES-256）、`/Adobe.PubSec`などの非Standardハンドラ、パスワード総当たり・辞書攻撃、owner passwordによる権限制限の回避、暗号化PDFへの変更の保存（再暗号化・平文化保存を含む）、object stream（`/ObjStm`）対応
-- cross-reference streamのtype 2 entry（object stream内のobject）は、xref解析自体は失敗させず内部的に保持しますが、そのobjectへ実際にアクセスした時点で「Object streams are not supported」という明確なエラーになります。object stream（`/ObjStm`）そのものの実装はまだ行っていません。Catalog / Pages / Contentsなど今回必要なobjectがtype 1（通常のindirect object）であれば処理を継続できます。
+  - 実装しないもの（意図的なスコープ外）: `/R 2`・`/R 3`・`/R 5`・`/R 6`、`/AESV3`（AES-256）、`/Adobe.PubSec`などの非Standardハンドラ、パスワード総当たり・辞書攻撃、owner passwordによる権限制限の回避、暗号化PDFへの変更の保存（再暗号化・平文化保存を含む）
+- **Object Stream（`/Type /ObjStm`、PDF 1.5以降）に対応しています。** cross-reference streamのtype 2 entry（`compressed: true` / `streamNumber` / `indexInStream`）を、対象のObject Streamをdecodeして中の該当objectを取り出すところまで解決します。Catalog・Pages・Page・Resources・Font dictionaryなど、本文抽出経路がたどる通常dictionaryがObject Stream内に格納されていても処理を継続できます（`/ToUnicode`の参照先streamや`/Contents`のcontent streamは仕様上Object Streamへ格納されないため、常にtype 1のまま扱います）。
+  - **解析**（`src/object-stream.js`の`parseObjectStream()`）: Object Streamの`/N`（object数）・`/First`（object本体開始byte offset）と、decoded streamの先頭にある`objectNumber offset`のペア列（header）を検証したうえで、各objectの本体をbyte単位で切り出します。`/N`が正の安全な整数でない、`/First`が範囲外、headerが`/N`個そろっていない、offsetが昇順でない・範囲外、といった不正値は明示的なエラーにし、推測補正はしません。ObjStm内部にstream object（PDF仕様上格納できません）を想定するfixtureに遭遇した場合も明示エラーです。
+  - **xref情報との整合性検証**: xref type 2 entryが指す対象object番号と、Object Stream header内の`indexInStream`位置に実際に入っているobject番号が一致することを確認し、一致しなければ「object番号の不一致」を明示するエラーにします。
+  - **decode順序**: Object Stream自身が暗号化されている場合、`raw stream bytes → AES復号（Object Stream自身のobject番号・generationから導出したobject keyを使用。内部の各compressed objectは個別に復号しません） → FlateDecode → Predictor解除 → header解析 → 内部object抽出`の順で処理します（暗号化されていなければAES復号を省略するだけで、他の順序は共通です）。FlateDecode・Predictor解除はcontent stream等と共通の`decodeStreamBytes()`をそのまま再利用します。xref stream自体は仕様上暗号化・Object Stream格納のいずれの対象にもならないため、この経路には一切含めていません。
+  - **async解決**: 通常object用の同期`PdfStructure#object()`はtype 1専用のまま維持し、type 1・type 2いずれも解決できる非同期の`PdfStructure#resolveObject(ref, security?, decrypt?)`を別に用意しています。`object()`をtype 2 entryへ呼ぶと「`resolveObject()`を使うように」という明確なエラーになります。実際にtype 2になり得る参照（Catalog・Pages/Page・Resources・`/Font`辞書）だけを`resolveObject()`に置き換え、`/Contents`や`/ToUnicode`など仕様上streamで格納される参照は従来どおり同期のままです。
+  - **cache**: 同じ`PdfTextEditor`/`PdfStructure`インスタンス内で、同じObject Streamは一度だけdecodeし（`objectStreamCache`）、複数のcompressed objectを解決しても再decodeしません。password・file keyそのものはこのcacheに保持しません。
 - inline image（`BI ... ID ... EI`）の画像データは本文走査から除外します。画像そのものは編集対象外です。
 - 1ページの`/Contents`が複数streamに分かれている場合、各streamを独立に走査します。`BT`〜`ET`がstream境界をまたぐと、そのrunは列挙されません。
 - 置換後の文字幅に応じた再レイアウトはしません。元と近い幅のテキスト置換が主用途です。
@@ -119,7 +124,13 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - `/Index`省略時に`[0 /Size]`として解析されること、および部分的・非連続なobject番号範囲を指定する`/Index`を正しく解析できること
 - 新しいxref streamのtype 0（free）entryが、古いclassic xref sectionのobjectを無効化すること
 - classic xrefとcross-reference streamが`/Prev`で混在していても、最新版のobjectを正しくたどれること（`save()`が生成するincremental updateは常にclassic xrefのため、xref stream由来のPDFを保存・再読込みするたびにこの経路を通ります）
-- type 2 entry（object stream内のobject）が存在してもxref解析全体は失敗させず、そのobjectへ実際にアクセスした場合にのみ明確なエラーになること
+- type 2 entry（object stream内のobject）が存在してもxref解析全体は失敗させないこと。同期`object()`をtype 2 entryへ呼ぶと明確なエラーになり、非同期`resolveObject()`は正しくObject Streamを解決できること
+- Object Streamの`/N`・`/First`が不正（負・0・非数値・stream長超過・header途中）な場合、headerのペア数が`/N`に足りない場合、offsetが昇順でない・重複・範囲外の場合、`indexInStream`が`/N`以上の場合、xref type 2 entryが指すobject番号とObject Stream header内のobject番号が食い違う場合に、それぞれ明確なエラーになること（`test/object-stream.test.js`・`test/object-stream-resolve.test.js`）
+- 1つのObject Streamに複数objectを格納しても、それぞれ`streamNumber`/`indexInStream`から正しく個別に取得できること。同じObject Streamを複数object分解決しても、decodeが1回しか行われないこと（cache）
+- Object StreamがFlateDecode単独、およびFlateDecode + PNG Predictorの場合の双方で正しくdecodeできること
+- Standard Security Handler R4 / AESV2で暗号化されたPDFで、Object Stream自身がAES暗号化されている場合に、Object Stream自身のobject番号から導出したobject keyで復号してから内部objectを取得できること（内部object個々を復号しないこと）。AESV2 + Predictorの組合せでも同様に取得できること
+- Font dictionaryやPage dictionaryがObject Stream内に格納されていても、`/ToUnicode`による日本語復号やCatalog→Pages→Page→Contentsのページツリー解決が通常どおり動作すること
+- Object Stream対応後も、非暗号化PDFの`listTextRuns()` → `replaceText()` → `save()` → 再読込み、および暗号化PDFの認証 → 復号 → 検索 → `/P`文書変更禁止時の置換拒否が、いずれも従来どおり動作すること
 - 不正な`/W`・奇数個の`/Index`・`/W`と`/Index`が示す長さに合わないstreamで、ハングや過大なメモリ確保をせず例外になること
 - `/Index`の各subsectionが`/Size`を超える、順序が昇順でない、subsection同士が重複する、といった`/Index`と`/Size`の矛盾を例外にすること
 - cross-reference stream由来のPDFで`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること
@@ -177,6 +188,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 | `src/assessment.js` | 評価パイプライン本体。Node版CLIとブラウザPoCで共有する |
 | `src/flate.js` | `/FlateDecode`の展開・`/Filter`解釈。content stream・CMap stream・cross-reference streamで共有する |
 | `src/predictor.js` | `/DecodeParms /Predictor`（TIFF・PNG）の解除。stream種別に依存せず`src/flate.js`から共通利用する |
+| `src/object-stream.js` | `/Type /ObjStm`のheader（`/N`・`/First`）解析とcompressed objectの切り出し。暗号処理・xref処理は含まない |
 | `src/encryption.js` | `/Encrypt`辞書の診断（復号は行わない）。DOM非依存で、Nodeのテストからも読み込む |
 | `src/pdf-dictionary-text.js` | 辞書text内の名前・文字列・真偽値・入れ子辞書の抽出。`src/encryption.js`と`src/security/decrypt.js`が共有する |
 | `src/security/decrypt.js` | 暗号化PDFの認証（対応範囲の判定含む）とstream/string復号のオーケストレーション |
@@ -196,7 +208,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 5. 一致を1件選ぶと置換後テキスト欄にその一致テキストが入り、置換後の文字列を編集できる
 6. 「置換してPDFを保存」を押すと、`replaceText()` → `save()` → 保存結果の再読込確認（reopen）の順に検証し、成功した場合だけ`元ファイル名.edited.pdf`としてローカル保存する
 
-**PDFプレビュー。** 選択したPDFは`Blob`から`URL.createObjectURL()`で作った`blob:` URLを`<iframe>`に読み込むだけで、外部PDF.jsなどは追加していません。新しいPDFを選ぶたびに古いBlob URLは`URL.revokeObjectURL()`で破棄します。プレビューは自作エンジンの解析結果とは独立して、ファイルの読み取りに成功していれば表示を試みます。プレビューが表示できないブラウザ・PDFでも検索・置換機能自体は利用でき、逆に自作エンジンが本文runを抽出できないPDF（暗号化PDF、object streamにしか実体がないPDFなど）でもプレビューは表示を試みます。**プレビュー表示の成否とPDF解析の成否は独立した別の事実です。**
+**PDFプレビュー。** 選択したPDFは`Blob`から`URL.createObjectURL()`で作った`blob:` URLを`<iframe>`に読み込むだけで、外部PDF.jsなどは追加していません。新しいPDFを選ぶたびに古いBlob URLは`URL.revokeObjectURL()`で破棄します。プレビューは自作エンジンの解析結果とは独立して、ファイルの読み取りに成功していれば表示を試みます。プレビューが表示できないブラウザ・PDFでも検索・置換機能自体は利用でき、逆に自作エンジンが本文runを抽出できないPDF（対応範囲外の暗号化PDF、未対応のObject Stream構造など）でもプレビューは表示を試みます。**プレビュー表示の成否とPDF解析の成否は独立した別の事実です。**
 
 **文字列検索。** PDF内部では、"令和8年度" が `令` / `和` / `8` / `年度` のように複数の`Tj`オペランドへ分かれて格納されていることがあります。検索は`listTextRuns()`の結果を**同じcontent stream（`objectNumber`）由来・同じ`BT ... ET`ブロック（`textObjectId`）由来・かつ出現順が連続しているrun**だけを連結した区間ごとに行うため、①複数runにまたがる文字列を1つの検索語として一致させつつ、②別のcontent streamの末尾と次のstreamの先頭を連結して誤一致することを防ぎ、③**同じcontent stream内でも別の`BT ... ET`（ページ上の別位置へ独立して移動して描画されることが多い）を跨いだ連結**も防ぎます。③は`objectNumber`だけでは区別できないため、`src/content-stream.js`が`BT`ごとに採番する`textObjectId`をrunへ持たせ、検索側もこれを区切りに使っています。一致ごとに、構成するrun ID・run数・前後の文脈を保持し、画面にも表示します。
 
@@ -246,7 +258,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 
 `readerDisplay`はブラウザPoCでも自動判定せず、常に`null`です。**保存できたことと、意図どおり表示されることは別です。**保存した編集済PDFをAcrobat Reader等の独立したPDF readerで開いて確認し、結果は人間がJSONへ追記してください。
 
-失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream解析失敗（破損した`/W`・`/Index`・stream長など）、object stream未対応（xref streamのtype 2 entry）、Predictor未対応または不正（未対応の値・row長不正・TIFF Predictorの未対応bit depthなど）、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
+失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream解析失敗（破損した`/W`・`/Index`・stream長など）、object stream解析失敗（`/ObjStm`の`/N`・`/First`・header不整合など）、Predictor未対応または不正（未対応の値・row長不正・TIFF Predictorの未対応bit depthなど）、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
 
 このPoCの成功は、**一般的なPDFすべてへの対応を保証しません。**失敗するPDFがあることを前提に、出力元ごとの傾向を確かめるための画面です。
 

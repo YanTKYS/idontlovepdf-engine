@@ -1,6 +1,7 @@
 import { skipWhite as skipSpace } from "./syntax.js";
 import { decodeStreamBytes } from "./flate.js";
 import { firstIdBytes } from "./pdf-dictionary-text.js";
+import { parseObjectStream } from "./object-stream.js";
 
 /**
  * A byte-preserving "binary string" codec: unlike `TextDecoder("latin1")` (which
@@ -326,11 +327,32 @@ function parseReferenceArray(text, key) {
   return single ? [single] : [];
 }
 
+/**
+ * Interprets one Object Stream entry's raw bytes (see parseObjectStream() in
+ * object-stream.js) as a PDF object, in the same `{ number, generation, dictionary,
+ * data, value }` shape object() returns for a type 1 object. Per PDF spec 7.5.7, a
+ * compressed object is never a stream, and this codebase only ever needs to resolve
+ * dictionary-shaped compressed objects (Catalog/Pages/Page/Resources/Font -- see
+ * pageContentObjects() and pdf-document.js's font/resource lookups); anything else
+ * is rejected explicitly rather than guessed at.
+ */
+function interpretCompressedObject(entry, streamNumber) {
+  const dictionary = extractDictionary(entry.bytes, 0);
+  if (!dictionary) {
+    throw new Error(`Object stream ${streamNumber}: compressed object ${entry.objectNumber} is not a dictionary (only dictionary-shaped compressed objects are supported)`);
+  }
+  return { number: entry.objectNumber, generation: 0, dictionary: dictionary.text, data: null, value: null };
+}
+
 export class PdfStructure {
   constructor(bytes) {
     this.bytes = bytes;
     this.cache = new Map();
     this._xrefReady = null;
+    // ObjStm object number -> parseObjectStream()'s entries for it (decode once per
+    // Object Stream per instance; see decodeObjectStream()). Never touches password
+    // or file-key material itself -- only the already-decoded plaintext bytes.
+    this.objectStreamCache = new Map();
   }
 
   /**
@@ -349,13 +371,20 @@ export class PdfStructure {
     return this._xrefReady;
   }
 
+  /**
+   * Resolves a type 1 (normal indirect) object only -- synchronous, since reading
+   * one straight out of `this.bytes` needs no I/O. A type 2 (compressed) object
+   * needs its Object Stream decoded first (FlateDecode, Predictor, and possibly
+   * AES -- see decodeObjectStream()), which is why that path is async: use
+   * resolveObject() instead when a reference might be compressed.
+   */
   object(referenceOrNumber) {
     const number = typeof referenceOrNumber === "number" ? referenceOrNumber : referenceOrNumber.number;
     if (this.cache.has(number)) return this.cache.get(number);
     const entry = this.entries.get(number);
     if (!entry) throw new Error(`PDF object ${number} is missing from the xref table`);
     if (entry.compressed) {
-      throw new Error(`Object streams are not supported (PDF object ${number} is stored in object stream ${entry.streamNumber})`);
+      throw new Error(`PDF object ${number} is a compressed object stored in object stream ${entry.streamNumber}; use resolveObject() instead of object() to resolve it`);
     }
     let cursor = skipSpace(this.bytes, entry.offset);
     const objectNumber = readInteger(this.bytes, cursor);
@@ -396,27 +425,106 @@ export class PdfStructure {
     return object;
   }
 
-  pageContentObjects() {
-    const catalog = this.object(this.root);
+  /**
+   * Resolves any object -- type 1 (a normal indirect object, via the synchronous
+   * object() above, which this shares its cache with) or type 2 (compressed inside
+   * an Object Stream). Kept separate from object() rather than making the whole
+   * object model async: only Object Streams need decoding (FlateDecode, Predictor,
+   * and possibly AES -- see decodeObjectStream()), so only the call sites that can
+   * actually hit a type 2 entry (pageContentObjects() below, and
+   * pdf-document.js's font/resource lookups) need to await this instead.
+   *
+   * `security`/`decrypt` are only consulted for a type 2 entry, and only when the
+   * PDF is encrypted: `decrypt` is the same decryptStreamBytes()-shaped function
+   * pdf-document.js already uses for content streams, passed in rather than
+   * imported here so this module stays unaware of what encryption even is (as it
+   * already was before this) -- it just calls what it's given.
+   */
+  async resolveObject(referenceOrNumber, security, decrypt) {
+    const number = typeof referenceOrNumber === "number" ? referenceOrNumber : referenceOrNumber.number;
+    if (this.cache.has(number)) return this.cache.get(number);
+    const entry = this.entries.get(number);
+    if (!entry) throw new Error(`PDF object ${number} is missing from the xref table`);
+    if (!entry.compressed) return this.object(number);
+    const objectStreamEntries = await this.decodeObjectStream(entry.streamNumber, security, decrypt);
+    if (entry.indexInStream < 0 || entry.indexInStream >= objectStreamEntries.length) {
+      throw new Error(
+        `Object stream index is out of range: object ${number} references index ${entry.indexInStream}` +
+        ` in object stream ${entry.streamNumber}, which holds ${objectStreamEntries.length} object(s)`
+      );
+    }
+    const found = objectStreamEntries[entry.indexInStream];
+    if (found.objectNumber !== number) {
+      throw new Error(
+        `Object stream object number mismatch: xref expected object ${number}, ` +
+        `object stream ${entry.streamNumber} index ${entry.indexInStream} contains object ${found.objectNumber}`
+      );
+    }
+    const object = interpretCompressedObject(found, entry.streamNumber);
+    this.cache.set(number, object);
+    return object;
+  }
+
+  /**
+   * Decodes Object Stream `streamNumber` into its component objects' byte ranges
+   * (see parseObjectStream() in object-stream.js), decoding it at most once per
+   * instance (objectStreamCache) regardless of how many of its compressed objects
+   * are actually resolved.
+   *
+   * Decode order, per PDF spec 7.6 (encryption applies to the Object Stream itself
+   * as a whole, before anything inside it is interpreted -- individual compressed
+   * objects are never separately encrypted, so their generation number, always 0
+   * per spec, plays no part in this): raw stream bytes -> AES decrypt (using the
+   * Object Stream object's own number/generation, when `security` is set) ->
+   * FlateDecode -> Predictor (both via the same decodeStreamBytes() every other
+   * stream in this codebase uses) -> header/object parsing. This is exactly the
+   * same pipeline decodeStream() in pdf-document.js applies to a content stream;
+   * only the last step (interpreting the plaintext) differs.
+   */
+  async decodeObjectStream(streamNumber, security, decrypt) {
+    if (this.objectStreamCache.has(streamNumber)) return this.objectStreamCache.get(streamNumber);
+    const objectStream = this.object(streamNumber);
+    if (!/\/Type\s*\/ObjStm\b/.test(objectStream.dictionary)) {
+      throw new Error(`PDF object ${streamNumber} is not an object stream (expected /Type /ObjStm)`);
+    }
+    const objectCount = directInteger(objectStream.dictionary, "N");
+    const firstOffset = directInteger(objectStream.dictionary, "First");
+    const rawData = security
+      ? await decrypt(security, { objectNumber: objectStream.number, generation: objectStream.generation, bytes: objectStream.data })
+      : objectStream.data;
+    const decoded = await decodeStreamBytes(objectStream.dictionary, rawData, `object stream ${streamNumber}`);
+    const entries = parseObjectStream(decoded, { objectCount, firstOffset });
+    this.objectStreamCache.set(streamNumber, entries);
+    return entries;
+  }
+
+  /**
+   * `security`/`decrypt`: see resolveObject() above. Both are optional and only
+   * matter when the Catalog, a Pages/Page node, or a Resources dictionary happens
+   * to be a compressed (type 2) object -- Contents (always a stream) never is, per
+   * spec, so that lookup stays on the synchronous object() unchanged.
+   */
+  async pageContentObjects(security, decrypt) {
+    const catalog = await this.resolveObject(this.root, security, decrypt);
     const pagesReference = reference(catalog.dictionary, "Pages");
     if (!pagesReference) throw new Error("PDF catalog has no /Pages reference");
     const result = [];
     const ancestors = new Set();
     const visited = new Set();
-    const visit = (pageReference, inheritedResources = null) => {
+    const visit = async (pageReference, inheritedResources = null) => {
       if (ancestors.has(pageReference.number)) throw new Error("Circular /Kids chain in the PDF page tree");
       // A node reachable by more than one path is walked once; without this a page
       // tree that repeats a node would report its content streams several times.
       if (visited.has(pageReference.number)) return;
       visited.add(pageReference.number);
       ancestors.add(pageReference.number);
-      const page = this.object(pageReference);
+      const page = await this.resolveObject(pageReference, security, decrypt);
       const resourcesReference = reference(page.dictionary, "Resources");
       const resources = resourcesReference
-        ? this.object(resourcesReference)
+        ? await this.resolveObject(resourcesReference, security, decrypt)
         : (/\/Resources\s*<</.test(page.dictionary) ? page : inheritedResources);
       if (/\/Type\s*\/Pages\b/.test(page.dictionary)) {
-        for (const kid of parseReferenceArray(page.dictionary, "Kids")) visit(kid, resources);
+        for (const kid of parseReferenceArray(page.dictionary, "Kids")) await visit(kid, resources);
       } else if (/\/Type\s*\/Page\b/.test(page.dictionary)) {
         for (const content of parseReferenceArray(page.dictionary, "Contents")) result.push({
           object: this.object(content),
@@ -425,7 +533,7 @@ export class PdfStructure {
       }
       ancestors.delete(pageReference.number);
     };
-    visit(pagesReference);
+    await visit(pagesReference);
     return result;
   }
 }

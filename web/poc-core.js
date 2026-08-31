@@ -30,7 +30,7 @@ export const ASSESSMENT_FIELDS = [
 ];
 
 const ERROR_CATEGORIES = [
-  { pattern: /Object streams are not supported/i, label: "object stream未対応（xref streamのtype 2 entry）" },
+  { pattern: /object stream/i, label: "object stream解析失敗（/ObjStm・xref streamのtype 2 entry）" },
   { pattern: /cross-reference stream/i, label: "xref stream解析失敗（/W・/Index・stream長など）" },
   { pattern: /predictor/i, label: "Predictor未対応または不正（値・row長・bit depthなど）" },
   {
