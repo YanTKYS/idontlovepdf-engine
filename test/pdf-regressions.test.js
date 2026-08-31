@@ -91,13 +91,16 @@ test("lets a newer free xref entry delete an object an older section still lists
   );
 });
 
-test("refuses a predictor-encoded stream rather than decoding it to mangled text", async () => {
+test("refuses an unsupported /Predictor value rather than decoding it to mangled text", async () => {
+  // PNG/TIFF predictors (10-15, 2) are now supported — see test/predictor.test.js —
+  // but an unrecognised /Predictor number must still fail cleanly rather than being
+  // guessed at.
   const stream = streamObject(4, "BT (Predicted) Tj ET", {
     compressed: true,
-    dictionary: "/DecodeParms << /Predictor 12 /Columns 4 >>"
+    dictionary: "/DecodeParms << /Predictor 99 /Columns 4 >>"
   });
   await assert.rejects(
     new PdfTextEditor(buildPdf([...singlePage, stream])).listTextRuns(),
-    /Unsupported stream filter: FlateDecode with a \/Predictor/
+    /Unsupported \/Predictor value: 99/
   );
 });

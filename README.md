@@ -8,9 +8,9 @@
 
 - ブラウザ標準 API のみを使い、処理は端末内で完結
 - literal string と hexadecimal string、および `TJ` 配列に対応
-- 無圧縮および `/FlateDecode` content stream に対応
+- 無圧縮および `/FlateDecode` content stream に対応。`/DecodeParms /Predictor`（TIFF Predictor 2の8bit、PNG Predictor 10〜15）にも対応
 - classic xrefとstreamの `/Length`からオブジェクト境界を解析（本文中の`endobj`等を境界と誤認しない）
-- PDF 1.5以降の**cross-reference stream**（`/Type /XRef`）に対応。classic xrefとの`/Prev`混在も可
+- PDF 1.5以降の**cross-reference stream**（`/Type /XRef`）に対応。classic xrefとの`/Prev`混在も可。xref stream自体がPredictor付きでも解析可能
 - Catalog → Pages → Page → Contentsをたどり、ページ本文以外のstreamを除外
 - 既存フォントの`/ToUnicode` CMap（`bfchar`・`bfrange`）によるUnicode復号と再エンコード
 - 元ファイルを壊さず、PDF incremental update として変更を追記
@@ -67,7 +67,15 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 ## 制約と次の段階
 
 - ページ上の座標、フォント名、文字サイズはまだ公開していません。
-- `/ASCII85Decode`、画像化された文字、暗号化PDFは未対応です。`/FlateDecode`に`/DecodeParms`の`/Predictor`が付く場合も、誤った本文を出さないよう未対応として報告します。
+- `/ASCII85Decode`、画像化された文字、暗号化PDFは未対応です。
+- `/DecodeParms /Predictor`は、`src/predictor.js`が次の範囲に対応します。
+  - **Predictor 1**（補正なし）: そのまま
+  - **Predictor 10〜15**（PNG Predictor: None/Sub/Up/Average/Paeth）: PDF仕様どおり、値の大小に関わらずrowごとの先頭1バイトで実際のfilter typeを読み取って復元します（`/Predictor`の数値はどのfilterが多いかの目安に過ぎず、行ごとの判定は仕様上常に必要です）
+  - **Predictor 2**（TIFF Predictor）: `/BitsPerComponent 8`のみ対応。それ以外のbit depth（1/2/4/16）は`Unsupported TIFF Predictor BitsPerComponent: N`という明確なエラーになります
+  - `/Columns`・`/Colors`・`/BitsPerComponent`省略時はそれぞれ既定値1・1・8を使用。`/DecodeParms << ... >>`と単要素配列`/DecodeParms [ << ... >> ]`の両形式に対応（複数filter chain全般は対象外）
+  - `/Predictor`・`/Columns`・`/BitsPerComponent`等の値は、キーに続くトークン全体をPDF整数として厳密に検証します。`/Predictor 12.5`のような小数や`/Columns foo`のような非数値は、先頭の数字部分だけを読んで推測することなく、そのまま不正値として拒否します。`/BitsPerComponent`はPDF仕様が定める`1`・`2`・`4`・`8`・`16`以外（例: `3`や`5`）も明示的に拒否します
+  - Predictor解除はxref stream・page content stream・ToUnicode CMap streamのいずれからも共通利用し（`src/predictor.js`と`src/flate.js`に集約）、失敗時のエラーには`content stream object 45: ...`のようにどのstreamで失敗したかを付記します
+  - 保存時（`save()`）は、編集済みcontent streamを常にPredictorなしの素の`/FlateDecode`として書き戻します（`/DecodeParms`も削除）。元PDFがPredictor付きでも、incremental updateとして追記される新しいstreamにはPredictorを再付与しません
 - cross-reference streamのtype 2 entry（object stream内のobject）は、xref解析自体は失敗させず内部的に保持しますが、そのobjectへ実際にアクセスした時点で「Object streams are not supported」という明確なエラーになります。object stream（`/ObjStm`）そのものの実装はまだ行っていません。Catalog / Pages / Contentsなど今回必要なobjectがtype 1（通常のindirect object）であれば処理を継続できます。
 - inline image（`BI ... ID ... EI`）の画像データは本文走査から除外します。画像そのものは編集対象外です。
 - 1ページの`/Contents`が複数streamに分かれている場合、各streamを独立に走査します。`BT`〜`ET`がstream境界をまたぐと、そのrunは列挙されません。
@@ -96,6 +104,13 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - 不正な`/W`・奇数個の`/Index`・`/W`と`/Index`が示す長さに合わないstreamで、ハングや過大なメモリ確保をせず例外になること
 - `/Index`の各subsectionが`/Size`を超える、順序が昇順でない、subsection同士が重複する、といった`/Index`と`/Size`の矛盾を例外にすること
 - cross-reference stream由来のPDFで`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること
+- PNG Predictor（None・Sub・Up・Average・Paeth）が、独立に実装した参照エンコーダで作った既知fixtureと完全一致で復元できること。`Predictor`の数値（10〜15）に関わらず、rowごとの実際のfilter typeバイトを読み取ること
+- TIFF Predictor 2が、`Colors`が2以上（同一color componentの前サンプルを正しく参照）でも復元できること。8bit以外の`BitsPerComponent`は明確なエラーになること
+- `/Columns`・`/Colors`・`/BitsPerComponent`省略時の既定値（1・1・8）、および`/DecodeParms`の`<< >>`形式・単要素配列`[ << >> ]`形式の両方を正しく解釈できること
+- rowサイズがstream長と合わない場合・未知のPNG filter typeの場合・`/Columns`等が0以下または安全な整数範囲外の場合に、ハングや過大なメモリ確保をせず例外になること
+- `/Predictor 12.5`・`/Columns foo`のような小数・非数値のDecodeParms値を、先頭の数字だけを読んで推測せず拒否すること。`/BitsPerComponent`が仕様の許容値（1・2・4・8・16）以外の場合（例: 3、5）に例外になること
+- Predictor付きのxref stream・content stream・ToUnicode CMap streamそれぞれから正しく本文runやCMapを取得できること
+- Predictor付きcontent streamに対して`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること。保存後のstreamはPredictorなしの`/FlateDecode`として書き戻され、`/DecodeParms`も除去されること
 
 これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。
 
@@ -127,6 +142,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 | `web/text-search.js` | DOM非依存の文字列検索・置換モデル。Nodeのテストからも読み込む |
 | `src/assessment.js` | 評価パイプライン本体。Node版CLIとブラウザPoCで共有する |
 | `src/flate.js` | `/FlateDecode`の展開・`/Filter`解釈。content stream・CMap stream・cross-reference streamで共有する |
+| `src/predictor.js` | `/DecodeParms /Predictor`（TIFF・PNG）の解除。stream種別に依存せず`src/flate.js`から共通利用する |
 
 ### 単一PDF検証: PDFプレビュー＋文字列検索・置換
 
@@ -182,7 +198,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 
 `readerDisplay`はブラウザPoCでも自動判定せず、常に`null`です。**保存できたことと、意図どおり表示されることは別です。**保存した編集済PDFをAcrobat Reader等の独立したPDF readerで開いて確認し、結果は人間がJSONへ追記してください。
 
-失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream解析失敗（破損した`/W`・`/Index`・stream長など）、object stream未対応（xref streamのtype 2 entry）、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
+失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream解析失敗（破損した`/W`・`/Index`・stream長など）、object stream未対応（xref streamのtype 2 entry）、Predictor未対応または不正（未対応の値・row長不正・TIFF Predictorの未対応bit depthなど）、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
 
 このPoCの成功は、**一般的なPDFすべてへの対応を保証しません。**失敗するPDFがあることを前提に、出力元ごとの傾向を確かめるための画面です。
 

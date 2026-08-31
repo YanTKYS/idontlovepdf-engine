@@ -231,7 +231,7 @@ function decodeXrefStreamEntries(decoded, widths, indexPairs) {
 async function parseXrefStreamSection(bytes, offset) {
   const object = readRawStreamObject(bytes, offset);
   if (!/\/Type\s*\/XRef\b/.test(object.dictionary)) throw new Error("Expected a cross-reference stream");
-  const decoded = await decodeStreamBytes(object.dictionary, object.data);
+  const decoded = await decodeStreamBytes(object.dictionary, object.data, `xref stream object ${object.number}`);
   const size = directInteger(object.dictionary, "Size");
   if (!Number.isInteger(size) || size < 0) throw new Error("Cross-reference stream has an invalid /Size");
   const widths = parseFieldWidths(object.dictionary);

@@ -26,14 +26,21 @@ function concat(chunks) {
   return result;
 }
 
-function decodeStream(object) {
-  return decodeStreamBytes(object.dictionary, object.data);
+function decodeStream(object, kind) {
+  return decodeStreamBytes(object.dictionary, object.data, `${kind} object ${object.number}`);
 }
 
 function replacementDictionary(dictionary, length) {
-  if (/\/Length\s+\d+\s+\d+\s+R/.test(dictionary)) return dictionary.replace(/\/Length\s+\d+\s+\d+\s+R/, `/Length ${length}`);
-  if (/\/Length\s+\d+/.test(dictionary)) return dictionary.replace(/\/Length\s+\d+/, `/Length ${length}`);
-  return dictionary.replace(/>>\s*$/, `/Length ${length} >>`);
+  // save() re-deflates the decoded (already predictor-reversed) content directly,
+  // without re-applying any predictor (see save()'s comment). A /DecodeParms carried
+  // over from the original stream would tell a reader reopening this file to reverse
+  // a predictor that the new bytes were never encoded with, so it is dropped here.
+  const withoutDecodeParms = dictionary
+    .replace(/\/DecodeParms\s*\[\s*<<[\s\S]*?>>\s*\]/, "")
+    .replace(/\/DecodeParms\s*<<[\s\S]*?>>/, "");
+  if (/\/Length\s+\d+\s+\d+\s+R/.test(withoutDecodeParms)) return withoutDecodeParms.replace(/\/Length\s+\d+\s+\d+\s+R/, `/Length ${length}`);
+  if (/\/Length\s+\d+/.test(withoutDecodeParms)) return withoutDecodeParms.replace(/\/Length\s+\d+/, `/Length ${length}`);
+  return withoutDecodeParms.replace(/>>\s*$/, `/Length ${length} >>`);
 }
 
 function fontReferences(resources, structure) {
@@ -51,7 +58,7 @@ async function loadFontMaps(resources, structure) {
     const toUnicode = reference(font.dictionary, "ToUnicode");
     if (!toUnicode) continue;
     const cmapObject = structure.object(toUnicode);
-    result.set(name, parseToUnicodeCMap(await decodeStream(cmapObject)));
+    result.set(name, parseToUnicodeCMap(await decodeStream(cmapObject, "ToUnicode stream")));
   }
   return result;
 }
@@ -79,7 +86,7 @@ export class PdfTextEditor {
         // once would hand out duplicate ids and append the object twice on save.
         if (seen.has(object.number)) continue;
         seen.add(object.number);
-        const decoded = await decodeStream(object);
+        const decoded = await decodeStream(object, "content stream");
         const runs = scanTextRuns(decoded);
         if (runs.length) this.streams.push({ object, decoded, runs, fontMaps: await loadFontMaps(resources, this.document) });
       }
@@ -118,6 +125,9 @@ export class PdfTextEditor {
       });
       if (!replacements.length) continue;
       let data = replaceTextRuns(stream.decoded, replacements);
+      // stream.decoded is already predictor-reversed (see decodeStreamBytes()); the
+      // edited bytes are re-deflated as plain FlateDecode without reapplying a
+      // predictor. replacementDictionary() drops any /DecodeParms accordingly.
       if (filters(stream.object.dictionary)[0] === "FlateDecode") data = await deflate(data);
       updates.push({ ...stream.object, dictionary: replacementDictionary(stream.object.dictionary, data.length), data });
     }
