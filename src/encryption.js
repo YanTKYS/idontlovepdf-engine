@@ -96,17 +96,26 @@ function cfmLabel(cfm) {
   }
 }
 
+/**
+ * A crypt filter dictionary's own `/Length` is in **bytes** (PDF spec 7.6.5, Table
+ * 25) — unlike the Encrypt dictionary's top-level `/Length`, which is in **bits**
+ * (7.6.3.2, Table 20). Reporting both units explicitly here avoids a caller ever
+ * printing the raw byte count next to a "bit" label, which would understate the key
+ * size by 8x (e.g. AESV2's `/Length 16` is a 128-bit key, not a 16-bit one).
+ */
 function parseCryptFilters(dictionaryText) {
   const cfText = nestedDictionaryText(dictionaryText, "CF");
   if (!cfText) return [];
   return namedSubDictionaries(cfText).map(({ name, text }) => {
     const method = nameValue(text, "CFM");
-    const length = directInteger(text, "Length");
+    const lengthRaw = directInteger(text, "Length");
+    const lengthBytes = Number.isInteger(lengthRaw) ? lengthRaw : null;
     return {
       name,
       method,
       methodLabel: method ? cfmLabel(method) : null,
-      length: Number.isInteger(length) ? length : null,
+      lengthBytes,
+      lengthBits: lengthBytes === null ? null : lengthBytes * 8,
       authEvent: nameValue(text, "AuthEvent")
     };
   });
@@ -195,8 +204,6 @@ export function analyzeEncryption(structure) {
   const revisionRaw = directInteger(dictionaryText, "R");
   const revision = Number.isInteger(revisionRaw) ? revisionRaw : null;
   const lengthRaw = directInteger(dictionaryText, "Length");
-  // /Length defaults to 40 (bits) when absent, per the PDF spec.
-  const lengthBits = Number.isInteger(lengthRaw) ? lengthRaw : 40;
 
   const base = {
     encrypted: true,
@@ -204,8 +211,7 @@ export function analyzeEncryption(structure) {
     subFilter: nameValue(dictionaryText, "SubFilter"),
     standardHandler,
     version,
-    revision,
-    lengthBits
+    revision
   };
 
   if (!standardHandler) {
@@ -215,6 +221,7 @@ export function analyzeEncryption(structure) {
     return {
       ...base,
       lengthBits: Number.isInteger(lengthRaw) ? lengthRaw : null,
+      lengthBitsSource: Number.isInteger(lengthRaw) ? "explicit" : "unspecified",
       permissionsRaw: null,
       permissions: null,
       streamFilter: null,
@@ -225,6 +232,24 @@ export function analyzeEncryption(structure) {
     };
   }
 
+  // The top-level /Length's spec default of 40 bits only applies to algorithm codes
+  // 1 and 2 (/V 1 or 2, plain RC4). Under /V 4 or 5 the actual key length comes from
+  // the crypt filter in /CF (or is fixed at 256 for /V 5), so an absent /Length
+  // there means "not stated here", not "40" -- defaulting to 40 regardless of /V
+  // would misreport an AES-128/AES-256 key as 40-bit RC4.
+  let lengthBits;
+  let lengthBitsSource;
+  if (Number.isInteger(lengthRaw)) {
+    lengthBits = lengthRaw;
+    lengthBitsSource = "explicit";
+  } else if (version === 1 || version === 2) {
+    lengthBits = 40;
+    lengthBitsSource = "default";
+  } else {
+    lengthBits = null;
+    lengthBitsSource = "unspecified";
+  }
+
   const permissionsRaw = signedInteger(dictionaryText, "P");
   const cryptFilters = version === 4 || version === 5 ? parseCryptFilters(dictionaryText) : [];
   const streamFilter = nameValue(dictionaryText, "StmF");
@@ -232,6 +257,8 @@ export function analyzeEncryption(structure) {
 
   return {
     ...base,
+    lengthBits,
+    lengthBitsSource,
     permissionsRaw,
     permissions: decodePermissions(permissionsRaw, revision),
     streamFilter,

@@ -173,6 +173,18 @@ function permissionLine(name, value) {
   return `${PERMISSION_LABELS[name]}: ${value ? "許可されている" : "制限されている"}`;
 }
 
+/**
+ * Encrypt dictionary直下の /Length（bit単位）の表示。/V 1・2 以外で /Length が
+ * 省略されている場合、実際の鍵長はCrypt Filter（/CF）側が決めるため、仕様上の
+ * 既定値40bitを当てはめると誤り（例: AES-128を40bit RC4のように見せてしまう）。
+ * そのため「明記」「仕様上の既定値」「不明・Crypt Filter側で決まる」を区別する。
+ */
+function lengthBitsLine(diagnosis) {
+  if (diagnosis.lengthBitsSource === "explicit") return `${diagnosis.lengthBits} bit`;
+  if (diagnosis.lengthBitsSource === "default") return `${diagnosis.lengthBits} bit（/Length省略時の仕様上の既定値）`;
+  return "未指定（/CF側の鍵長を参照。下記Crypt Filterを参照）";
+}
+
 function dl(rows) {
   const node = element("dl");
   for (const [label, value] of rows) node.append(element("dt", { text: label }), element("dd", { text: String(value) }));
@@ -201,7 +213,7 @@ function renderEncryptionDiagnosis(container, diagnosis) {
     ["Security Handler", "Standard"],
     ["V（バージョン）", diagnosis.version ?? "不明"],
     ["R（リビジョン）", diagnosis.revision ?? "不明"],
-    ["Length（鍵長・bit）", diagnosis.lengthBits ?? "不明"],
+    ["Length（Encrypt辞書直下、bit単位）", lengthBitsLine(diagnosis)],
     ["EncryptMetadata", diagnosis.encryptMetadata === null ? "不明" : (diagnosis.encryptMetadata ? "true（メタデータも暗号化）" : "false（メタデータは平文）")]
   ]));
 
@@ -213,8 +225,10 @@ function renderEncryptionDiagnosis(container, diagnosis) {
         filter.name === diagnosis.streamFilter ? "stream用" : null,
         filter.name === diagnosis.stringFilter ? "string用" : null
       ].filter(Boolean).join("・");
+      // Crypt Filterの /Length は bytes 単位（Encrypt辞書直下の /Length とは単位が異なる）。
+      const lengthText = filter.lengthBytes === null ? "不明" : `${filter.lengthBytes} bytes（${filter.lengthBits} bit）`;
       list.append(element("li", {
-        text: `${filter.name}${role ? `（${role}）` : ""}: CFM=${filter.method ?? "不明"}（${filter.methodLabel ?? "不明"}） / Length=${filter.length ?? "不明"} bit / AuthEvent=${filter.authEvent ?? "(なし)"}`
+        text: `${filter.name}${role ? `（${role}）` : ""}: CFM=${filter.method ?? "不明"}（${filter.methodLabel ?? "不明"}） / Length=${lengthText} / AuthEvent=${filter.authEvent ?? "(なし)"}`
       }));
     }
     container.append(list);
@@ -250,7 +264,7 @@ function renderEncryptionDebug(container, diagnosis, encryptReference) {
     ["standardHandler", String(diagnosis.standardHandler)],
     ["V", String(diagnosis.version)],
     ["R", String(diagnosis.revision)],
-    ["Length（raw, bit）", String(diagnosis.lengthBits)],
+    ["Length（Encrypt辞書直下, bit, raw）", `${diagnosis.lengthBits} (source: ${diagnosis.lengthBitsSource})`],
     ["StmF", diagnosis.streamFilter ?? "(なし)"],
     ["StrF", diagnosis.stringFilter ?? "(なし)"],
     ["EFF", diagnosis.encryptFileFilter ?? "(なし)"],

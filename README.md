@@ -79,8 +79,8 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
   - 保存時（`save()`）は、編集済みcontent streamを常にPredictorなしの素の`/FlateDecode`として書き戻します（`/DecodeParms`も削除）。元PDFがPredictor付きでも、incremental updateとして追記される新しいstreamにはPredictorを再付与しません
 - **暗号化PDF（`/Encrypt`）は、`src/encryption.js`が診断のみ対応します。**トレーラー（またはxref streamの辞書）が持つ`/Encrypt N 0 R`を検出しても、xref解析自体は失敗させず先まで進めます。実際に本文を読もうとした時点（`listTextRuns()`）で、`Error`に`encryptionDiagnosis`という診断結果を添えて拒否します。診断は次を読み取ります（**復号やパスワード検証は一切行いません**）。
   - `/Filter`が`/Standard`かどうか（Standard Security Handlerかどうか）。`/Adobe.PubSec`のような別方式の場合は、`/Filter`・`/SubFilter`のみ報告し、それ以上（`/P`・`/CF`など）はStandard固有の解釈を当てはめず`null`のまま止めます
-  - `/V`（暗号化バージョン）・`/R`（リビジョン）・`/Length`（鍵長bit、省略時は仕様どおり40）・`/EncryptMetadata`（省略時は仕様どおり`true`）
-  - `/CF`（Crypt Filter辞書）内の各filterの`/CFM`（`/None`・`/V2`＝RC4系・`/AESV2`＝AES-128系・`/AESV3`＝AES-256系のいずれかを日本語ラベル付きで報告）・`/Length`・`/AuthEvent`、および`/StmF`・`/StrF`（どのfilterをstream/stringに使うか）
+  - `/V`（暗号化バージョン）・`/R`（リビジョン）・`/Length`（Encrypt辞書直下、**bit**単位）・`/EncryptMetadata`（省略時は仕様どおり`true`）。`/Length`省略時の仕様上の既定値40bitは`/V 1`・`/V 2`（RC4のみ）にのみ適用します。`/V 4`・`/V 5`では実際の鍵長は`/CF`側（またはAES-256固定）が決めるため、`/Length`省略時は40bitとみなさず「未指定」として区別します（`lengthBitsSource`: `explicit`/`default`/`unspecified`）
+  - `/CF`（Crypt Filter辞書）内の各filterの`/CFM`（`/None`・`/V2`＝RC4系・`/AESV2`＝AES-128系・`/AESV3`＝AES-256系のいずれかを日本語ラベル付きで報告）・`/Length`・`/AuthEvent`、および`/StmF`・`/StrF`（どのfilterをstream/stringに使うか）。**Crypt Filterの`/Length`はEncrypt辞書直下の`/Length`と異なり`bytes`単位**（PDF仕様 7.6.5 表25）のため、`lengthBytes`（原文の値）と`lengthBits`（`× 8`した値）の両方を返し、bytesの値をbitのラベルで表示してしまう取り違えを防ぎます（例: `/Length 16` は128bit鍵であり16bit鍵ではありません）
   - `/P`の権限bit（符号付き32bit整数として解釈）: 印刷・文書変更・内容コピー・注釈の4項目に加え、`/R >= 3`の場合のみフォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷の4項目。`/R 2`ではこの4項目を仕様上未定義として`null`のまま返し、bitを読んで推測することはしません
   - `/V`・`/R`・`/CFM`の組み合わせからの**推定**方式（`estimatedMethod`）。これは辞書の記載そのもの（`filter`・`version`・`revision`・`cryptFilters`など）とは別のフィールドとして返し、「確定できる情報」と「推定」を混同しないようにしています
   - パスワードの検証は行わないため、パスワード状態は常に「未判定 / PoC対象外」です。他のPDF readerで開けたことをもって「パスワードなし」と判定することもありません
@@ -120,7 +120,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - `/Predictor 12.5`・`/Columns foo`のような小数・非数値のDecodeParms値を、先頭の数字だけを読んで推測せず拒否すること。`/BitsPerComponent`が仕様の許容値（1・2・4・8・16）以外の場合（例: 3、5）に例外になること
 - Predictor付きのxref stream・content stream・ToUnicode CMap streamそれぞれから正しく本文runやCMapを取得できること
 - Predictor付きcontent streamに対して`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること。保存後のstreamはPredictorなしの`/FlateDecode`として書き戻され、`/DecodeParms`も除去されること
-- `/Encrypt`を持つトレーラーでもxref解析自体は失敗せず、`listTextRuns()`の時点で初めて拒否されること。診断（`encryptionDiagnosis`）が`/V`（1・2・4・5）・`/R`・`/Length`（省略時40）・`/EncryptMetadata`（true/false/省略時true）・`/CF`の`/CFM`（`/None`・`/V2`・`/AESV2`・`/AESV3`のラベル付け）を正しく読み取ること
+- `/Encrypt`を持つトレーラーでもxref解析自体は失敗せず、`listTextRuns()`の時点で初めて拒否されること。診断（`encryptionDiagnosis`）が`/V`（1・2・4・5）・`/R`・`/Length`（`/V 1`・`/V 2`のみ省略時40、`/V 4`・`/V 5`では省略時`unspecified`のまま推測しない）・`/EncryptMetadata`（true/false/省略時true）・`/CF`の`/CFM`（`/None`・`/V2`・`/AESV2`・`/AESV3`のラベル付け、bytes単位の`/Length`をbit単位に変換した値と併記）を正しく読み取ること
 - 既知の`/P`値（`R4`で`-44`）から、印刷・内容コピーは許可、文書変更・注釈は制限、かつ`/R >= 3`の4項目（フォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷）はすべて許可、という仕様どおりのbit解釈になること。`/R 2`ではこの4項目を`null`のまま返し、bitを読んで推測しないこと
 - `/Filter /Adobe.PubSec`のようなStandard以外のSecurity Handlerを誤ってStandardとして扱わず、`/P`・`/CF`など固有フィールドを解釈しないこと
 - 暗号化されたトレーラーがcross-reference stream由来（classic xrefの`trailer`ではなく`/Type /XRef`辞書の`/Encrypt`）でも参照解決できること。また、xref stream + `/FlateDecode` + PNG Predictorという実PDFで見られる組み合わせと`/Encrypt`が同時に成立していても、診断まで到達できること

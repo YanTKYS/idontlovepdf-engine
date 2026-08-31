@@ -57,12 +57,28 @@ test("reads /R independently of /V", () => {
 
 /* --------------------------------------------------- 5: /Length bits, including its default */
 
-test("reads /Length in bits, defaulting to 40 when the Standard handler omits it", () => {
+test("reads /Length in bits when explicit", () => {
   const withLength = analyzeEncryption(fixture("<< /Filter /Standard /V 2 /R 3 /Length 128 /P -1 >>"));
   assert.equal(withLength.lengthBits, 128);
+  assert.equal(withLength.lengthBitsSource, "explicit");
+});
 
-  const withoutLength = analyzeEncryption(fixture("<< /Filter /Standard /V 1 /R 2 /P -1 >>"));
-  assert.equal(withoutLength.lengthBits, 40);
+test("defaults /Length to 40 bits only for /V 1 or /V 2 (plain RC4), where the spec's default applies", () => {
+  for (const v of [1, 2]) {
+    const diagnosis = analyzeEncryption(fixture(`<< /Filter /Standard /V ${v} /R 2 /P -1 >>`));
+    assert.equal(diagnosis.lengthBits, 40);
+    assert.equal(diagnosis.lengthBitsSource, "default");
+  }
+});
+
+test("does not default an absent /Length to 40 bits under /V 4 or /V 5, where the crypt filter decides key length", () => {
+  // Defaulting to 40 here would misreport an AES-128/AES-256 crypt filter as
+  // 40-bit RC4 -- the exact bug this test guards against.
+  for (const v of [4, 5]) {
+    const diagnosis = analyzeEncryption(fixture(`<< /Filter /Standard /V ${v} /R 4 /P -1 >>`));
+    assert.equal(diagnosis.lengthBits, null);
+    assert.equal(diagnosis.lengthBitsSource, "unspecified");
+  }
 });
 
 /* --------------------------------------------------- 6: /EncryptMetadata true/false/omitted */
@@ -88,10 +104,12 @@ test("parses /CF crypt filters and labels each /CFM family", () => {
   assert.equal(diagnosis.streamFilter, "StdCF");
   assert.equal(diagnosis.stringFilter, "StdCF");
   assert.deepEqual(diagnosis.cryptFilters.find((f) => f.name === "StdCF"), {
-    name: "StdCF", method: "AESV2", methodLabel: "AES-128系", length: 16, authEvent: "DocOpen"
+    // A crypt filter's own /Length is in BYTES (unlike the Encrypt dictionary's
+    // top-level /Length, which is in bits) -- 16 bytes is a 128-bit AES-128 key.
+    name: "StdCF", method: "AESV2", methodLabel: "AES-128系", lengthBytes: 16, lengthBits: 128, authEvent: "DocOpen"
   });
   assert.deepEqual(diagnosis.cryptFilters.find((f) => f.name === "Identity"), {
-    name: "Identity", method: "None", methodLabel: "暗号化なし（Crypt Filter経由の平文）", length: null, authEvent: null
+    name: "Identity", method: "None", methodLabel: "暗号化なし（Crypt Filter経由の平文）", lengthBytes: null, lengthBits: null, authEvent: null
   });
 });
 
