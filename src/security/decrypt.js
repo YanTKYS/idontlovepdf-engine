@@ -59,44 +59,71 @@ function readFields(dictionaryText) {
 }
 
 /**
- * Runs a candidate password through `authenticate`, treating any thrown error the
- * same as "wrong password" (recoverable: prompt again), never letting it escape as
- * an unrelated crash. For R4 this mainly catches a PDFDocEncoding encoding failure
- * (see src/security/pdfdoc-encoding.js -- a character the candidate password
- * contains that PDFDocEncoding cannot represent: the real password, whatever it is,
- * must itself have been representable, so an unrepresentable candidate cannot be
- * it). For R6 it mainly catches this module's minimal SASLprep profile rejecting a
- * candidate password's characters (see standard-r6.js) -- same reasoning.
+ * Runs a candidate password through `authenticate`, treating *only* an error
+ * explicitly marked `recoverableWrongPassword` (currently: R4's PDFDocEncoding
+ * encoding failure -- see the `unrepresentable()` helper in
+ * src/security/pdfdoc-encoding.js, whose docstring explains why an unrepresentable
+ * candidate can safely be treated the same as a wrong one) the same as "wrong
+ * password" (recoverable: prompt again). Every other error propagates unchanged --
+ * in particular, R6's minimal SASLprep profile rejecting a candidate password's
+ * characters (standard-r6.js), a missing `crypto.subtle` (Algorithm 2.B needs it),
+ * or a genuine bug in the AES/hash primitives all surface as distinct, explicit
+ * errors rather than being silently reported to the caller as "that password was
+ * wrong" -- which would be actively misleading (retrying the *same* password would
+ * just fail identically every time) and would hide a real problem behind a UI that
+ * only ever offers "try a different password".
+ *
  * `authenticate` may be sync (R4) or async (R6, since Algorithm 2.B hashes via
  * `crypto.subtle`); `await`ing either works uniformly.
  */
 async function tryAuthenticate(authenticate, authArgs) {
   try {
     return await authenticate(authArgs);
-  } catch {
-    return { success: false, fileKey: null };
+  } catch (error) {
+    if (error?.recoverableWrongPassword) return { success: false, fileKey: null };
+    throw error;
   }
 }
 
 /** Which revisions/versions this module actually authenticates, and which crypt
- * filter method each one requires -- deliberately not "any AESV2" or "any AESV3",
- * since e.g. a /V 5 PDF using /R 5 (Adobe's original, pre-ISO AES-256 extension,
- * different key derivation) is out of this scope just as much as a wrong /CFM is. */
+ * filter method + key length (bytes) each one requires -- deliberately not "any
+ * AESV2" or "any AESV3", since e.g. a /V 5 PDF using /R 5 (Adobe's original,
+ * pre-ISO AES-256 extension, different key derivation) is out of this scope just as
+ * much as a wrong /CFM is. `keyLengthBytes` is the one ISO 32000-2 fixes for each
+ * CFM (AESV2: 128-bit; AESV3: 256-bit) -- a Crypt Filter dictionary that names the
+ * right /CFM but declares an inconsistent /Length is malformed, not merely
+ * unconventional, and is rejected explicitly (see checkCryptFilterInScope() below)
+ * rather than silently accepted with the correct fixed length substituted in. */
 const SUPPORTED_CONFIGURATIONS = [
-  { version: 4, revision: 4, cfm: "AESV2" },
-  { version: 5, revision: 6, cfm: "AESV3" }
+  { version: 4, revision: 4, cfm: "AESV2", keyLengthBytes: 16 },
+  { version: 5, revision: 6, cfm: "AESV3", keyLengthBytes: 32 }
 ];
 
 function matchConfiguration(version, revision) {
   return SUPPORTED_CONFIGURATIONS.find((entry) => entry.version === version && entry.revision === revision) ?? null;
 }
 
-/** Throws unless `filterName` is /Identity or a crypt filter using `configuration`'s required /CFM. */
+/**
+ * Throws unless `filterName` is /Identity or a crypt filter using `configuration`'s
+ * required /CFM *and* the key length ISO 32000-2 fixes for that /CFM. A Crypt
+ * Filter's own /Length is optional (both AESV2 and AESV3 have a fixed key length
+ * regardless of what /Length says), so an absent /Length is not an error -- but one
+ * that is present and disagrees with the /CFM (e.g. `/CFM /AESV3 /Length 16`) means
+ * this PDF's own Encrypt dictionary is internally inconsistent, and is rejected
+ * rather than silently proceeding with whichever of the two numbers happens to be
+ * used elsewhere.
+ */
 function checkCryptFilterInScope(filterName, cryptFilters, configuration, diagnosis) {
   if (filterName === "Identity") return;
   const filter = cryptFilters.get(filterName);
   if (!filter || filter.method !== configuration.cfm) {
     throw encryptionError(`Unsupported crypt filter method: ${filter?.method ?? filterName ?? "不明"}`, diagnosis);
+  }
+  if (filter.lengthBytes !== null && filter.lengthBytes !== configuration.keyLengthBytes) {
+    throw encryptionError(
+      `Crypt filter /Length is inconsistent with /CFM /${configuration.cfm}: expected ${configuration.keyLengthBytes} bytes, got ${filter.lengthBytes}`,
+      diagnosis
+    );
   }
 }
 

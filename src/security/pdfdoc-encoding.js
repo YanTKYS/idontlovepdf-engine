@@ -39,7 +39,14 @@ const SPECIAL = new Map([
 
 function unrepresentable(codepoint) {
   const hex = codepoint.toString(16).toUpperCase().padStart(4, "0");
-  return new Error(`Password contains a character that cannot be represented in PDFDocEncoding (U+${hex})`);
+  const error = new Error(`Password contains a character that cannot be represented in PDFDocEncoding (U+${hex})`);
+  // Marks this specific failure as safe to treat the same as "wrong password"
+  // (recoverable: prompt again) -- see tryAuthenticate() in security/decrypt.js,
+  // which catches *only* errors carrying this marker and lets anything else
+  // (a genuine bug, a missing Web Crypto API, ...) propagate as a real error
+  // instead of being silently swallowed into a misleading "wrong password".
+  error.recoverableWrongPassword = true;
+  return error;
 }
 
 export function encodePdfDocPassword(text) {

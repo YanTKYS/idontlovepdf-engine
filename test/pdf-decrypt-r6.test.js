@@ -484,3 +484,44 @@ test("R6/AESV3: a /V 5 /R 5 PDF (pre-ISO AES-256, out of scope) is refused, not 
   const editor = new PdfTextEditor(Buffer.from(text, "latin1"));
   await assert.rejects(editor.listTextRuns(""), /Unsupported encrypted PDF version\/revision/);
 });
+
+/* --------------------------------------------------------------------- Crypt Filter /Length */
+
+test("R6/AESV3: rejects a Crypt Filter whose /Length is inconsistent with /CFM /AESV3 (16 instead of 32 bytes)", async () => {
+  const pdf = buildEncryptedPdfR6({ userPassword: "" });
+  const text = Buffer.from(pdf).toString("latin1").replace("/CFM /AESV3 /Length 32", "/CFM /AESV3 /Length 16");
+  assert.notEqual(text, Buffer.from(pdf).toString("latin1"));
+  const editor = new PdfTextEditor(Buffer.from(text, "latin1"));
+  await assert.rejects(editor.listTextRuns(""), /Crypt filter \/Length is inconsistent/);
+});
+
+test("R6/AESV3: accepts a Crypt Filter with no /Length at all (AESV3's key length is fixed by the CFM)", async () => {
+  const pdf = buildEncryptedPdfR6({ userPassword: "" });
+  // Same-length replacement only (padded with spaces, harmless inside a PDF
+  // dictionary) -- every byte offset after this point in the fixture (the xref
+  // stream's own recorded object offsets, /startxref) was computed from the
+  // original text, so a shorter replacement would silently corrupt them instead of
+  // just removing /Length.
+  const original = "/CFM /AESV3 /Length 32";
+  const withoutLength = `/CFM /AESV3${" ".repeat(original.length - "/CFM /AESV3".length)}`;
+  assert.equal(withoutLength.length, original.length);
+  const text = Buffer.from(pdf).toString("latin1").replace(original, withoutLength);
+  const editor = new PdfTextEditor(Buffer.from(text, "latin1"));
+  const runs = await editor.listTextRuns("");
+  assert.equal(runs.length, 1);
+});
+
+/* --------------------------------------------------------------------------- error propagation */
+
+test("R6/AESV3: a password this module's SASLprep profile rejects propagates as an explicit error, not a generic wrong-password prompt", async () => {
+  const pdf = buildEncryptedPdfR6({ userPassword: "correct-password" });
+  const editor = new PdfTextEditor(pdf);
+  await assert.rejects(editor.listTextRuns("א"), (error) => {
+    assert.match(error.message, /SASLprep/);
+    // Unlike an ordinary wrong password, this must NOT look like a recoverable
+    // "please try another password" case -- retrying the *same* rejected
+    // candidate would just fail identically every time.
+    assert.notEqual(error.passwordRequired, true);
+    return true;
+  });
+});

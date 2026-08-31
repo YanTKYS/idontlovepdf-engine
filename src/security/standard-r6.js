@@ -65,41 +65,75 @@ const SASLPREP_MAP_TO_NOTHING = new Set([
 ]);
 
 // RFC 3454 C.1.2, "Non-ASCII space characters" -- mapped to U+0020, not rejected.
+// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are NOT in this table --
+// RFC 3454 lists them under C.2.2 (non-ASCII control characters) instead, so they
+// must be *rejected*, not silently turned into a plain space; see
+// isProhibitedSaslprepCodepoint() below, which is where they are actually handled
+// (as General_Category Zl/Zp, alongside the rest of C.2.2).
 const SASLPREP_SPACE_CODEPOINTS = new Set([
   0x00a0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007,
-  0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000
+  0x2008, 0x2009, 0x200a, 0x202f, 0x205f, 0x3000
 ]);
 
+// General Unicode categories that cover, more completely and more reliably than a
+// hand-copied RFC 3454 codepoint table would, the bulk of RFC 3454's Appendix C
+// prohibited-output categories:
+//   Cc - control characters (C.2.1 ASCII + C.2.2 non-ASCII, e.g. U+0080-U+009F)
+//   Cf - format characters (most of C.2.2's non-ASCII controls, e.g. U+180E, U+06DD,
+//        U+2061-U+2063, U+FFF9-U+FFFB; most of C.8's deprecated/bidi-format
+//        characters, e.g. U+200E/U+200F, U+202A-U+202E; all of C.9's tag characters)
+//   Co - private use (C.3, all planes)
+//   Cs - surrogate codes (C.5)
+//   Cn - unassigned, which includes every Unicode noncharacter (C.4) as a subset,
+//        plus any codepoint not yet assigned a meaning at all (rejecting those too
+//        is conservative, never less strict than RFC 3454 requires)
+//   Zl/Zp - U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR (part of C.2.2, but
+//        General_Category Zl/Zp rather than Cc/Cf, so not covered by those above)
+// Deriving this from the JS engine's own actively-maintained Unicode Character
+// Database avoids the risk inherent in hand-transcribing RFC 3454's tables: a
+// transcription can silently go stale or miss entries (as an earlier version of
+// this file did -- U+2028/U+2029 were wrongly listed as C.1.2 spaces above instead
+// of being rejected, and codepoints like U+180E, U+2061-U+2063, and U+1D173-U+1D17A
+// were not rejected by the old table-based check at all).
+const PROHIBITED_UNICODE_CATEGORY = /[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Cn}\p{Zl}\p{Zp}]/u;
+
 /**
- * A codepoint this minimal SASLprep profile refuses to accept at all -- close to
- * (but not a byte-exact reimplementation of) RFC 3454's prohibited-output tables
- * C.2 (control characters), C.3 (private use), C.4 (noncharacters), C.5 (surrogate
- * codes), C.6 ("inappropriate for plain text", e.g. the replacement/object
- * replacement characters), C.8 (deprecated/bidi-format characters), and C.9
- * (tagging characters). This module does not carry the full Unicode Bidi_Class
- * table needed for RFC 3454 §6's actual bidirectional rule, so as a conservative
- * stand-in it also rejects any codepoint from a right-to-left script (Hebrew,
- * Arabic, Syriac, Thaana, N'Ko, and their presentation-form blocks) outright,
- * rather than risk a wrong bidi judgement for a password this profile cannot
- * really evaluate. See preprocessR6Password()'s docstring and the README for this
- * module's exact scope: ASCII and general left-to-right-script UTF-8 passwords are
- * fully handled; anything needing genuine bidi handling throws explicitly instead
- * of silently passing through as UTF-8 bytes.
+ * A codepoint this minimal SASLprep profile refuses to accept at all. Combines the
+ * general-category check above (covering RFC 3454 C.2/C.3/C.4/C.5, and the Cf-
+ * category members of C.6/C.8/C.9) with the handful of prohibited codepoints that
+ * general-category checks cannot catch because Unicode does not classify them as
+ * control/format/private-use/surrogate/unassigned:
+ *   - U+FFFC OBJECT REPLACEMENT CHARACTER / U+FFFD REPLACEMENT CHARACTER (RFC 3454
+ *     C.6; General_Category So, not Cf)
+ * This module does not carry the full Unicode Bidi_Class table needed for RFC 3454
+ * §6's actual bidirectional rule, so as a conservative stand-in it also rejects any
+ * codepoint from a right-to-left script (Hebrew, Arabic, Syriac, Thaana, N'Ko, and
+ * their presentation-form blocks) outright, rather than risk a wrong bidi judgement
+ * for a password this profile cannot really evaluate -- these RTL blocks are this
+ * module's own addition, not part of RFC 3454's C tables. See
+ * preprocessR6Password()'s docstring and the README for this module's exact scope:
+ * ASCII and general left-to-right-script UTF-8 passwords are handled; anything
+ * needing genuine bidi handling throws explicitly instead of silently passing
+ * through as UTF-8 bytes.
+ *
+ * Two RFC 3454 categories need no explicit check here at all, because
+ * `.normalize("NFKC")` (applied before this function ever runs) has already made
+ * their codepoints unreachable:
+ *   - C.8's U+0340/U+0341 (deprecated combining tone marks) each have a canonical
+ *     decomposition mapping (to U+0300/U+0301), so NFKC always replaces them.
+ *   - C.7, the entire Hangul Compatibility Jamo block U+3131-U+318E ("inappropriate
+ *     for canonical representation"): every one of its 94 codepoints has a
+ *     compatibility decomposition mapping to the ordinary Hangul Jamo block
+ *     (U+1100-U+11FF), so NFKC always replaces them too -- verified directly
+ *     (`test/standard-r6.test.js`) rather than assumed. The two unassigned
+ *     codepoints at the block's edges, U+3130 and U+318F, have no such mapping and
+ *     do reach this function, but are already caught by the `\p{Cn}` (unassigned)
+ *     branch of the general-category check above.
  */
 function isProhibitedSaslprepCodepoint(codePoint) {
-  if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) return true; // C.2.1/C.2.2 control
-  if (codePoint === 0xfffd || codePoint === 0xfffc) return true; // C.6 specials
-  if (codePoint >= 0xd800 && codePoint <= 0xdfff) return true; // C.5 surrogate
-  if ((codePoint & 0xfffe) === 0xfffe) return true; // noncharacters *FFFE/*FFFF, every plane
-  if (codePoint >= 0xfdd0 && codePoint <= 0xfdef) return true; // C.4 noncharacters
-  if (codePoint >= 0xe000 && codePoint <= 0xf8ff) return true; // C.3 private use (BMP)
-  if (codePoint >= 0xf0000 && codePoint <= 0xffffd) return true; // C.3 private use plane 15
-  if (codePoint >= 0x100000 && codePoint <= 0x10fffd) return true; // C.3 private use plane 16
-  if (codePoint >= 0xe0000 && codePoint <= 0xe007f) return true; // C.9 tags
-  if (codePoint === 0x200e || codePoint === 0x200f) return true; // C.8 bidi marks
-  if (codePoint >= 0x202a && codePoint <= 0x202e) return true; // C.8 bidi embedding/override
-  if (codePoint >= 0x2066 && codePoint <= 0x2069) return true; // C.8 bidi isolates
-  if (codePoint >= 0x206a && codePoint <= 0x206f) return true; // C.8 deprecated format chars
+  const character = String.fromCodePoint(codePoint);
+  if (PROHIBITED_UNICODE_CATEGORY.test(character)) return true;
+  if (codePoint === 0xfffc || codePoint === 0xfffd) return true;
   if (codePoint >= 0x0590 && codePoint <= 0x08ff) return true; // RTL scripts (Hebrew..Arabic Ext-A)
   if (codePoint >= 0xfb1d && codePoint <= 0xfdff) return true; // Hebrew/Arabic presentation forms A
   if (codePoint >= 0xfe70 && codePoint <= 0xfeff) return true; // Arabic presentation forms B

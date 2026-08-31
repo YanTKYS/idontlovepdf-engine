@@ -174,6 +174,50 @@ test("rejects a right-to-left-script password as outside this module's minimal S
   assert.throws(() => saslprep("ابج"), /SASLprep/); // Arabic
 });
 
+test("rejects U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR instead of mapping them to a space", () => {
+  // RFC 3454 lists these under C.2.2 (non-ASCII control characters), not C.1.2
+  // (non-ASCII space characters) -- an earlier version of this file's space table
+  // wrongly included them, which would have silently turned "a<LS>b" into the
+  // password "a b" instead of rejecting it outright.
+  assert.throws(() => saslprep(`a${String.fromCodePoint(0x2028)}b`), /SASLprep/);
+  assert.throws(() => saslprep(`a${String.fromCodePoint(0x2029)}b`), /SASLprep/);
+});
+
+test("rejects further RFC 3454 C.2.2/C.6 characters not caught by a hand-copied table", () => {
+  // These specific codepoints were named in review as gaps in an earlier,
+  // hand-transcribed prohibited-codepoint table; the current implementation derives
+  // most of C.2/C.3/C.4/C.5 from Unicode's own General_Category via a regex
+  // (\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Cn}\p{Zl}\p{Zp}) specifically so gaps like these
+  // cannot recur silently.
+  assert.throws(() => saslprep(String.fromCodePoint(0x180e)), /SASLprep/); // C.2.2 Mongolian vowel separator
+  assert.throws(() => saslprep(String.fromCodePoint(0x06dd)), /SASLprep/); // C.2.2 Arabic end of ayah
+  assert.throws(() => saslprep(String.fromCodePoint(0x2061)), /SASLprep/); // C.2.2 function application
+  assert.throws(() => saslprep(String.fromCodePoint(0xfff9)), /SASLprep/); // C.2.2/C.6 interlinear annotation anchor
+  assert.throws(() => saslprep(String.fromCodePoint(0x1d173)), /SASLprep/); // C.2.2 musical notation format (astral)
+});
+
+test("C.7 Hangul Compatibility Jamo needs no explicit rejection: NFKC always resolves it to ordinary Hangul Jamo first", () => {
+  // Every one of the 94 assigned codepoints in U+3131-U+318E canonically
+  // decomposes (under NFKC) to the U+1100-U+11FF Hangul Jamo block, so none of
+  // them can still be U+3131-U+318E by the time isProhibitedSaslprepCodepoint()
+  // runs -- verified here directly, not merely assumed, since standard-r6.js's own
+  // docstring relies on this claim to justify not carrying an explicit C.7 check.
+  for (let codePoint = 0x3131; codePoint <= 0x318e; codePoint += 1) {
+    const normalized = String.fromCodePoint(codePoint).normalize("NFKC");
+    assert.notEqual(normalized.codePointAt(0), codePoint, `U+${codePoint.toString(16)} should be transformed by NFKC`);
+  }
+  // The two unassigned codepoints at the block's edges are not compatibility jamo
+  // (no decomposition mapping) and do reach the check -- but as unassigned
+  // codepoints they are already caught by the general Unicode-category check.
+  assert.throws(() => saslprep(String.fromCodePoint(0x3130)), /SASLprep/);
+  assert.throws(() => saslprep(String.fromCodePoint(0x318f)), /SASLprep/);
+});
+
+test("accepts an ordinary space (U+0020) and a mapped non-ASCII space unaffected by the C.2.2 fix", () => {
+  assert.deepEqual(saslprep("a b"), "a b");
+  assert.equal(saslprep(`a${String.fromCodePoint(0x00a0)}b`), "a b"); // NBSP -> space
+});
+
 /* -------------------------------------------------------------------- user password authentication */
 
 test("authenticates a correct user password and recovers the file encryption key from /UE", async () => {
