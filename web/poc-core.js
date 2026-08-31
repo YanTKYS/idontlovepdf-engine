@@ -27,10 +27,11 @@ export const ASSESSMENT_FIELDS = [
 ];
 
 const ERROR_CATEGORIES = [
-  { pattern: /Cross-reference streams are not supported/i, label: "xref stream未対応" },
+  { pattern: /Object streams are not supported/i, label: "object stream未対応（xref streamのtype 2 entry）" },
+  { pattern: /cross-reference stream/i, label: "xref stream解析失敗（/W・/Index・stream長など）" },
   { pattern: /Encrypted PDFs are not supported|\/Encrypt/i, label: "暗号化PDF" },
   { pattern: /Unsupported stream filter/i, label: "unsupported filter（未対応の圧縮・符号化）" },
-  { pattern: /missing from the xref table|Unsupported non-dictionary PDF object/i, label: "object stream未対応の可能性（xrefに実体がない）" },
+  { pattern: /missing from the xref table|Unsupported non-dictionary PDF object/i, label: "objectがxrefに存在しない（破損の可能性）" },
   { pattern: /no editable text-showing operands/i, label: "本文runなし" },
   { pattern: /single-byte characters/i, label: "ToUnicodeなし（CMap不在のため多バイト文字を書けない）" },
   { pattern: /has no ToUnicode code for/i, label: "CMap逆引き失敗（既存fontにその文字のglyphがない可能性）" },
