@@ -29,6 +29,7 @@ export const ASSESSMENT_FIELDS = [
 const ERROR_CATEGORIES = [
   { pattern: /Object streams are not supported/i, label: "object stream未対応（xref streamのtype 2 entry）" },
   { pattern: /cross-reference stream/i, label: "xref stream解析失敗（/W・/Index・stream長など）" },
+  { pattern: /predictor/i, label: "Predictor未対応または不正（値・row長・bit depthなど）" },
   { pattern: /Encrypted PDFs are not supported|\/Encrypt/i, label: "暗号化PDF" },
   { pattern: /Unsupported stream filter/i, label: "unsupported filter（未対応の圧縮・符号化）" },
   { pattern: /missing from the xref table|Unsupported non-dictionary PDF object/i, label: "objectがxrefに存在しない（破損の可能性）" },

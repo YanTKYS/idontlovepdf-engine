@@ -4,22 +4,14 @@
  * duplicated between src/pdf-document.js and src/pdf-structure.js.
  */
 
+import { reversePredictor } from "./predictor.js";
+
 /** Filter names listed in a stream dictionary's /Filter, single name or array form. */
 export function filters(dictionary) {
   const array = dictionary.match(/\/Filter\s*\[(.*?)\]/s)?.[1];
   if (array) return [...array.matchAll(/\/([A-Za-z0-9]+)/g)].map((match) => match[1]);
   const single = dictionary.match(/\/Filter\s*\/([A-Za-z0-9]+)/)?.[1];
   return single ? [single] : [];
-}
-
-/**
- * Flate streams may be predictor-encoded through /DecodeParms. Inflating one and
- * treating the result as content would silently yield mangled data, so it is
- * reported as unsupported instead.
- */
-export function hasPredictor(dictionary) {
-  const parameters = dictionary.match(/\/DecodeParms\s*(?:\[[^\]]*?)?<<(.*?)>>/s)?.[1] ?? "";
-  return Number(parameters.match(/\/Predictor\s+(\d+)/)?.[1] ?? 1) > 1;
 }
 
 async function transformWithStream(bytes, format, StreamClass) {
@@ -39,15 +31,22 @@ export async function deflate(bytes) {
 
 /**
  * Applies a stream dictionary's /Filter to its raw bytes. Currently handles no
- * filter, or a bare /FlateDecode without a /Predictor; anything else is reported as
- * an explicit unsupported-filter error rather than silently mangling the output.
+ * filter, or a bare /FlateDecode (optionally TIFF- or PNG-predictor-encoded via
+ * /DecodeParms /Predictor); anything else is reported as an explicit
+ * unsupported-filter error rather than silently mangling the output.
+ *
+ * `context`, when given, prefixes any error with where the stream came from (e.g.
+ * "content stream object 45"), since the same code path is shared by xref streams,
+ * content streams, and ToUnicode CMap streams — see src/pdf-structure.js and
+ * src/pdf-document.js for how each names itself.
  */
-export async function decodeStreamBytes(dictionary, data) {
+export async function decodeStreamBytes(dictionary, data, context = "") {
   const applied = filters(dictionary);
   if (applied.length === 0) return data;
   if (applied.length === 1 && applied[0] === "FlateDecode") {
-    if (hasPredictor(dictionary)) throw new Error("Unsupported stream filter: FlateDecode with a /Predictor");
-    return inflate(data);
+    const inflated = await inflate(data);
+    return reversePredictor(inflated, dictionary, context);
   }
-  throw new Error(`Unsupported stream filter: ${applied.join(", ")}`);
+  const prefix = context ? `${context}: ` : "";
+  throw new Error(`${prefix}Unsupported stream filter: ${applied.join(", ")}`);
 }
