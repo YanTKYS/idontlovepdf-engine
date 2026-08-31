@@ -34,6 +34,13 @@ const ERROR_CATEGORIES = [
   { pattern: /cross-reference stream/i, label: "xref stream解析失敗（/W・/Index・stream長など）" },
   { pattern: /predictor/i, label: "Predictor未対応または不正（値・row長・bit depthなど）" },
   {
+    pattern: /Password required to open this encrypted PDF/i,
+    label: "暗号化PDF（パスワードが必要）",
+    detail: (text) => text.match(/Password required to open this encrypted PDF \(([^)]+)\)/)?.[1] ?? null
+  },
+  { pattern: /modification is not permitted.*modify permission denied/i, label: "暗号化PDF（文書変更が許可されていません／P permission）" },
+  { pattern: /Saving edits to an encrypted PDF is not supported/i, label: "暗号化PDF（再暗号化保存は未対応）" },
+  {
     pattern: /Encrypted PDFs are not supported|\/Encrypt/i,
     label: "暗号化PDF",
     // "Encrypted PDFs are not supported (Standard / AES-128 / R4)" のように、

@@ -26,6 +26,30 @@ export function messageOf(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * A small, corpus-JSON-friendly summary of a PDF's encryption -- never the full
+ * diagnosis (see src/encryption.js) and never, under any circumstance, the
+ * password itself. `security` is the authenticated SecurityContext from
+ * src/security/decrypt.js when authentication succeeded (`editor.security`),
+ * `null`/`undefined` otherwise (auth failed, was out of scope, or was never
+ * attempted). Returns `null` for an unencrypted PDF.
+ */
+function encryptionSummary(diagnosis, security) {
+  if (!diagnosis?.encrypted) return null;
+  return {
+    filter: diagnosis.filter,
+    V: diagnosis.version,
+    R: diagnosis.revision,
+    method: diagnosis.cryptFilters?.find((filter) => filter.name === diagnosis.streamFilter)?.method ?? null,
+    authenticated: Boolean(security?.authenticated),
+    authType: security?.authType ?? null,
+    // Independent of authentication: /P's modify bit is a property of the
+    // dictionary itself, readable from the diagnosis alone even before a password
+    // is known -- see src/encryption.js.
+    modifyAllowed: security ? security.modifyAllowed : (diagnosis.permissions?.modify ?? null)
+  };
+}
+
 /** A record for a PDF that failed at `stage`, with every later stage left false. */
 export function failedRecord(file, stage, error, partial = {}) {
   return {
@@ -64,22 +88,26 @@ export async function assessPdfBytes(file, bytes) {
   } catch (error) {
     // listTextRuns() attaches a diagnosis (see src/encryption.js) instead of just
     // refusing encrypted PDFs outright; surface a short summary of it on the record
-    // so a corpus run can tell "encrypted, and here's what kind" from a bare failure.
-    const diagnosis = error?.encryptionDiagnosis;
-    const partial = diagnosis?.encrypted
-      ? { load: true, encryption: { filter: diagnosis.filter, V: diagnosis.version, R: diagnosis.revision, method: diagnosis.estimatedMethod } }
-      : { load: true };
+    // so a corpus run can tell "encrypted, and here's what kind" from a bare
+    // failure -- whether that is "out of scope" or "the empty-password attempt
+    // this pipeline always makes was not enough" (see src/security/decrypt.js).
+    const partial = { load: true, encryption: encryptionSummary(error?.encryptionDiagnosis, null) };
     return { record: failedRecord(file, "extract", error, partial), output: null };
   }
   if (runs.length === 0) {
     return { record: failedRecord(file, "extract", "no editable text-showing operands found", { load: true }), output: null };
   }
 
+  // Once listTextRuns() has succeeded, editor.security is the authenticated
+  // SecurityContext for an encrypted PDF (see src/security/decrypt.js), or null for
+  // an unencrypted one -- either way it is now settled for the rest of this PDF.
+  const encryption = encryptionSummary(editor.security?.diagnosis, editor.security);
+
   try {
     await editor.replaceText(runs[0].id, runs[0].bytes);
   } catch (error) {
     return {
-      record: failedRecord(file, "writeback", error, { load: true, extract: true, runCount: runs.length }),
+      record: failedRecord(file, "writeback", error, { load: true, extract: true, runCount: runs.length, encryption }),
       output: null
     };
   }
@@ -89,7 +117,7 @@ export async function assessPdfBytes(file, bytes) {
     output = await editor.save();
   } catch (error) {
     return {
-      record: failedRecord(file, "save", error, { load: true, extract: true, writeback: true, runCount: runs.length }),
+      record: failedRecord(file, "save", error, { load: true, extract: true, writeback: true, runCount: runs.length, encryption }),
       output: null
     };
   }
@@ -100,7 +128,7 @@ export async function assessPdfBytes(file, bytes) {
   } catch (error) {
     return {
       record: failedRecord(file, "reopen", error, {
-        load: true, extract: true, writeback: true, save: true, runCount: runs.length
+        load: true, extract: true, writeback: true, save: true, runCount: runs.length, encryption
       }),
       output: null
     };
@@ -119,6 +147,7 @@ export async function assessPdfBytes(file, bytes) {
       // PDF in an independent reader can answer it.
       readerDisplay: null,
       runCount: runs.length,
+      encryption,
       error: null
     },
     output
