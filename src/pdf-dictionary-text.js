@@ -21,12 +21,93 @@
  * Handler's authentication depends on being exact.
  */
 
-import { readHex, readLiteral } from "./content-stream.js";
+import { isRegular, skipWhite } from "./syntax.js";
+import { readHex, readLiteral, skipArray, skipDictionary } from "./content-stream.js";
 
 function textToBytes(text) {
   const bytes = new Uint8Array(text.length);
   for (let index = 0; index < text.length; index += 1) bytes[index] = text.charCodeAt(index) & 0xff;
   return bytes;
+}
+
+function bytesToText(bytes, start, end) {
+  let result = "";
+  for (let index = start; index < end; index += 1) result += String.fromCharCode(bytes[index]);
+  return result;
+}
+
+/**
+ * Locates the byte offset where `/key`'s value begins, considering only an
+ * occurrence that appears directly inside `text` itself -- depth 0 relative to
+ * `text`'s own outer `<< >>` -- and skipping over anything nested one level
+ * deeper: a nested dictionary (e.g. a Crypt Filter sub-dictionary), an array, a
+ * literal string, or a hex string. This is what makes a key like /Length safe to
+ * read from an Encrypt dictionary that also has a /CF sub-dictionary with its own
+ * /Length: a plain whole-text search finds whichever `/Length` happens to come
+ * first in the raw bytes, nested or not -- which silently returns the Crypt
+ * Filter's key length in *bytes* instead of the Encrypt dictionary's own top-level
+ * /Length in *bits* whenever the sub-dictionary happens to be written first, as a
+ * real PDF this engine needed to open does (`/CF << /StdCF << ... /Length 32 >>
+ * >> /Length 256`).
+ *
+ * `text` must be a full dictionary including its own outer `<< >>`, as
+ * PdfStructure#object()'s `.dictionary` and this module's own
+ * nestedDictionaryText()/namedSubDictionaries() results always are. Returns
+ * `undefined` when `/key` does not appear at the top level at all (whether or not
+ * it appears nested somewhere) -- the caller reads the value itself starting from
+ * the returned offset (a digit run for topLevelInteger() below, or any other shape
+ * a future caller needs).
+ */
+export function topLevelValueOffset(text, key) {
+  const bytes = textToBytes(text);
+  if (bytes[0] !== 0x3c || bytes[1] !== 0x3c) return undefined;
+  const keyToken = `/${key}`;
+  let cursor = 2;
+  while (cursor < bytes.length) {
+    cursor = skipWhite(bytes, cursor);
+    if (cursor >= bytes.length || (bytes[cursor] === 0x3e && bytes[cursor + 1] === 0x3e)) break; // this dictionary's own end
+    if (bytes[cursor] === 0x3c && bytes[cursor + 1] === 0x3c) {
+      cursor = skipDictionary(bytes, cursor);
+    } else if (bytes[cursor] === 0x28) {
+      cursor = readLiteral(bytes, cursor).end;
+    } else if (bytes[cursor] === 0x3c) {
+      cursor = readHex(bytes, cursor).end;
+    } else if (bytes[cursor] === 0x5b) {
+      cursor = skipArray(bytes, cursor);
+    } else if (bytes[cursor] === 0x2f) {
+      const nameStart = cursor;
+      cursor += 1;
+      while (isRegular(bytes[cursor])) cursor += 1;
+      if (bytesToText(bytes, nameStart, cursor) === keyToken) return skipWhite(bytes, cursor);
+    } else if (isRegular(bytes[cursor])) {
+      while (cursor < bytes.length && isRegular(bytes[cursor])) cursor += 1;
+    } else {
+      cursor += 1;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Reads `/key`'s value as a direct (non-indirect-reference) integer, but only a
+ * top-level (depth-0) occurrence of `/key` -- see topLevelValueOffset() above.
+ * Like pdf-structure.js's directInteger() (used for structural values this parser
+ * already trusts, e.g. /Size, /Prev, a stream's own /Length -- none of which share
+ * a key name with anything that can legitimately be nested one level deeper the
+ * way an Encrypt dictionary's /Length and its Crypt Filter's /Length do), this
+ * truncates to a leading digit run rather than requiring the full token to be a
+ * clean integer -- this function fixes *where* it looks for /key, not how
+ * strictly it reads the digits once found. Returns `null` when `/key` is absent
+ * at the top level.
+ */
+export function topLevelInteger(text, key) {
+  const offset = topLevelValueOffset(text, key);
+  if (offset === undefined) return null;
+  const bytes = textToBytes(text);
+  let end = offset;
+  while (end < bytes.length && bytes[end] >= 0x30 && bytes[end] <= 0x39) end += 1;
+  if (end === offset) return null;
+  return Number(bytesToText(bytes, offset, end));
 }
 
 export function nameValue(text, key) {

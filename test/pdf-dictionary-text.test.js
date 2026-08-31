@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { firstIdBytes, stringValue } from "../src/pdf-dictionary-text.js";
+import { firstIdBytes, stringValue, topLevelInteger, topLevelValueOffset } from "../src/pdf-dictionary-text.js";
 
 /**
  * These build dictionary/trailer *text* the same way pdf-structure.js's
@@ -57,4 +57,68 @@ test("firstIdBytes() reads the trailer's /ID first element as a hex string", () 
 
 test("firstIdBytes() returns null when the trailer has no /ID", () => {
   assert.equal(firstIdBytes("<< /Size 6 /Root 1 0 R >>"), null);
+});
+
+/* ---------------------------------------------------------- topLevelInteger() / topLevelValueOffset() */
+/* These reproduce the exact structural bug a real PDF (Standard/V5/R6/AESV3) hit:
+ * its Encrypt dictionary's own top-level /Length (256, bits) and its Crypt Filter
+ * sub-dictionary's /Length (32, bytes) share the same key name, and a plain
+ * whole-text search returns whichever one comes first in the raw bytes -- which,
+ * for that PDF, was the nested one, silently misreporting the top-level /Length. */
+
+const NESTED_CF_BEFORE_TOP_LEVEL = dictionaryText(
+  "<< /Filter /Standard /V 5 /R 6 /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /Length 256 >>"
+);
+const TOP_LEVEL_BEFORE_NESTED_CF = dictionaryText(
+  "<< /Filter /Standard /V 5 /R 6 /Length 256 /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> >>"
+);
+
+test("topLevelInteger() reads the Encrypt dictionary's own /Length, not the nested Crypt Filter's, when CF comes first", () => {
+  assert.equal(topLevelInteger(NESTED_CF_BEFORE_TOP_LEVEL, "Length"), 256);
+});
+
+test("topLevelInteger() reads the same top-level /Length regardless of whether CF appears before or after it", () => {
+  // No "first /Length wins" behavior: both orderings must produce the identical
+  // top-level value.
+  assert.equal(topLevelInteger(NESTED_CF_BEFORE_TOP_LEVEL, "Length"), topLevelInteger(TOP_LEVEL_BEFORE_NESTED_CF, "Length"));
+  assert.equal(topLevelInteger(TOP_LEVEL_BEFORE_NESTED_CF, "Length"), 256);
+});
+
+test("topLevelInteger() still lets the nested Crypt Filter's own /Length be read from its own isolated sub-dictionary text", () => {
+  // This is what parseCryptFilters() in encryption.js actually does: it isolates
+  // each named filter's own text first (via nestedDictionaryText()/
+  // namedSubDictionaries()), then reads /Length from *that* text -- at which point
+  // it IS the top-level (depth-0) key of that smaller dictionary, and
+  // topLevelInteger() correctly returns it.
+  const stdCfText = "<< /CFM /AESV3 /Length 32 >>";
+  assert.equal(topLevelInteger(stdCfText, "Length"), 32);
+});
+
+test("topLevelValueOffset() does not mistake /Length appearing inside a literal string, hex string, or array for the real key", () => {
+  const text = dictionaryText(
+    "<< /SomeText (contains /Length 123 as literal text) " +
+    "/SomeHex <4C656E677468> " +
+    "/Array [ << /Length 64 >> ] " +
+    "/CF << /StdCF << /Length 32 >> >> " +
+    "/Length 256 >>"
+  );
+  assert.equal(topLevelInteger(text, "Length"), 256);
+});
+
+test("topLevelValueOffset() returns undefined when /key only appears nested, never at the top level", () => {
+  const text = dictionaryText("<< /CF << /StdCF << /Length 32 >> >> >>");
+  assert.equal(topLevelValueOffset(text, "Length"), undefined);
+  assert.equal(topLevelInteger(text, "Length"), null);
+});
+
+test("topLevelInteger() handles multiply-nested structures (array of dictionaries, nested dictionaries) without losing track of depth", () => {
+  const text = dictionaryText(
+    "<< /Weird [ << /A << /Length 1 >> >> << /B [ << /Length 2 >> ] >> ] /Length 999 >>"
+  );
+  assert.equal(topLevelInteger(text, "Length"), 999);
+});
+
+test("topLevelInteger() reads /V and /R the same depth-aware way (no realistic collision, but consistent with /Length)", () => {
+  assert.equal(topLevelInteger(NESTED_CF_BEFORE_TOP_LEVEL, "V"), 5);
+  assert.equal(topLevelInteger(NESTED_CF_BEFORE_TOP_LEVEL, "R"), 6);
 });

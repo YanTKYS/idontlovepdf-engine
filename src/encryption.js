@@ -14,7 +14,9 @@
  */
 
 import { directInteger } from "./pdf-structure.js";
-import { booleanValue, nameValue, namedSubDictionaries, nestedDictionaryText, signedInteger } from "./pdf-dictionary-text.js";
+import {
+  booleanValue, nameValue, namedSubDictionaries, nestedDictionaryText, signedInteger, topLevelInteger
+} from "./pdf-dictionary-text.js";
 
 /** Human-readable family for a /CFM crypt filter method. Diagnostic label only. */
 function cfmLabel(cfm) {
@@ -132,11 +134,21 @@ export function analyzeEncryption(structure) {
   const filter = nameValue(dictionaryText, "Filter");
   const standardHandler = filter === "Standard";
 
-  const versionRaw = directInteger(dictionaryText, "V");
+  // /V, /R, and (further below) /Length are read with topLevelInteger(), not the
+  // plain whole-text directInteger() used elsewhere in this codebase for
+  // structural values (/Size, /Prev, a stream's own /Length): a Crypt Filter
+  // sub-dictionary under /CF can itself declare /Length (in bytes, its own key
+  // length -- see parseCryptFilters() above), and a whole-text search for
+  // "/Length" would return whichever one happens to come first in the raw bytes,
+  // nested or not. /V and /R do not currently share a key name with anything a
+  // Crypt Filter sub-dictionary declares, but are read the same depth-aware way
+  // for consistency, since all three are Encrypt-dictionary-direct fields read
+  // from the same `dictionaryText`.
+  const versionRaw = topLevelInteger(dictionaryText, "V");
   const version = Number.isInteger(versionRaw) ? versionRaw : null;
-  const revisionRaw = directInteger(dictionaryText, "R");
+  const revisionRaw = topLevelInteger(dictionaryText, "R");
   const revision = Number.isInteger(revisionRaw) ? revisionRaw : null;
-  const lengthRaw = directInteger(dictionaryText, "Length");
+  const lengthRaw = topLevelInteger(dictionaryText, "Length");
 
   const base = {
     encrypted: true,

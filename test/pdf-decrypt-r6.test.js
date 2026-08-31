@@ -140,17 +140,27 @@ function buildEncryptedPdfR6({
   content = "BT (R6 encrypted content) Tj ET",
   usePredictor = false,
   fontAndCMap = null,
-  includeId = false
+  includeId = false,
+  // Reproduces the two real-PDF quirks together: /O and /U zero-padded to 127
+  // bytes (some writers pad these two fixed-size binary strings instead of using
+  // the spec's exact 48), and the Crypt Filter's own /Length appearing before the
+  // Encrypt dictionary's own top-level /Length in the raw bytes (which is what
+  // actually triggered the /Length-misattribution bug -- see
+  // test/pdf-dictionary-text.test.js for the isolated structural test).
+  zeroPadOU = false,
+  cfBeforeLength = false
 } = {}) {
   const fileKey = randomBytes(32);
   const userBytes = encode(userPassword);
   const ownerBytes = encode(ownerPassword);
 
   const userFields = independentR6Fields(userBytes, null, fileKey);
-  const u = concatBytes([userFields.validationEntry]); // 48 bytes
+  const validUser48 = concatBytes([userFields.validationEntry]); // 48 bytes, used to mix into owner hashing
+  const u = zeroPadOU ? concatBytes([validUser48, new Uint8Array(79)]) : validUser48; // 127 bytes when padded
   const ue = userFields.encryptedFileKey; // 32 bytes
-  const ownerFields = independentR6Fields(ownerBytes, u, fileKey);
-  const o = concatBytes([ownerFields.validationEntry]); // 48 bytes
+  const ownerFields = independentR6Fields(ownerBytes, validUser48, fileKey);
+  const validOwner48 = concatBytes([ownerFields.validationEntry]); // 48 bytes
+  const o = zeroPadOU ? concatBytes([validOwner48, new Uint8Array(79)]) : validOwner48; // 127 bytes when padded
   const oe = ownerFields.encryptedFileKey; // 32 bytes
   const perms = independentPerms(fileKey, p, encryptMetadata);
 
@@ -197,10 +207,11 @@ function buildEncryptedPdfR6({
   const cfDictionary = streamFilter === "Identity" && stringFilter === "Identity"
     ? ""
     : " /CF << /StdCF << /CFM /AESV3 /Length 32 >> >>";
-  const encryptDictionary = "<< /Filter /Standard /V 5 /R 6 /Length 256" +
-    ` /O ${hexString(o)} /U ${hexString(u)} /OE ${hexString(oe)} /UE ${hexString(ue)} /Perms ${hexString(perms)}` +
-    ` /P ${p} /EncryptMetadata ${encryptMetadata}` +
-    ` /StmF /${streamFilter} /StrF /${stringFilter}${cfDictionary} >>`;
+  const fieldsClause = ` /O ${hexString(o)} /U ${hexString(u)} /OE ${hexString(oe)} /UE ${hexString(ue)} /Perms ${hexString(perms)}` +
+    ` /P ${p} /EncryptMetadata ${encryptMetadata} /StmF /${streamFilter} /StrF /${stringFilter}`;
+  const encryptDictionary = cfBeforeLength
+    ? `<< /Filter /Standard /V 5 /R 6${cfDictionary}${fieldsClause} /Length 256 >>`
+    : `<< /Filter /Standard /V 5 /R 6 /Length 256${fieldsClause}${cfDictionary} >>`;
   place(5, encryptDictionary);
 
   if (fontAndCMap) {
@@ -359,6 +370,74 @@ test("R6/AESV3: does not require a trailer /ID (unlike R4)", async () => {
   const editor = new PdfTextEditor(pdf);
   const runs = await editor.listTextRuns();
   assert.equal(runs.length, 1);
+});
+
+/* ------------------------------------------------------- real-PDF quirks: zero-padded /O //U, */
+/* ------------------------------------------------------- and /CF appearing before top-level /Length */
+/* Reproduces 2024_subsidy_koubo_outline.pdf's exact two structural quirks, together and
+ * separately: /O and /U zero-padded to 127 bytes, and the Encrypt dictionary's own
+ * /Length written after (in raw byte order) its Crypt Filter sub-dictionary's own
+ * same-named /Length. */
+
+test("R6/AESV3: authenticates and decrypts when /O and /U are 127-byte zero-padded", async () => {
+  const pdf = buildEncryptedPdfR6({ userPassword: "", zeroPadOU: true });
+  const editor = new PdfTextEditor(pdf);
+  const runs = await editor.listTextRuns();
+  assert.deepEqual(runs.map((run) => run.text), ["R6 encrypted content"]);
+  assert.equal(editor.security.authType, "user");
+  assert.equal(editor.security.validationEntryNormalization.U.zeroPaddingCompatibilityApplied, true);
+  assert.equal(editor.security.validationEntryNormalization.U.rawLength, 127);
+  // /O was never actually needed (user auth succeeded), so it was never normalized.
+  assert.equal(editor.security.validationEntryNormalization.O, null);
+});
+
+test("R6/AESV3: owner authentication also works when /O and /U are 127-byte zero-padded", async () => {
+  const pdf = buildEncryptedPdfR6({ userPassword: "user-secret", ownerPassword: "owner-secret", zeroPadOU: true });
+  const editor = new PdfTextEditor(pdf);
+  const runs = await editor.listTextRuns("owner-secret");
+  assert.deepEqual(runs.map((run) => run.text), ["R6 encrypted content"]);
+  assert.equal(editor.security.authType, "owner");
+  assert.equal(editor.security.validationEntryNormalization.O.zeroPaddingCompatibilityApplied, true);
+  assert.equal(editor.security.validationEntryNormalization.U.zeroPaddingCompatibilityApplied, true);
+});
+
+test("R6/AESV3: correctly reads Encrypt-direct /Length (256) and Crypt Filter /Length (32) when CF is written before the top-level /Length", async () => {
+  const pdf = buildEncryptedPdfR6({ userPassword: "", cfBeforeLength: true });
+  const editor = new PdfTextEditor(pdf);
+  const runs = await editor.listTextRuns();
+  assert.deepEqual(runs.map((run) => run.text), ["R6 encrypted content"]);
+  const diagnosis = editor.security.diagnosis;
+  assert.equal(diagnosis.lengthBits, 256);
+  const stdCf = diagnosis.cryptFilters.find((filter) => filter.name === "StdCF");
+  assert.equal(stdCf.lengthBytes, 32);
+});
+
+test("R6/AESV3: the full real-PDF reproduction -- zero-padded /O //U together with /CF before top-level /Length", async () => {
+  const pdf = buildEncryptedPdfR6({
+    userPassword: "",
+    zeroPadOU: true,
+    cfBeforeLength: true,
+    content: "BT (Real-PDF-shaped R6 content) Tj ET"
+  });
+  const editor = new PdfTextEditor(pdf);
+  const runs = await editor.listTextRuns();
+  assert.deepEqual(runs.map((run) => run.text), ["Real-PDF-shaped R6 content"]);
+  assert.equal(editor.security.authenticated, true);
+  assert.equal(editor.security.encryptionMethod, "AESV3");
+  assert.equal(editor.security.diagnosis.lengthBits, 256);
+  assert.equal(editor.security.diagnosis.cryptFilters.find((filter) => filter.name === "StdCF").lengthBytes, 32);
+  // /P denies modification in this reproduction? No -- default p=-1 here allows it;
+  // covered together with a denial case immediately below instead, to keep this
+  // one test focused on the load/auth/decrypt/extract/search path alone.
+});
+
+test("R6/AESV3: real-PDF reproduction with /P modify denied -- extraction/search still succeed, replaceText() is refused", async () => {
+  const pdf = buildEncryptedPdfR6({ userPassword: "", zeroPadOU: true, cfBeforeLength: true, p: -3904 });
+  const editor = new PdfTextEditor(pdf);
+  const runs = await editor.listTextRuns();
+  assert.equal(runs.length, 1);
+  assert.equal(editor.security.modifyAllowed, false);
+  await assert.rejects(editor.replaceText(runs[0].id, "nope"), /modification is not permitted/);
 });
 
 /* -------------------------------------------------------------------------- 2: wrong password */

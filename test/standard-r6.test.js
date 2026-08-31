@@ -6,6 +6,7 @@ import {
   algorithm2B,
   authenticateOwnerPasswordR6,
   authenticateUserPasswordR6,
+  normalizeR6ValidationEntry,
   preprocessR6Password,
   saslprep,
   validatePerms
@@ -218,6 +219,66 @@ test("accepts an ordinary space (U+0020) and a mapped non-ASCII space unaffected
   assert.equal(saslprep(`a${String.fromCodePoint(0x00a0)}b`), "a b"); // NBSP -> space
 });
 
+/* ---------------------------------------------------- /O //U zero-padding compatibility normalization */
+/* A real PDF this engine needed to open pads /O and /U to 127 bytes (the 48 valid
+ * bytes followed by 79 0x00 bytes) instead of the spec's exact 48. These tests cover
+ * normalizeR6ValidationEntry() directly; the full authenticate...R6() integration is
+ * covered further below and in test/pdf-decrypt-r6.test.js. */
+
+test("normalizeR6ValidationEntry() passes an exact 48-byte entry through unchanged", () => {
+  const entry = randomBytes(48);
+  const result = normalizeR6ValidationEntry(entry, "O");
+  assert.equal(hex(result.bytes), hex(entry));
+  assert.deepEqual(
+    { rawLength: result.rawLength, normalizedLength: result.normalizedLength, zeroPaddingCompatibilityApplied: result.zeroPaddingCompatibilityApplied },
+    { rawLength: 48, normalizedLength: 48, zeroPaddingCompatibilityApplied: false }
+  );
+});
+
+test("normalizeR6ValidationEntry() normalizes a 127-byte zero-padded entry (the real-PDF case) to 48 bytes", () => {
+  const valid = randomBytes(48);
+  const padded = Buffer.concat([Buffer.from(valid), Buffer.alloc(79)]); // 48 + 79 = 127
+  const result = normalizeR6ValidationEntry(padded, "U");
+  assert.equal(hex(result.bytes), hex(valid));
+  assert.equal(result.rawLength, 127);
+  assert.equal(result.normalizedLength, 48);
+  assert.equal(result.zeroPaddingCompatibilityApplied, true);
+});
+
+test("normalizeR6ValidationEntry() normalizes a 128-byte zero-padded entry to 48 bytes", () => {
+  const valid = randomBytes(48);
+  const padded = Buffer.concat([Buffer.from(valid), Buffer.alloc(80)]); // 48 + 80 = 128
+  const result = normalizeR6ValidationEntry(padded, "U");
+  assert.equal(hex(result.bytes), hex(valid));
+  assert.equal(result.rawLength, 128);
+  assert.equal(result.zeroPaddingCompatibilityApplied, true);
+});
+
+test("normalizeR6ValidationEntry() rejects a padded entry with even one non-zero trailing byte", () => {
+  const valid = randomBytes(48);
+  const tail = Buffer.alloc(4);
+  tail[3] = 0x01; // one non-zero byte at the very end
+  const padded = Buffer.concat([Buffer.from(valid), tail]);
+  assert.throws(() => normalizeR6ValidationEntry(padded, "O"), /Malformed \/O/);
+});
+
+test("normalizeR6ValidationEntry() never silently truncates an arbitrarily long /O or /U", () => {
+  // 129 bytes (one past the compatibility limit) must be rejected outright, not
+  // truncated to the first 48 bytes the way a generic "trim trailing NUL" or
+  // "just take the first 48 bytes" implementation would.
+  const tooLong = Buffer.concat([Buffer.from(randomBytes(48)), Buffer.alloc(81)]); // 129 bytes, all-zero tail
+  assert.throws(() => normalizeR6ValidationEntry(tooLong, "U"), /Malformed \/U/);
+  assert.throws(() => normalizeR6ValidationEntry(randomBytes(500), "U"), /Malformed \/U/);
+});
+
+test("normalizeR6ValidationEntry() rejects an entry shorter than 48 bytes", () => {
+  assert.throws(() => normalizeR6ValidationEntry(randomBytes(47), "O"), /Malformed \/O/);
+});
+
+test("normalizeR6ValidationEntry() rejects a missing entry", () => {
+  assert.throws(() => normalizeR6ValidationEntry(null, "O"), /Malformed \/O/);
+});
+
 /* -------------------------------------------------------------------- user password authentication */
 
 test("authenticates a correct user password and recovers the file encryption key from /UE", async () => {
@@ -254,6 +315,39 @@ test("rejects malformed /U or /UE lengths explicitly", async () => {
   await assert.rejects(authenticateUserPasswordR6({ password: "pw", u, ue: ue.subarray(0, 16) }), /Malformed \/UE/);
 });
 
+test("authenticates a user password when /U is 127-byte zero-padded (the real-PDF case)", async () => {
+  const fileKey = randomBytes(32);
+  const { u, ue } = buildUserFixture(encode("pw"), fileKey);
+  const paddedU = Buffer.concat([u, Buffer.alloc(79)]); // 48 + 79 = 127
+  const result = await authenticateUserPasswordR6({ password: "pw", u: paddedU, ue });
+  assert.equal(result.success, true);
+  assert.equal(hex(result.fileKey), hex(fileKey));
+});
+
+test("authenticates a user password when /U is 128-byte zero-padded", async () => {
+  const fileKey = randomBytes(32);
+  const { u, ue } = buildUserFixture(encode("pw"), fileKey);
+  const paddedU = Buffer.concat([u, Buffer.alloc(80)]); // 48 + 80 = 128
+  const result = await authenticateUserPasswordR6({ password: "pw", u: paddedU, ue });
+  assert.equal(result.success, true);
+});
+
+test("rejects a padded /U with a non-zero trailing byte, even with the correct password", async () => {
+  const fileKey = randomBytes(32);
+  const { u, ue } = buildUserFixture(encode("pw"), fileKey);
+  const tail = Buffer.alloc(79);
+  tail[10] = 0x02; // one non-zero byte partway through the padding
+  const paddedU = Buffer.concat([u, tail]);
+  await assert.rejects(authenticateUserPasswordR6({ password: "pw", u: paddedU, ue }), /Malformed \/U/);
+});
+
+test("rejects /UE when it is itself padded -- /UE is never zero-padding compatible", async () => {
+  const fileKey = randomBytes(32);
+  const { u, ue } = buildUserFixture(encode("pw"), fileKey);
+  const paddedUe = Buffer.concat([ue, Buffer.alloc(1)]); // 33 bytes
+  await assert.rejects(authenticateUserPasswordR6({ password: "pw", u, ue: paddedUe }), /Malformed \/UE: expected 32 bytes, got 33/);
+});
+
 /* ------------------------------------------------------------------- owner password authentication */
 
 test("authenticates a correct owner password and recovers the file encryption key from /OE", async () => {
@@ -281,6 +375,58 @@ test("owner authentication with the wrong /U (the mixed-in user key) fails even 
   const { o, oe } = buildOwnerFixture(password, randomBytes(48), fileKey);
   const result = await authenticateOwnerPasswordR6({ password: "right-owner-password", o, oe, u: randomBytes(48) });
   assert.equal(result.success, false);
+});
+
+test("owner authentication succeeds with a zero-padded /U, using the NORMALIZED 48-byte /U to mix into Algorithm 2.B", async () => {
+  // The fixture's independent Algorithm 2.B hashes were computed with the real
+  // 48-byte /U (userKey48 below) -- exactly what a correct implementation must
+  // reproduce internally after normalizing the padded /U it was actually given.
+  // If production mixed the raw, still-padded 127-byte /U into Algorithm 2.B
+  // instead, the hash would not match /O at all and this would fail.
+  const password = encode("owner-secret");
+  const userKey48 = randomBytes(48);
+  const fileKey = randomBytes(32);
+  const { o, oe } = buildOwnerFixture(password, userKey48, fileKey);
+  const paddedU = Buffer.concat([userKey48, Buffer.alloc(79)]); // 127 bytes
+  const result = await authenticateOwnerPasswordR6({ password: "owner-secret", o, oe, u: paddedU });
+  assert.equal(result.success, true);
+  assert.equal(hex(result.fileKey), hex(fileKey));
+});
+
+test("owner authentication with a padded /U fails if production mixed the raw (not normalized) /U in -- guards against regressing to raw-U mixing", async () => {
+  // Same fixture as above, but this time the independent reference hash is
+  // (incorrectly, deliberately) computed with the RAW padded 127-byte /U, to
+  // confirm that is NOT what the production implementation reproduces.
+  const password = encode("owner-secret-2");
+  const userKey48 = randomBytes(48);
+  const paddedU = Buffer.concat([userKey48, Buffer.alloc(79)]);
+  const fileKey = randomBytes(32);
+  const { o, oe } = buildOwnerFixture(password, paddedU, fileKey); // note: paddedU, not userKey48
+  const result = await authenticateOwnerPasswordR6({ password: "owner-secret-2", o, oe, u: paddedU });
+  assert.equal(result.success, false);
+});
+
+test("normalizes both /O and /U when both are zero-padded for owner authentication", async () => {
+  const password = encode("owner-secret-3");
+  const userKey48 = randomBytes(48);
+  const fileKey = randomBytes(32);
+  const { o, oe } = buildOwnerFixture(password, userKey48, fileKey);
+  const paddedO = Buffer.concat([o, Buffer.alloc(80)]); // 128 bytes
+  const paddedU = Buffer.concat([userKey48, Buffer.alloc(79)]); // 127 bytes
+  const result = await authenticateOwnerPasswordR6({ password: "owner-secret-3", o: paddedO, oe, u: paddedU });
+  assert.equal(result.success, true);
+  assert.equal(hex(result.fileKey), hex(fileKey));
+});
+
+test("rejects /OE when it is itself padded -- /OE is never zero-padding compatible", async () => {
+  const userKey48 = randomBytes(48);
+  const fileKey = randomBytes(32);
+  const { o, oe } = buildOwnerFixture(encode("pw"), userKey48, fileKey);
+  const paddedOe = Buffer.concat([oe, Buffer.alloc(1)]); // 33 bytes
+  await assert.rejects(
+    authenticateOwnerPasswordR6({ password: "pw", o, oe: paddedOe, u: userKey48 }),
+    /Malformed \/OE: expected 32 bytes, got 33/
+  );
 });
 
 /* ---------------------------------------------------------------------------------- /Perms */
@@ -339,4 +485,11 @@ test("rejects /Perms with corrupted reserved bytes", () => {
 test("rejects a malformed /Perms length", () => {
   const fileKey = randomBytes(32);
   assert.throws(() => validatePerms(fileKey, randomBytes(15), -3904, true), /Malformed \/Perms/);
+});
+
+test("/Perms is never zero-padding compatible, even with an all-zero tail", () => {
+  const fileKey = randomBytes(32);
+  const perms = buildPerms(fileKey, -3904, true);
+  const padded = Buffer.concat([perms, Buffer.alloc(1)]); // 17 bytes, zero tail
+  assert.throws(() => validatePerms(fileKey, padded, -3904, true), /Malformed \/Perms: expected 16 bytes, got 17/);
 });
