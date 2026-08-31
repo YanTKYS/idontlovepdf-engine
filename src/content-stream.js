@@ -55,6 +55,91 @@ export function readHex(bytes, start) {
   };
 }
 
+/**
+ * Skips a PDF array `[ ... ]` appearing inside a content-stream dictionary operand
+ * (e.g. `/BBox [0 0 100 100]`, `/Items [(A) <42>]`), tracking `[`/`]` depth and
+ * reusing readLiteral()/readHex()/skipDictionary() for anything nested inside it --
+ * a literal string, hex string, dictionary, or another array. Only skipDictionary()
+ * (mutually recursive with this) calls it; scanTextRuns() itself never sees an
+ * array except as a TJ operand, which it reads element-by-element on its own (see
+ * below), not via this helper.
+ */
+function skipArray(bytes, start) {
+  let cursor = start + 1;
+  let depth = 1;
+  while (cursor < bytes.length && depth > 0) {
+    cursor = skipWhite(bytes, cursor);
+    if (cursor >= bytes.length) break;
+    if (bytes[cursor] === 0x5b) {
+      depth += 1;
+      cursor += 1;
+    } else if (bytes[cursor] === 0x5d) {
+      depth -= 1;
+      cursor += 1;
+    } else if (bytes[cursor] === 0x28) {
+      cursor = readLiteral(bytes, cursor).end;
+    } else if (bytes[cursor] === 0x3c && bytes[cursor + 1] === 0x3c) {
+      cursor = skipDictionary(bytes, cursor);
+    } else if (bytes[cursor] === 0x3c) {
+      cursor = readHex(bytes, cursor).end;
+    } else {
+      cursor += 1;
+    }
+  }
+  if (depth !== 0) throw new Error("Malformed PDF array in content stream");
+  return cursor;
+}
+
+/**
+ * Skips a PDF dictionary operand `<< ... >>` appearing directly in a content stream
+ * (e.g. `/Span << /MCID 12 >> BDC`, a marked-content property list) as one opaque
+ * unit, without extracting or interpreting anything inside it. scanTextRuns() below
+ * must not mistake the dictionary's own second `<` for the start of a hex string
+ * (that misreading is exactly what used to turn `/Span << /MCID 12 >> BDC` into a
+ * "Malformed PDF hex string" failure -- `/MCID 12 ` is not valid hex), nor treat a
+ * string nested inside the dictionary (e.g. `/ActualText (...)`) as a text-showing
+ * operand -- neither is meaningful to this scanner, which only extracts operands of
+ * Tj/TJ/'/" (see scanTextRuns()'s own docstring further down).
+ *
+ * `start` must point at the opening `<<`. Tracks `<<`/`>>` nesting depth, and reuses
+ * readLiteral()/readHex() -- both already string-boundary-aware, so a `>>`, `<<`, or
+ * unescaped `<`/`>` occurring inside a string value (literal or hex) never disturbs
+ * the depth count. An array value is walked via skipArray() above, since it can
+ * itself hold strings, nested dictionaries, or nested arrays. `%` comments are
+ * skipped the same as whitespace, via skipWhite() (already used everywhere else in
+ * this module for that).
+ *
+ * Never returns silently on a dictionary that never closes, or a string/array inside
+ * it that is itself malformed: those already throw via readLiteral()/readHex()/
+ * skipArray(), and an unclosed `<<` throws here once `bytes` runs out at depth > 0.
+ */
+export function skipDictionary(bytes, start) {
+  if (bytes[start] !== 0x3c || bytes[start + 1] !== 0x3c) throw new Error("Expected a PDF dictionary");
+  let cursor = start + 2;
+  let depth = 1;
+  while (cursor < bytes.length && depth > 0) {
+    cursor = skipWhite(bytes, cursor);
+    if (cursor >= bytes.length) break;
+    if (bytes[cursor] === 0x3c && bytes[cursor + 1] === 0x3c) {
+      depth += 1;
+      cursor += 2;
+    } else if (bytes[cursor] === 0x3e && bytes[cursor + 1] === 0x3e) {
+      depth -= 1;
+      cursor += 2;
+    } else if (bytes[cursor] === 0x28) {
+      cursor = readLiteral(bytes, cursor).end;
+    } else if (bytes[cursor] === 0x3c) {
+      cursor = readHex(bytes, cursor).end;
+    } else if (bytes[cursor] === 0x5b) {
+      cursor = skipArray(bytes, cursor);
+    } else {
+      cursor += 1;
+    }
+  }
+  if (depth !== 0) throw new Error("Malformed PDF dictionary in content stream");
+  return cursor;
+}
+
 function encodeLiteral(value) {
   const output = [0x28];
   for (const byte of value) {
@@ -101,7 +186,35 @@ function skipInlineImage(bytes, start) {
   return bytes.length;
 }
 
-export function scanTextRuns(bytes) {
+/**
+ * Wraps a token-reading call so a parse failure names where it happened: `context`
+ * (e.g. "content stream object 42", passed in by the caller -- see decodeStream() in
+ * pdf-document.js) and the byte offset the failing token started at, both appended to
+ * the underlying error's own message (already specific -- "Malformed PDF hex
+ * string", "Malformed PDF dictionary in content stream", ...). Also attaches a short
+ * (<=40 byte) excerpt around the failure as `contentStreamExcerpt`/
+ * `contentStreamOffset` properties, for callers that want it for debugging, without
+ * putting raw PDF bytes into the message every caller/log/UI sees by default.
+ */
+function withStreamContext(read, bytes, cursor, context) {
+  try {
+    return read();
+  } catch (error) {
+    const suffix = context ? `${context}, byte offset ${cursor}` : `byte offset ${cursor}`;
+    const wrapped = new Error(`${error.message} (${suffix})`);
+    wrapped.contentStreamOffset = cursor;
+    wrapped.contentStreamExcerpt = latin1.decode(bytes.subarray(Math.max(0, cursor - 20), Math.min(bytes.length, cursor + 20)));
+    throw wrapped;
+  }
+}
+
+/**
+ * Extracts text-showing operands (Tj/TJ/'/" strings, inside BT...ET) from a content
+ * stream, as a lightweight scanner -- not a full PDF content-stream parser or AST.
+ * `context`, when given, is threaded into any parse-failure message via
+ * withStreamContext() above; pdf-document.js passes `content stream object ${number}`.
+ */
+export function scanTextRuns(bytes, context = "") {
   const strings = [];
   const runs = [];
   let cursor = 0;
@@ -117,13 +230,23 @@ export function scanTextRuns(bytes) {
     cursor = skipWhite(bytes, cursor);
     if (cursor >= bytes.length) break;
     if (bytes[cursor] === 0x28) {
-      const token = readLiteral(bytes, cursor);
+      const token = withStreamContext(() => readLiteral(bytes, cursor), bytes, cursor, context);
       strings.push({ ...token, start: cursor });
       cursor = token.end;
       continue;
     }
-    if (bytes[cursor] === 0x3c && bytes[cursor + 1] !== 0x3c) {
-      const token = readHex(bytes, cursor);
+    // A dictionary operand (e.g. `/Span << /MCID 12 >> BDC`, a marked-content
+    // property list) is skipped as one opaque unit -- its second `<` must never be
+    // mistaken for the start of a hex string (see skipDictionary()'s docstring), and
+    // any string nested inside it (e.g. /ActualText's value) must never become a
+    // text-showing run: this scanner only extracts operands actually passed to
+    // Tj/TJ/'/", which a dictionary operand to BDC/DP/etc. never is.
+    if (bytes[cursor] === 0x3c && bytes[cursor + 1] === 0x3c) {
+      cursor = withStreamContext(() => skipDictionary(bytes, cursor), bytes, cursor, context);
+      continue;
+    }
+    if (bytes[cursor] === 0x3c) {
+      const token = withStreamContext(() => readHex(bytes, cursor), bytes, cursor, context);
       strings.push({ ...token, start: cursor });
       cursor = token.end;
       continue;

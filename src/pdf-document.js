@@ -138,7 +138,7 @@ export class PdfTextEditor {
         if (seen.has(object.number)) continue;
         seen.add(object.number);
         const decoded = await decodeStream(object, "content stream", this.security);
-        const runs = scanTextRuns(decoded);
+        const runs = scanTextRuns(decoded, `content stream object ${object.number}`);
         if (runs.length) this.streams.push({ object, decoded, runs, fontMaps: await loadFontMaps(resources, this.document, this.security) });
       }
     }

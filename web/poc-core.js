@@ -58,7 +58,7 @@ const ERROR_CATEGORIES = [
   { pattern: /must contain \/Root and \/Size|has no \/Pages reference/i, label: "PDF構造が想定外（Root/Pagesをたどれない）" },
   { pattern: /length does not end at endstream|has no valid \/Length/i, label: "stream長の解析失敗" },
   { pattern: /Unknown text run/i, label: "run IDが存在しない" },
-  { pattern: /Malformed PDF (literal string|hex string)/i, label: "content stream解析失敗（文字列トークンが壊れている）" },
+  { pattern: /Malformed PDF (literal string|hex string|dictionary in content stream|array in content stream)/i, label: "content stream解析失敗（文字列トークンまたはdictionary/arrayが壊れている）" },
   { pattern: /Circular \/(Kids|Prev)/i, label: "PDF構造が循環している（破損の可能性）" },
   { pattern: /Maximum call stack size exceeded/i, label: "構造が深すぎる、または循環している" },
   { pattern: /saved PDF contains no editable text runs/i, label: "再読込失敗（保存結果から本文runを取り出せない）" },

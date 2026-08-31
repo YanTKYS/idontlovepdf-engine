@@ -103,6 +103,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
   - **decode順序**: Object Stream自身が暗号化されている場合、`raw stream bytes → AES復号（Object Stream自身のobject番号・generationから導出したobject keyを使用。内部の各compressed objectは個別に復号しません） → FlateDecode → Predictor解除 → header解析 → 内部object抽出`の順で処理します（暗号化されていなければAES復号を省略するだけで、他の順序は共通です）。FlateDecode・Predictor解除はcontent stream等と共通の`decodeStreamBytes()`をそのまま再利用します。xref stream自体は仕様上暗号化・Object Stream格納のいずれの対象にもならないため、この経路には一切含めていません。
   - **async解決**: 通常object用の同期`PdfStructure#object()`はtype 1専用のまま維持し、type 1・type 2いずれも解決できる非同期の`PdfStructure#resolveObject(ref, security?, decrypt?)`を別に用意しています。`object()`をtype 2 entryへ呼ぶと「`resolveObject()`を使うように」という明確なエラーになります。実際にtype 2になり得る参照（Catalog・Pages/Page・Resources・`/Font`辞書）だけを`resolveObject()`に置き換え、`/Contents`や`/ToUnicode`など仕様上streamで格納される参照は従来どおり同期のままです。
   - **cache**: 同じ`PdfTextEditor`/`PdfStructure`インスタンス内で、同じObject Streamは一度だけdecodeし（`objectStreamCache`）、複数のcompressed objectを解決しても再decodeしません。password・file keyそのものはこのcacheに保持しません。
+- **content stream内のdictionary operand（`<< ... >>`）を構造的にskipします。** marked-content操作（`/Span << /MCID 12 >> BDC`のような、property listを伴う`BDC`/`DP`等）が実PDFでは一般的ですが、dictionaryの2文字目の`<`をhex string開始と誤認しない、`<<`/`>>`のnesting depthを追跡してdictionary全体を安全にskipする、というのが`src/content-stream.js`の`skipDictionary()`（内部で配列用の`skipArray()`と相互再帰）です。dictionary/array内部のliteral string・hex stringは既存の`readLiteral()`・`readHex()`をそのまま再利用するため、文字列中の`)`・`>`・`>>`相当のbyteをdictionary/array終端と誤認しません。`%`commentは既存の`skipWhite()`でwhitespace同様に読み飛ばします。**dictionary operand内部のstringは本文runとして扱いません**（`/ActualText`のような値の意味解釈はしません）。`Tj`・`TJ`・`'`・`"`（TJ arrayの要素を含む）へ渡されたstringのみが従来どおり本文抽出対象です。閉じていない`<<`・array・dictionary内の不正なliteral/hex stringは、`Malformed PDF dictionary in content stream`・`Malformed PDF array in content stream`のように明示的なエラーにします（silent recoveryはしません）。`scanTextRuns(bytes, context)`の`context`（`pdf-document.js`が`content stream object ${number}`を渡す）は、これらの解析失敗時にbyte offsetとともにエラーメッセージへ付与されます（`error.contentStreamOffset`・`error.contentStreamExcerpt`にも前後最大40byte程度のdebug情報を保持しますが、通常のエラーメッセージ自体にPDF本文を大量には含めません）。
 - inline image（`BI ... ID ... EI`）の画像データは本文走査から除外します。画像そのものは編集対象外です。
 - 1ページの`/Contents`が複数streamに分かれている場合、各streamを独立に走査します。`BT`〜`ET`がstream境界をまたぐと、そのrunは列挙されません。
 - 置換後の文字幅に応じた再レイアウトはしません。元と近い幅のテキスト置換が主用途です。
@@ -136,6 +137,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - Standard Security Handler R4 / AESV2で暗号化されたPDFで、Object Stream自身がAES暗号化されている場合に、Object Stream自身のobject番号から導出したobject keyで復号してから内部objectを取得できること（内部object個々を復号しないこと）。AESV2 + Predictorの組合せでも同様に取得できること
 - Font dictionaryやPage dictionaryがObject Stream内に格納されていても、`/ToUnicode`による日本語復号やCatalog→Pages→Page→Contentsのページツリー解決が通常どおり動作すること
 - Object Stream対応後も、非暗号化PDFの`listTextRuns()` → `replaceText()` → `save()` → 再読込み、および暗号化PDFの認証 → 復号 → 検索 → `/P`文書変更禁止時の置換拒否が、いずれも従来どおり動作すること
+- `/Span << /MCID 12 >> BDC`のようなdictionary operandが、2文字目の`<`をhex string開始と誤認せず正しくskipされ、直後の`Tj`本文runの取得を妨げないこと（実PDFで実際に発生した誤認パターンの回帰）。dictionary内部のliteral string・hex string・array・nested dictionary・`%`commentもそれぞれ正しくskipされ、その内部のstringが本文runに含まれないこと。dictionary skip後も、`TJ` arrayの要素や独立したhex text-showing stringは従来どおり本文runとして取得できること。閉じていない`<<`・dictionary/array内の不正なliteral/hex stringは明確なエラーになり、silent recoveryやhangを起こさないこと（`test/content-stream.test.js`・`test/pdf-regressions.test.js`）
 - 不正な`/W`・奇数個の`/Index`・`/W`と`/Index`が示す長さに合わないstreamで、ハングや過大なメモリ確保をせず例外になること
 - `/Index`の各subsectionが`/Size`を超える、順序が昇順でない、subsection同士が重複する、といった`/Index`と`/Size`の矛盾を例外にすること
 - cross-reference stream由来のPDFで`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること
@@ -263,7 +265,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 
 `readerDisplay`はブラウザPoCでも自動判定せず、常に`null`です。**保存できたことと、意図どおり表示されることは別です。**保存した編集済PDFをAcrobat Reader等の独立したPDF readerで開いて確認し、結果は人間がJSONへ追記してください。
 
-失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream解析失敗（破損した`/W`・`/Index`・stream長など）、object stream解析失敗（`/ObjStm`の`/N`・`/First`・header不整合など）、Predictor未対応または不正（未対応の値・row長不正・TIFF Predictorの未対応bit depthなど）、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
+失敗時は既存のエラーメッセージをそのまま表示したうえで、xref stream解析失敗（破損した`/W`・`/Index`・stream長など）、object stream解析失敗（`/ObjStm`の`/N`・`/First`・header不整合など）、content stream解析失敗（文字列トークンまたはdictionary/arrayが壊れている。dictionary/arrayが閉じていない、内部のliteral/hex stringが不正など）、Predictor未対応または不正（未対応の値・row長不正・TIFF Predictorの未対応bit depthなど）、暗号化PDF、unsupported filter、本文runなし、ToUnicodeなし、CMap逆引き失敗（glyph不足の可能性）、保存失敗、再読込失敗などの分類を併記します。
 
 このPoCの成功は、**一般的なPDFすべてへの対応を保証しません。**失敗するPDFがあることを前提に、出力元ごとの傾向を確かめるための画面です。
 

@@ -48,6 +48,16 @@ test("skips inline image data instead of tokenising it as text", async () => {
   assert.deepEqual((await editor.listTextRuns()).map((run) => run.text), ["before", "after"]);
 });
 
+test("does not misread a marked-content dictionary operand's second '<' as a hex string (real-PDF regression)", async () => {
+  // Exactly the pattern npo_koubo_r6.pdf uses (/Span << /MCID ... >> BDC ... EMC)
+  // around each piece of visible text -- without skipDictionary(), the dictionary's
+  // own second "<" was mistaken for a hex string start and "/MCID 12 " was fed to
+  // readHex() as hex digits, aborting the whole scan with "Malformed PDF hex string".
+  const content = "BT /Span << /MCID 12 >> BDC (Visible text) Tj EMC ET";
+  const editor = new PdfTextEditor(buildPdf([...singlePage, streamObject(4, content)]));
+  assert.deepEqual((await editor.listTextRuns()).map((run) => run.text), ["Visible text"]);
+});
+
 test("edits a content stream shared by several pages exactly once", async () => {
   const source = buildPdf([
     catalog,
