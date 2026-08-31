@@ -578,6 +578,98 @@ test("rejects a compressed object that is itself a stream object (disallowed ins
   await assert.rejects(editor.document.resolveObject(100), /is a stream object, which is not permitted/);
 });
 
+/* ------------------------------------------------- trailing-token validation (object end) */
+/* An Object Stream entry's byte range is bounded only by the header's offsets (see
+ * parseObjectStream()), not by any terminator of its own -- so after a value's own
+ * syntax ends, everything up to the entry's end must be nothing but whitespace/comments.
+ * Otherwise a malformed entry like "42 /Foo" would be silently accepted as if it were
+ * merely "42" with the remainder ignored. */
+
+test("rejects a compressed object with trailing tokens after a number (42 /Foo)", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "42 /Foo" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.resolveObject(100), /trailing tokens/);
+});
+
+test("rejects a compressed boolean with trailing tokens (trueX)", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "trueX" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.resolveObject(100), /trailing tokens/);
+});
+
+test("rejects a compressed null with trailing tokens (null garbage)", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "null garbage" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.resolveObject(100), /trailing tokens/);
+});
+
+test("rejects a compressed array with trailing tokens ([1 2] /Foo)", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "[1 2] /Foo" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.resolveObject(100), /trailing tokens/);
+});
+
+test("rejects a compressed dictionary with trailing tokens (<< /A 1 >> 99)", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "<< /A 1 >> 99" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.resolveObject(100), /trailing tokens/);
+});
+
+test("rejects a compressed number written with exponent notation (1e3) instead of silently reading its leading digit", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "1e3" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  await assert.rejects(editor.document.resolveObject(100), /trailing tokens/);
+});
+
+test("accepts trailing whitespace and a comment after a compressed object's value", async () => {
+  const pdf = buildObjStmPdf({
+    compressedObjects: [{ number: 100, dictionary: "42  \n% a comment\n" }],
+    normalObjects: [],
+    objStmNumber: 5,
+    rootNumber: 1
+  });
+  const editor = new PdfTextEditor(pdf);
+  await editor.document.ensureXref();
+  const object = await editor.document.resolveObject(100);
+  assert.equal(object.value, 42);
+});
+
 /* --------------------------------------------------------------------- FlateDecode / Predictor */
 
 test("decodes an object stream that is FlateDecode-compressed", async () => {

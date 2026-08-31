@@ -395,11 +395,29 @@ function parseReferenceArray(text, key) {
  * something else is still resolved correctly rather than rejected as unsupported;
  * only a genuinely disallowed shape (a stream) is rejected, and explicitly.
  */
+/**
+ * An Object Stream entry's byte range holds exactly one PDF value (its bounds come
+ * from the header's offsets, not from any terminator of its own -- see
+ * parseObjectStream() in object-stream.js). Reading a value only from its start
+ * would silently accept trailing garbage after it (`42 /Foo`, `trueX`, `[1 2] /Foo`)
+ * as if the entry were merely `42`/`true`/`[1 2]` with an ignored remainder -- an
+ * unintended value taken from a malformed or hostile PDF. Called once per branch of
+ * interpretCompressedObject() below, after that branch has located its value's own
+ * end, to confirm nothing but whitespace/comments (skipWhite() already skips both)
+ * remains before the entry's byte range runs out.
+ */
+function requireObjectEnd(bytes, valueEnd, streamNumber, objectNumber) {
+  if (skipSpace(bytes, valueEnd) !== bytes.length) {
+    throw new Error(`Object stream ${streamNumber}: compressed object ${objectNumber} has trailing tokens after its value`);
+  }
+}
+
 function interpretCompressedObject(entry, streamNumber) {
   const base = { number: entry.objectNumber, generation: 0, dictionary: "", data: null, value: null, rawValue: null };
   const bytes = entry.bytes;
   const start = skipSpace(bytes, 0);
   const byte = bytes[start];
+  const end = (valueEnd) => requireObjectEnd(bytes, valueEnd, streamNumber, entry.objectNumber);
 
   if (byte === 0x3c && bytes[start + 1] === 0x3c) {
     const dictionary = extractDictionary(bytes, start);
@@ -410,30 +428,51 @@ function interpretCompressedObject(entry, streamNumber) {
     if (keywordAt(bytes, skipSpace(bytes, dictionary.end), "stream")) {
       throw new Error(`Object stream ${streamNumber}: compressed object ${entry.objectNumber} is a stream object, which is not permitted inside an Object Stream`);
     }
+    end(dictionary.end);
     return { ...base, dictionary: dictionary.text };
   }
   if (byte === 0x5b) {
-    return { ...base, rawValue: decodeBinaryString(bytes.subarray(start, arrayEnd(bytes, start))) };
+    const cursor = arrayEnd(bytes, start);
+    end(cursor);
+    return { ...base, rawValue: decodeBinaryString(bytes.subarray(start, cursor)) };
   }
   if (byte === 0x2f) {
     let cursor = start + 1;
     while (isRegular(bytes[cursor])) cursor += 1;
+    end(cursor);
     return { ...base, rawValue: decodeBinaryString(bytes.subarray(start, cursor)) };
   }
   if (byte === 0x28) {
-    return { ...base, rawValue: readLiteral(bytes, start).value };
+    const literal = readLiteral(bytes, start);
+    end(literal.end);
+    return { ...base, rawValue: literal.value };
   }
   if (byte === 0x3c) {
-    return { ...base, rawValue: readHex(bytes, start).value };
+    const hex = readHex(bytes, start);
+    end(hex.end);
+    return { ...base, rawValue: hex.value };
   }
-  if (keywordAt(bytes, start, "true")) return { ...base, value: true };
-  if (keywordAt(bytes, start, "false")) return { ...base, value: false };
-  if (keywordAt(bytes, start, "null")) return { ...base, value: null, rawValue: "null" };
+  if (keywordAt(bytes, start, "true")) {
+    end(start + 4);
+    return { ...base, value: true };
+  }
+  if (keywordAt(bytes, start, "false")) {
+    end(start + 5);
+    return { ...base, value: false };
+  }
+  if (keywordAt(bytes, start, "null")) {
+    end(start + 4);
+    return { ...base, value: null, rawValue: "null" };
+  }
   if (byte === 0x2b || byte === 0x2d || byte === 0x2e || (byte >= 0x30 && byte <= 0x39)) {
     let cursor = start + (bytes[start] === 0x2b || bytes[start] === 0x2d ? 1 : 0);
     while ((bytes[cursor] >= 0x30 && bytes[cursor] <= 0x39) || bytes[cursor] === 0x2e) cursor += 1;
     const value = Number(decodeBinaryString(bytes.subarray(start, cursor)));
     if (!Number.isFinite(value)) throw new Error(`Object stream ${streamNumber}: malformed number for compressed object ${entry.objectNumber}`);
+    // A PDF number is only digits/sign/decimal point -- never exponent notation
+    // ("1e3"), which the digit scan above stops at ("1"), leaving "e3" as trailing
+    // tokens for the check below to reject.
+    end(cursor);
     return { ...base, value };
   }
   throw new Error(
