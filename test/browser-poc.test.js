@@ -72,6 +72,9 @@ test("classifies known engine errors into readable causes and keeps the raw mess
     ["load: Encrypted PDFs are not supported", "暗号化PDF"],
     ["load: Encrypted PDFs are not supported (Standard / AES-128 / R4)", "暗号化PDF（Standard / AES-128 / R4）"],
     ["load: Encrypted PDFs are not supported (Standard以外のSecurity Handler: Adobe.PubSec)", "暗号化PDF（Standard以外のSecurity Handler: Adobe.PubSec）"],
+    ["extract: Password required to open this encrypted PDF (Standard / AES-128 / R4)", "暗号化PDF（パスワードが必要）（Standard / AES-128 / R4）"],
+    ["writeback: Document modification is not permitted: this PDF's /P permissions disallow content changes (modify permission denied)", "暗号化PDF（文書変更が許可されていません／P permission）"],
+    ["save: Saving edits to an encrypted PDF is not supported yet (re-encryption is out of scope for this PR); this PDF can be searched but not saved.", "暗号化PDF（再暗号化保存は未対応）"],
     ["extract: Unsupported stream filter: ASCII85Decode", "unsupported filter（未対応の圧縮・符号化）"],
     ["extract: PDF object 12 is missing from the xref table", "objectがxrefに存在しない（破損の可能性）"],
     ["extract: Object streams are not supported (PDF object 12 is stored in object stream 7)", "object stream未対応（xref streamのtype 2 entry）"],
@@ -198,8 +201,14 @@ test("attaches a short encryption summary to the assessment record when extract 
   const { record } = await assessPdfBytes("encrypted.pdf", pdf);
   assert.equal(record.load, true);
   assert.equal(record.extract, false);
-  assert.deepEqual(record.encryption, { filter: "Standard", V: 2, R: 3, method: "Standard Security Handler / RC4（可変長鍵）" });
+  // V2 has no /CF (RC4 is the base algorithm itself, not a named crypt filter), so
+  // the short CFM-code `method` is null; V2 is also out of this PR's authentication
+  // scope (Standard/V4/R4/AESV2 only -- see src/security/decrypt.js), so
+  // authenticated/authType stay false/null regardless of password. modifyAllowed is
+  // still readable straight from /P, independent of authentication.
+  const expected = { filter: "Standard", V: 2, R: 3, method: null, authenticated: false, authType: null, modifyAllowed: true };
+  assert.deepEqual(record.encryption, expected);
 
   const parsed = JSON.parse(toAssessmentJson([record]));
-  assert.deepEqual(parsed.results[0].encryption, { filter: "Standard", V: 2, R: 3, method: "Standard Security Handler / RC4（可変長鍵）" });
+  assert.deepEqual(parsed.results[0].encryption, expected);
 });

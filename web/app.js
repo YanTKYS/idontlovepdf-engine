@@ -8,6 +8,7 @@
  */
 
 import { PdfTextEditor } from "../src/index.js";
+import { summarizeEncryption } from "../src/encryption.js";
 import {
   STAGES,
   WRITEBACK_MODE,
@@ -125,7 +126,12 @@ function setupTabs() {
 
 /* -------------------------------------------------- 機能1・2: 単一PDF検証 */
 
-const single = { name: null, bytes: null, runs: [], previewUrl: null, debugSelectedId: null };
+// password is kept in memory only, for the lifetime of the currently loaded PDF --
+// never persisted (no localStorage/sessionStorage), never sent anywhere, and reset
+// on every new file selection. It exists purely so that a fresh PdfTextEditor
+// built for replace/save (see runMatchReplacement()/runDebugReplacement()) can
+// re-authenticate without asking the user to type the password again.
+const single = { name: null, bytes: null, runs: [], previewUrl: null, debugSelectedId: null, password: undefined, modifyBlocked: false };
 const search = { query: "", matches: [], selectedId: null };
 
 /* --------------------------------------------------------- PDFプレビュー */
@@ -275,6 +281,69 @@ function renderEncryptionDebug(container, diagnosis, encryptReference) {
   container.append(json);
 }
 
+/**
+ * Shown once an encrypted PDF has actually been authenticated (see
+ * src/security/decrypt.js) -- distinct from renderEncryptionDiagnosis() above,
+ * which is for a PDF this engine only diagnoses (out of scope, or not yet
+ * authenticated). Authentication and /P's modify permission are reported as two
+ * separate facts on purpose: recovering the file key is a reading capability,
+ * never grounds on its own for allowing edits -- see README.
+ */
+function renderEncryptionAuthenticated(container, security, passwordWasEntered) {
+  clear(container);
+  container.hidden = false;
+  container.append(element("p", { className: "ok-title", text: "暗号化PDF（認証・復号に成功しました）" }));
+
+  container.append(element("h4", { text: "方式" }));
+  container.append(element("p", { text: summarizeEncryption(security.diagnosis) ?? "不明" }));
+
+  container.append(element("h4", { text: "認証" }));
+  const authLabel = security.authType === "owner"
+    ? "○ owner passwordで認証成功"
+    : `○ ${passwordWasEntered ? "入力された" : "空の"}user passwordで認証成功`;
+  container.append(element("p", { text: authLabel }));
+
+  container.append(element("h4", { text: "権限" }));
+  const list = element("ul");
+  list.append(element("li", { text: "閲覧・検索: 利用可能" }));
+  list.append(element("li", {
+    text: security.modifyAllowed ? "文書変更: 許可されています（/P上）" : "文書変更: 制限されています（/P上、このPoCでは置換を拒否します）"
+  }));
+  container.append(list);
+  if (security.modifyAllowed) {
+    container.append(element("p", { className: "warn", text: "/P上は文書変更が許可されていますが、暗号化PDFの再暗号化保存自体が未対応のため、このPoCでは保存できません（置換の一時的な確認のみ可能です）。" }));
+  }
+}
+
+/**
+ * The minimal password prompt for an encrypted PDF that needs one (see
+ * src/pdf-document.js's `passwordRequired` error). The password never leaves this
+ * function except as an in-memory argument to `onSubmit`: not logged, not put in
+ * the URL, not written to localStorage/sessionStorage, not included in any error
+ * text (see showError()/classifyError(), which only ever echo the engine's own
+ * error message -- never user input).
+ */
+function renderPasswordPrompt(container, diagnosis, onSubmit) {
+  clear(container);
+  container.hidden = false;
+  container.append(element("p", { className: "error-title", text: "暗号化PDF（パスワードが必要です）" }));
+  container.append(element("p", { text: `方式: ${summarizeEncryption(diagnosis) ?? "不明"}` }));
+  container.append(element("p", { text: "認証: × パスワードが必要です" }));
+  container.append(element("p", { className: "sub", text: "入力したパスワードは送信・保存されません。このブラウザ内だけで認証に使い、画面を離れると破棄されます。" }));
+
+  const input = element("input", {
+    attributes: { type: "password", id: "encryption-password-input", placeholder: "パスワード", autocomplete: "off" }
+  });
+  const button = element("button", { text: "認証", attributes: { type: "button" } });
+  const submit = () => onSubmit(input.value);
+  button.addEventListener("click", submit);
+  input.addEventListener("keydown", (event) => { if (event.key === "Enter") submit(); });
+  const actions = element("div", { className: "actions" });
+  actions.append(input, button);
+  container.append(actions);
+  input.focus();
+}
+
 /* ------------------------------------------------------- デバッグ: run一覧 */
 
 function renderRunRow(run) {
@@ -353,10 +422,14 @@ async function runDebugReplacement() {
   let output;
   try {
     const editor = new PdfTextEditor(single.bytes.slice());
+    // Re-authenticates with the same password the initial load already verified
+    // (see attemptLoad()) -- this is a fresh PdfTextEditor instance, so it has not
+    // authenticated yet. A no-op for an unencrypted PDF.
+    await editor.listTextRuns(single.password);
     await editor.replaceText(id, replacement);
     output = await editor.save();
   } catch (error) {
-    const stage = /Unknown text run|ToUnicode|single-byte/.test(messageOf(error)) ? "replace" : "save";
+    const stage = /Unknown text run|ToUnicode|single-byte|modification is not permitted/.test(messageOf(error)) ? "replace" : "save";
     showError($("debug-replace-error"), { title: "置換または保存に失敗しました", error, stage });
     return;
   }
@@ -460,6 +533,12 @@ function selectMatch(match) {
     }));
   }
 
+  if (single.modifyBlocked) {
+    detail.append(element("p", { className: "warn", text: "このPDFでは文書変更が許可されていません（/P permission）。置換は実行できません。" }));
+    $("replace-input").disabled = true;
+    $("replace-run").disabled = true;
+    return;
+  }
   $("replace-input").disabled = false;
   $("replace-input").value = match.text;
   $("replace-run").disabled = false;
@@ -495,10 +574,15 @@ async function runMatchReplacement() {
   let output;
   try {
     const editor = new PdfTextEditor(single.bytes.slice());
+    // 新しいeditorインスタンスは未認証のため、読込時に確認済みの同じパスワードで
+    // 再認証する（暗号化PDFでない場合は無視される）。selectMatch()側で/P上
+    // 文書変更が許可されていないPDFは置換UI自体を無効化しているが、ここでも
+    // replaceText()自身のpermissionチェックにより二重に拒否される。
+    await editor.listTextRuns(single.password);
     for (const update of plan.updates) await editor.replaceText(update.runId, update.newText);
     output = await editor.save();
   } catch (error) {
-    const stage = /Unknown text run|ToUnicode|single-byte/.test(messageOf(error)) ? "replace" : "save";
+    const stage = /Unknown text run|ToUnicode|single-byte|modification is not permitted/.test(messageOf(error)) ? "replace" : "save";
     showError($("replace-error"), { title: "置換または保存に失敗しました", error, stage });
     return;
   }
@@ -532,13 +616,102 @@ async function runMatchReplacement() {
 
 /* --------------------------------------------------------------- PDF読込 */
 
+/**
+ * The load/extract half of handleSingleFile(), split out so it can run again with
+ * a different password when the first (empty-password) attempt reports
+ * `passwordRequired` -- see renderPasswordPrompt(). `password` is `undefined` on
+ * the very first call, which listTextRuns() treats as "try the empty password".
+ */
+async function attemptLoad(file, editor, password, passwordWasEntered) {
+  const summary = $("single-summary");
+  let runs;
+  try {
+    runs = await editor.listTextRuns(password);
+  } catch (error) {
+    hide(summary);
+    const diagnosis = error.encryptionDiagnosis;
+    if (error.passwordRequired) {
+      // Recoverable: this encryption is within scope, just needs a (different)
+      // password. Keep the file's own preview/summary state intact so the user
+      // isn't staring at a blank screen while they try again.
+      renderPasswordPrompt($("encryption-password-section"), diagnosis, (entered) => {
+        void attemptLoad(file, editor, entered, true);
+      });
+      return;
+    }
+    hide($("encryption-password-section"));
+    if (diagnosis?.encrypted) {
+      // Out of this PR's decryption scope (not Standard/V4/R4/AESV2), or missing
+      // /O//U/ID -- no password will fix this, so show the read-only diagnosis
+      // instead of a password prompt. The raw error message is still shown
+      // via showError() (never hidden), alongside the structured breakdown.
+      showError($("single-error"), { title: `${file.name}: 暗号化PDFのため本文を抽出できません`, error, stage: "extract" });
+      renderEncryptionDiagnosis($("single-encryption"), diagnosis);
+      renderEncryptionDebug($("debug-encryption"), diagnosis, editor.document.encryptReference);
+    } else {
+      showError($("single-error"), { title: `${file.name}: 本文runを抽出できませんでした`, error, stage: "extract" });
+    }
+    return;
+  }
+
+  hide($("encryption-password-section"));
+  hide($("single-error"));
+  single.password = password;
+  single.runs = runs;
+
+  if (editor.security) {
+    renderEncryptionAuthenticated($("single-encryption"), editor.security, passwordWasEntered);
+    renderEncryptionDebug($("debug-encryption"), editor.security.diagnosis, editor.document.encryptReference);
+  } else {
+    hide($("single-encryption"));
+    hide($("debug-encryption"));
+  }
+
+  clear(summary);
+  const undecodable = runs.filter((run) => !describeRun(run).decodable).length;
+  summary.append(element("p", {}, [
+    element("strong", { text: file.name }),
+    element("span", { text: `（${file.size.toLocaleString("ja-JP")} バイト）` })
+  ]));
+  const status = element("p", { className: "status-line" });
+  status.append(element("span", { text: "load: " }), statusChip(true));
+  status.append(element("span", { text: " extract: " }), statusChip(runs.length > 0));
+  status.append(element("span", { text: ` 本文run: ${runs.length} 件` }));
+  if (undecodable) status.append(element("span", { className: "warn", text: ` / 復号不可を含むrun: ${undecodable} 件` }));
+  summary.append(status);
+  if (runs.length === 0) {
+    summary.append(element("p", { className: "warn", text: "本文runが0件です。テキストが画像化されている、または本PoCが解釈できない構造の可能性があります。検索・置換は利用できません。" }));
+  }
+
+  const body = $("run-body");
+  clear(body);
+  for (const run of runs) body.append(renderRunRow(run));
+
+  $("search-section").hidden = false;
+  $("search-input").disabled = runs.length === 0;
+  // Search always works once runs are extracted -- authentication is a reading
+  // capability. Only the replace UI (gated in selectMatch(), see below) is blocked
+  // on /P's modify permission.
+  single.modifyBlocked = editor.security?.modifyAllowed === false;
+  if (single.modifyBlocked) {
+    const notice = $("replace-permission-notice");
+    notice.hidden = false;
+    notice.textContent = "このPDFでは文書変更が許可されていません（/P permission）。検索はできますが、置換・保存はできません。";
+  } else {
+    hide($("replace-permission-notice"));
+  }
+  runSearch("");
+}
+
 async function handleSingleFile(file) {
   single.name = file.name;
   single.bytes = null;
   single.runs = [];
+  single.password = undefined;
   hide($("single-error"));
   hide($("single-encryption"));
   hide($("debug-encryption"));
+  hide($("encryption-password-section"));
   clear($("run-body"));
   revokePreview();
   $("editor-grid").hidden = true;
@@ -564,7 +737,8 @@ async function handleSingleFile(file) {
   }
 
   // editor-gridとプレビューは、この自作エンジンの解析結果とは独立に、読み取れた
-  // bytesがあれば表示する。エンジンが本文runを抽出できないPDFでも、目視確認の助けになる。
+  // bytesがあれば表示する。エンジンが本文runを抽出できないPDF（暗号化PDF含む）でも、
+  // 目視確認の助けになる。
   $("editor-grid").hidden = false;
   $("preview-section").hidden = false;
   try {
@@ -584,51 +758,8 @@ async function handleSingleFile(file) {
     return;
   }
 
-  let runs;
-  try {
-    runs = await editor.listTextRuns();
-  } catch (error) {
-    hide(summary);
-    const diagnosis = error.encryptionDiagnosis;
-    if (diagnosis?.encrypted) {
-      // 暗号化PDFは単なる赤いエラーではなく、Security Handler/V/R/CF/権限を
-      // 読み取れる範囲まで構造化して見せる。原文のエラーメッセージも
-      // showError() 経由でそのまま併記する（隠さない方針は変えない）。
-      showError($("single-error"), { title: `${file.name}: 暗号化PDFのため本文を抽出できません`, error, stage: "extract" });
-      renderEncryptionDiagnosis($("single-encryption"), diagnosis);
-      renderEncryptionDebug($("debug-encryption"), diagnosis, editor.document.encryptReference);
-    } else {
-      showError($("single-error"), { title: `${file.name}: 本文runを抽出できませんでした`, error, stage: "extract" });
-    }
-    return;
-  }
-
   single.bytes = bytes;
-  single.runs = runs;
-
-  clear(summary);
-  const undecodable = runs.filter((run) => !describeRun(run).decodable).length;
-  summary.append(element("p", {}, [
-    element("strong", { text: file.name }),
-    element("span", { text: `（${file.size.toLocaleString("ja-JP")} バイト）` })
-  ]));
-  const status = element("p", { className: "status-line" });
-  status.append(element("span", { text: "load: " }), statusChip(true));
-  status.append(element("span", { text: " extract: " }), statusChip(runs.length > 0));
-  status.append(element("span", { text: ` 本文run: ${runs.length} 件` }));
-  if (undecodable) status.append(element("span", { className: "warn", text: ` / 復号不可を含むrun: ${undecodable} 件` }));
-  summary.append(status);
-  if (runs.length === 0) {
-    summary.append(element("p", { className: "warn", text: "本文runが0件です。テキストが画像化されている、または本PoCが解釈できない構造の可能性があります。検索・置換は利用できません。" }));
-  }
-
-  const body = $("run-body");
-  clear(body);
-  for (const run of runs) body.append(renderRunRow(run));
-
-  $("search-section").hidden = false;
-  $("search-input").disabled = runs.length === 0;
-  runSearch("");
+  await attemptLoad(file, editor, undefined, false);
 }
 
 /* -------------------------------------------- 機能3: 複数PDFの一括互換性評価 */

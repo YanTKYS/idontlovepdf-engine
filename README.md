@@ -13,6 +13,7 @@
 - PDF 1.5以降の**cross-reference stream**（`/Type /XRef`）に対応。classic xrefとの`/Prev`混在も可。xref stream自体がPredictor付きでも解析可能
 - Catalog → Pages → Page → Contentsをたどり、ページ本文以外のstreamを除外
 - 既存フォントの`/ToUnicode` CMap（`bfchar`・`bfrange`）によるUnicode復号と再エンコード
+- Standard Security Handler R4 / AESV2で暗号化されたPDFのuser/owner password認証・復号に対応（`/P`の文書変更permissionは尊重し、編集はまだ保存できない）
 - 元ファイルを壊さず、PDF incremental update として変更を追記
 - `Uint8Array` による composite font 用のエンコード済み文字コード指定
 - TypeScript 型定義を同梱
@@ -46,19 +47,21 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 
 ### `new PdfTextEditor(input)`
 
-`ArrayBuffer` または `Uint8Array` の PDF を読み込みます。classic xref table・cross-reference stream・両者が`/Prev`で混在する構成のいずれにも対応します。トレーラーが`/Encrypt`を持つ暗号化PDFでも、xref解析自体（object位置・`/Root`・`/Size`の取得）はここでは失敗しません。暗号化の有無はcontent（文字列やstream本体）を読まなくても分かる情報のためです。実際に本文を読もうとする`listTextRuns()`の時点で初めて拒否され、その際に何が検出されたかの診断が付きます（後述「暗号化PDFの診断」）。xref解析自体はFlateDecodeの展開を含み非同期になり得るため、コンストラクタは同期のまま、実際の解析は最初の`listTextRuns()`（内部的には`replaceText()`・`save()`も経由）呼び出し時に遅延して行われます。
+`ArrayBuffer` または `Uint8Array` の PDF を読み込みます。classic xref table・cross-reference stream・両者が`/Prev`で混在する構成のいずれにも対応します。トレーラーが`/Encrypt`を持つ暗号化PDFでも、xref解析自体（object位置・`/Root`・`/Size`の取得）はここでは失敗しません。暗号化の有無はcontent（文字列やstream本体）を読まなくても分かる情報のためです。xref解析自体はFlateDecodeの展開を含み非同期になり得るため、コンストラクタは同期のまま、実際の解析（および暗号化PDFの認証・復号）は最初の`listTextRuns()`（内部的には`replaceText()`・`save()`も経由）呼び出し時に遅延して行われます。
 
-### `await editor.listTextRuns()`
+### `await editor.listTextRuns(password?)`
 
 `{ id, objectNumber, textObjectId, fontName, text, bytes }` の配列を返します。`textObjectId`は、そのrunが属する`BT ... ET`ブロックを、content stream内での出現順に0から採番したものです。同じ`objectNumber`でも別の`BT ... ET`（PDF上の別位置へ独立して移動して描画されることが多い）なら異なる`textObjectId`になります。利用中のfontに`/ToUnicode` CMapがあれば`text`をUnicodeへ復号します。CMapがなければ単一バイト表示にフォールバックするため、確実な調査には`bytes`も確認してください。
 
+暗号化PDF（`/Encrypt`）の場合、初回呼び出しは`password`省略時に空文字列のuser passwordで認証を試みます。認証に成功すればそのまま本文を復号して返し、失敗すれば`passwordRequired: true`と`encryptionDiagnosis`を持つ`Error`を投げます（対応するSecurity Handler自体が対象外の場合は`passwordRequired`なしでこの`Error`を投げ、パスワードでは解決しません）。`password`を指定して再度呼び出すと、そのパスワードで再認証します。認証に使ったユーザー/オーナー種別・`/P`権限などは`editor.security`（内部利用: `{ authenticated, authType, modifyAllowed, permissions, diagnosis, ... }`）に保持されます。対応範囲・認証・復号の詳細は後述「暗号化PDFの認証・復号（Standard Security Handler R4 / AESV2）」を参照してください。
+
 ### `await editor.replaceText(id, replacement)`
 
-対象runを文字列またはバイト列で置換予約します。CMapがあるfontではUnicode文字列を既存文字コードへ逆変換します。CMapがない場合、文字列は単一バイト文字に限定されます。どちらの場合も、実際に表示できる字形は既存fontに含まれるものだけです。
+対象runを文字列またはバイト列で置換予約します。CMapがあるfontではUnicode文字列を既存文字コードへ逆変換します。CMapがない場合、文字列は単一バイト文字に限定されます。どちらの場合も、実際に表示できる字形は既存fontに含まれるものだけです。暗号化PDFで`/P`の文書変更permissionが許可されていない場合、認証に成功していてもここで明確なエラーを投げて拒否します（読み取り・検索ができることと、変更が許可されていることは別の判定です）。
 
 ### `await editor.save()`
 
-変更済み PDF を新しい `Uint8Array` で返します。入力データは変更しません。
+変更済み PDF を新しい `Uint8Array` で返します。入力データは変更しません。保留中の変更が1件もなければ、暗号化PDFでもそのまま元のbytesを返します。暗号化PDFに対して実際に変更を保存しようとした場合はエラーになります（再暗号化保存は未対応。後述）。
 
 ## idontlovepdf への組込み
 
@@ -68,7 +71,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 
 - ページ上の座標、フォント名、文字サイズはまだ公開していません。
 - `/ASCII85Decode`、画像化された文字は未対応です。
-- 暗号化PDFは、`/Encrypt`辞書の内容を読み取って画面へ診断表示するところまでは対応しています（後述「暗号化PDFの診断」）が、本文抽出・置換・保存（=実際の復号）は未対応です。
+- 暗号化PDFは、`/Filter /Standard /V 4 /R 4`かつCrypt Filterが`/AESV2`（または`/Identity`）の組み合わせに限り、認証・復号・本文抽出・検索まで対応しています。それ以外（`/R 2`・`/R 3`・`/R 5`・`/R 6`・`/AESV3`・AES-256・`/Adobe.PubSec`などの非Standard方式）は診断のみで、明確な理由付きのエラーで停止します。文書変更を許可しない`/P`のPDFでは、認証に成功しても置換・保存を拒否します。暗号化PDFへの変更の保存（再暗号化）はまだ未対応です。詳細は後述「暗号化PDFの認証・復号（Standard Security Handler R4 / AESV2）」を参照してください。
 - `/DecodeParms /Predictor`は、`src/predictor.js`が次の範囲に対応します。
   - **Predictor 1**（補正なし）: そのまま
   - **Predictor 10〜15**（PNG Predictor: None/Sub/Up/Average/Paeth）: PDF仕様どおり、値の大小に関わらずrowごとの先頭1バイトで実際のfilter typeを読み取って復元します（`/Predictor`の数値はどのfilterが多いかの目安に過ぎず、行ごとの判定は仕様上常に必要です）
@@ -77,14 +80,19 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
   - `/Predictor`・`/Columns`・`/BitsPerComponent`等の値は、キーに続くトークン全体をPDF整数として厳密に検証します。`/Predictor 12.5`のような小数や`/Columns foo`のような非数値は、先頭の数字部分だけを読んで推測することなく、そのまま不正値として拒否します。`/BitsPerComponent`はPDF仕様が定める`1`・`2`・`4`・`8`・`16`以外（例: `3`や`5`）も明示的に拒否します
   - Predictor解除はxref stream・page content stream・ToUnicode CMap streamのいずれからも共通利用し（`src/predictor.js`と`src/flate.js`に集約）、失敗時のエラーには`content stream object 45: ...`のようにどのstreamで失敗したかを付記します
   - 保存時（`save()`）は、編集済みcontent streamを常にPredictorなしの素の`/FlateDecode`として書き戻します（`/DecodeParms`も削除）。元PDFがPredictor付きでも、incremental updateとして追記される新しいstreamにはPredictorを再付与しません
-- **暗号化PDF（`/Encrypt`）は、`src/encryption.js`が診断のみ対応します。**トレーラー（またはxref streamの辞書）が持つ`/Encrypt N 0 R`を検出しても、xref解析自体は失敗させず先まで進めます。実際に本文を読もうとした時点（`listTextRuns()`）で、`Error`に`encryptionDiagnosis`という診断結果を添えて拒否します。診断は次を読み取ります（**復号やパスワード検証は一切行いません**）。
-  - `/Filter`が`/Standard`かどうか（Standard Security Handlerかどうか）。`/Adobe.PubSec`のような別方式の場合は、`/Filter`・`/SubFilter`のみ報告し、それ以上（`/P`・`/CF`など）はStandard固有の解釈を当てはめず`null`のまま止めます
-  - `/V`（暗号化バージョン）・`/R`（リビジョン）・`/Length`（Encrypt辞書直下、**bit**単位）・`/EncryptMetadata`（省略時は仕様どおり`true`）。`/Length`省略時の仕様上の既定値40bitは`/V 1`・`/V 2`（RC4のみ）にのみ適用します。`/V 4`・`/V 5`では実際の鍵長は`/CF`側（またはAES-256固定）が決めるため、`/Length`省略時は40bitとみなさず「未指定」として区別します（`lengthBitsSource`: `explicit`/`default`/`unspecified`）
-  - `/CF`（Crypt Filter辞書）内の各filterの`/CFM`（`/None`・`/V2`＝RC4系・`/AESV2`＝AES-128系・`/AESV3`＝AES-256系のいずれかを日本語ラベル付きで報告）・`/Length`・`/AuthEvent`、および`/StmF`・`/StrF`（どのfilterをstream/stringに使うか）。**Crypt Filterの`/Length`はEncrypt辞書直下の`/Length`と異なり`bytes`単位**（PDF仕様 7.6.5 表25）のため、`lengthBytes`（原文の値）と`lengthBits`（`× 8`した値）の両方を返し、bytesの値をbitのラベルで表示してしまう取り違えを防ぎます（例: `/Length 16` は128bit鍵であり16bit鍵ではありません）
-  - `/P`の権限bit（符号付き32bit整数として解釈）: 印刷・文書変更・内容コピー・注釈の4項目に加え、`/R >= 3`の場合のみフォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷の4項目。`/R 2`ではこの4項目を仕様上未定義として`null`のまま返し、bitを読んで推測することはしません
-  - `/V`・`/R`・`/CFM`の組み合わせからの**推定**方式（`estimatedMethod`）。これは辞書の記載そのもの（`filter`・`version`・`revision`・`cryptFilters`など）とは別のフィールドとして返し、「確定できる情報」と「推定」を混同しないようにしています
-  - パスワードの検証は行わないため、パスワード状態は常に「未判定 / PoC対象外」です。他のPDF readerで開けたことをもって「パスワードなし」と判定することもありません
-  - 実装しないもの（意図的なスコープ外）: 復号そのもの、ユーザー/オーナーパスワードの検証、パスワード入力UI、パスワード総当たり、権限制限の回避、暗号化鍵の生成、RC4/AES復号、暗号化されたstream・stringの復号、object stream（`/ObjStm`）対応
+- **暗号化PDFの診断は`src/encryption.js`が担い、認証・復号は`src/security/`配下が担います。**両者は責任を分離しています: `src/encryption.js`はEncrypt辞書を読み取って`{ filter, version, revision, lengthBits, cryptFilters, permissions, estimatedMethod, ... }`を返すだけで、鍵やパスワードには一切触れません。`src/security/decrypt.js`がこの診断を使って対応範囲かどうかを判定し、対応範囲内だけ実際の認証・復号を行います。
+  - トレーラー（またはxref streamの辞書）が持つ`/Encrypt N 0 R`を検出しても、xref解析自体は失敗させず先まで進めます（object位置・`/Root`・`/Size`は暗号化の影響を受けないため）。`Standard`以外のSecurity Handler（`/Adobe.PubSec`など）の場合、`/Filter`・`/SubFilter`のみ報告し、それ以上（`/P`・`/CF`など）はStandard固有の解釈を当てはめず`null`のまま診断のみで止めます。
+  - **認証・復号の対応範囲は`/Filter /Standard /V 4 /R 4`、かつ`/StmF`・`/StrF`が`/AESV2`または`/Identity`のみです。** それ以外（`/R 2`・`/R 3`・`/R 5`・`/R 6`・`/V`が4以外・`/AESV3`・非AESV2のCrypt Filterなど）は、`Unsupported encrypted PDF revision: R6`・`Unsupported crypt filter method: AESV3`のように理由を明示して停止します（パスワードでは解決しません）。
+  - **user password認証**（PDF仕様 7.6.3, Algorithm 2/5/6相当）: `listTextRuns()`は初回、`password`省略時に**空文字列**のuser passwordでまず認証を試みます。実PDFがReaderでパスワード入力なしに開けても、それを「空パスワード」と推測することはせず、Standard Security Handlerの認証計算（`/O`・`/U`・`/P`・トレーラーの`/ID`先頭要素・`/EncryptMetadata`からfile encryption keyを導出し、`/U`と突き合わせる）で判定します。失敗すると`passwordRequired: true`を持つ`Error`を投げ、`listTextRuns(password)`で別のパスワードを渡して再試行できます。
+  - **owner password認証**も同じ呼び出しで（user password認証が失敗した場合に）試みます。認証結果は`user`・`owner`・`失敗`を区別して`editor.security.authType`に残しますが、**owner passwordが分かったからといって`/P`の権限制限を無視することはしません**（owner認証はuser passwordと同じfile encryption keyを復元するだけで、権限突破の手段としては使っていません）。
+  - **ファイル暗号鍵の導出**は仕様どおり実装しています: パスワードのpadding（固定32byteパディング列）、MD5、RC4、revision 3以上での50回の追加MD5、`/O`・`/P`・file ID・`/EncryptMetadata`の扱いを含みます。**AESV2だからといって鍵導出自体をAESで行うわけではありません** — R4 Standard Security Handlerの認証・鍵導出は仕様上MD5/RC4のみで行い、AESはobject単位のstream/string復号にのみ使います。この2つを混同しないよう、`src/security/standard-r4.js`（認証・鍵導出、PDF知識のみ）と`src/security/aes.js`（AES-CBC復号のみ）を分けています。
+  - **objectごとの鍵導出**（Algorithm 1 + AES用の`"sAlT"`）: file encryption key + objectNumber下位3byte + generationNumber下位2byte（+ AESV2の場合は固定4byte `"sAlT"`）をMD5にかけ、先頭バイトを切り出します（`src/security/standard-r4.js`の`deriveObjectKey()`）。object番号やgenerationが異なれば異なる鍵になります。
+  - **MD5・RC4は外部npm依存を追加せず、`src/security/md5.js`・`src/security/rc4.js`として最小限を自前実装しています**（Web CryptoにはMD5・RC4がありません）。汎用暗号ライブラリ化はせず、この認証アルゴリズムに必要な範囲に限定しています。AES-CBC復号は`crypto.subtle`（Web Crypto API）を使い、ブラウザ・Node両方で同じコードが動きます。PDFのAES暗号化stream/stringは先頭16byteがIVで、残りがAES-CBC暗号文です。IV分離・PKCS#7 padding除去（`crypto.subtle`が自動的に検証・除去し、不正な場合は明確なエラーになります）は`src/security/aes.js`が担います。
+  - **復号の順序**は、暗号化された生bytes → Crypt Filterで復号 → `/FlateDecode`展開 → Predictor解除 → content/CMap解析、です（`src/pdf-document.js`の`decodeStream()`に集約）。xref stream自体はPDF仕様上暗号化の対象外のため、この経路を通しません（既存のxref stream解析はそのまま）。`/StmF`・`/StrF`にそれぞれ対応するCrypt Filterを適用し、`/Identity`が指定されたstream/stringは復号しません。
+  - **`/P`の権限判定は認証と独立に行います。** `/P`は符号付き32bit整数として解釈し、印刷・文書変更・内容コピー・注釈の4項目に加え、`/R >= 3`の場合のみフォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷の4項目を判定します（`/R 2`ではこの4項目を`null`のまま返し、bitを読んで推測しません）。認証に成功していても、文書変更（modify）permissionがない場合`replaceText()`は明確なエラーで拒否します。検索（`listTextRuns()`）は権限に関わらず利用できます。
+  - **保存（`save()`）は、暗号化PDFに対する実際の変更がある場合は拒否します。** 再暗号化・`/O`/`/U`の再計算・トレーラーの更新を伴う実装は、認証・復号を成立させる今回のスコープには含めていません。保留中の変更が0件なら（元のPDFをそのまま返すだけなので）暗号化PDFでも成功します。
+  - パスワードは`analyzeEncryption()`が返す診断・`assessment.json`・エラーメッセージのいずれにも一切含めません。ローカルストレージ（`localStorage`・`sessionStorage`）への保存、URLへの混入、外部送信も行いません（ブラウザPoCのパスワード入力欄も参照）。
+  - 実装しないもの（意図的なスコープ外）: `/R 2`・`/R 3`・`/R 5`・`/R 6`、`/AESV3`（AES-256）、`/Adobe.PubSec`などの非Standardハンドラ、パスワード総当たり・辞書攻撃、owner passwordによる権限制限の回避、暗号化PDFへの変更の保存（再暗号化・平文化保存を含む）、object stream（`/ObjStm`）対応
 - cross-reference streamのtype 2 entry（object stream内のobject）は、xref解析自体は失敗させず内部的に保持しますが、そのobjectへ実際にアクセスした時点で「Object streams are not supported」という明確なエラーになります。object stream（`/ObjStm`）そのものの実装はまだ行っていません。Catalog / Pages / Contentsなど今回必要なobjectがtype 1（通常のindirect object）であれば処理を継続できます。
 - inline image（`BI ... ID ... EI`）の画像データは本文走査から除外します。画像そのものは編集対象外です。
 - 1ページの`/Contents`が複数streamに分かれている場合、各streamを独立に走査します。`BT`〜`ET`がstream境界をまたぐと、そのrunは列挙されません。
@@ -124,6 +132,15 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - 既知の`/P`値（`R4`で`-44`）から、印刷・内容コピーは許可、文書変更・注釈は制限、かつ`/R >= 3`の4項目（フォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷）はすべて許可、という仕様どおりのbit解釈になること。`/R 2`ではこの4項目を`null`のまま返し、bitを読んで推測しないこと
 - `/Filter /Adobe.PubSec`のようなStandard以外のSecurity Handlerを誤ってStandardとして扱わず、`/P`・`/CF`など固有フィールドを解釈しないこと
 - 暗号化されたトレーラーがcross-reference stream由来（classic xrefの`trailer`ではなく`/Type /XRef`辞書の`/Encrypt`）でも参照解決できること。また、xref stream + `/FlateDecode` + PNG Predictorという実PDFで見られる組み合わせと`/Encrypt`が同時に成立していても、診断まで到達できること
+- MD5・RC4の自前実装が、それぞれ既知のtest vector（MD5はRFC 1321、RC4はよく知られた公開ベクタ）および複数長にわたる`node:crypto`との比較で一致すること
+- password padding、file encryption keyの導出（Algorithm 2）、`/U`によるuser password認証（Algorithm 6）、`/O`によるowner password認証（Algorithm 7）が、この実装とは別に書いた参照実装（Pythonの`hashlib.md5`と仕様どおりのRC4のみを使用し、pypdfや`cryptography`パッケージには依存しない）が算出した`/O`・`/U`・file keyの既知の値と一致すること。誤ったpasswordでは明確に認証失敗になること
+- objectごとの鍵導出が、object number・generation numberのいずれを変えても異なる鍵になること（AESV2の`"sAlT"`付きとRC4想定の`"sAlT"`なしでも異なること）
+- 空のuser passwordでの自動認証、明示的なuser password再試行、owner passwordでの認証（`authType`が`user`/`owner`を正しく区別すること）、誤ったpasswordでの認証失敗（`passwordRequired: true`、パスワード自体はエラーメッセージに含まれないこと）
+- AESV2で暗号化されたcontent streamおよびToUnicode CMap streamを復号し、正しい本文・日本語テキストを取得できること。`/StmF /Identity`が指定されたstreamは復号せずそのまま扱われること
+- AES暗号化データが破損している場合（PKCS#7 paddingが不正になるようcontent stream末尾を1byte改変）、`zlib`のエラーなど別の失敗にすり替わらず、AES-CBC復号自体の明確なエラーになること
+- `listTextRuns()` → `replaceText()` → `save()`が、AES decrypt → `/FlateDecode`展開 → Predictor解除、という順序で実PDFと同じ組み合わせを通ること
+- `/P`の文書変更permissionがないPDFでは、認証に成功していても`replaceText()`が明確な理由付きで拒否し、`listTextRuns()`（検索）は引き続き利用できること。permissionがあるPDFでは`replaceText()`は成功するが、暗号化PDFへの`save()`は（再暗号化が未対応のため）明確な理由で拒否されること。何も変更していなければ`save()`は暗号化PDFでも元のbytesを返すこと
+- corpus評価（`assessPdfBytes`）が、暗号化PDFに`encryption: { filter, V, R, method, authenticated, authType, modifyAllowed }`の要約を付け、認証・復号に成功しても`load: ○`かつ`extract: ○`止まりで、permission拒否や再暗号化保存未対応を理由に編集成功とはみなさないこと。要約にpassword自体を含まないこと
 
 これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。
 
@@ -157,6 +174,11 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 | `src/flate.js` | `/FlateDecode`の展開・`/Filter`解釈。content stream・CMap stream・cross-reference streamで共有する |
 | `src/predictor.js` | `/DecodeParms /Predictor`（TIFF・PNG）の解除。stream種別に依存せず`src/flate.js`から共通利用する |
 | `src/encryption.js` | `/Encrypt`辞書の診断（復号は行わない）。DOM非依存で、Nodeのテストからも読み込む |
+| `src/pdf-dictionary-text.js` | 辞書text内の名前・文字列・真偽値・入れ子辞書の抽出。`src/encryption.js`と`src/security/decrypt.js`が共有する |
+| `src/security/decrypt.js` | 暗号化PDFの認証（対応範囲の判定含む）とstream/string復号のオーケストレーション |
+| `src/security/standard-r4.js` | Standard Security Handler R4の認証・鍵導出アルゴリズム（PDF知識のみ、AESには触れない） |
+| `src/security/md5.js` / `src/security/rc4.js` | 認証アルゴリズムに必要な最小限のMD5・RC4自前実装（外部npm依存なし） |
+| `src/security/aes.js` | AESV2のAES-CBC復号。`crypto.subtle`（Web Crypto API）を使い、ブラウザ・Node両方で動く |
 
 ### 単一PDF検証: PDFプレビュー＋文字列検索・置換
 
@@ -181,7 +203,12 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 
 **詳細・デバッグ情報。** `<details>`内に、従来どおりの本文run一覧（`id` / `objectNumber` / `fontName` / `text` / 文字数 / bytes数 / bytes hex、既定で折りたたみ）と、run一覧から1件を直接選んで置換する検証用UIを残しています。通常操作には使いませんが、検索・置換モデルが内部でどのrunを操作しているかを確認する用途で利用できます。
 
-**暗号化PDFの診断表示。** 選択したPDFが`/Encrypt`を持つ場合、本文抽出（`listTextRuns()`）は失敗しますが、単なる赤いエラー表示だけでは終わりません。エラー原文の下に、Security Handler（Standardかどうか）・`/V`・`/R`・`/Length`・`/EncryptMetadata`・Crypt Filter（`/CFM`とそのラベル）・推定される暗号化方式・`/P`権限（印刷・文書変更・内容コピー・注釈、および`/R >= 3`ならフォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷）を、**「確定できる情報」（辞書の記載）と「推定」を見出しを分けて**表示します。パスワード状態は常に「未判定 / PoC対象外」と表示し、判定を試みません。Standard以外のSecurity Handler（`/Adobe.PubSec`など）では`/Filter`・`/SubFilter`のみを表示し、それ以上は解釈しない旨を明記します。この間もPDFプレビューは（読み取れたbytesがある限り）通常どおり表示を試みます。`/Encrypt`辞書のobject番号・生の`/Length`・`/StmF`・`/StrF`など内部的な値は「詳細・デバッグ情報」の中に別枠で表示し、通常の要約とは分けています。「複数PDF評価」の結果表には、この診断から作った短い要約（`暗号化PDF（Standard / AES-128 / R4）`のような形式）がエラー分類として表示されますが、`load: ○ / extract: ×`のまま扱われ、編集成功とはみなしません。
+**暗号化PDF。** 選択したPDFが`/Encrypt`を持つ場合の挙動は、対応範囲かどうかで分かれます。
+
+- **対応範囲（`Standard` / `V4` / `R4` / `AESV2`または`Identity`）:** まず空のuser passwordで自動的に認証を試みます。成功すれば、方式（例: `Standard / AES-128 / R4`）・認証方法（`○ 空のuser passwordで認証成功`）・権限（閲覧・検索は常に利用可能、文書変更は`/P`次第）を表示したうえで、通常どおり本文run一覧・検索が使えます。空passwordで認証できなければ`× パスワードが必要です`とパスワード入力欄を表示し、入力・認証すると同じ画面がそのまま更新されます。**入力したパスワードは送信・保存されません**（`fetch`等は使わず、`localStorage`/`sessionStorage`にも書き込まず、コンソール出力やエラーメッセージ・`assessment.json`にも含めません）。`/P`の文書変更permissionがない場合、置換入力欄とボタンはあらかじめ無効化され、その旨を表示します（実行しようとした場合も`replaceText()`自身が明確な理由で拒否します）。
+- **対応範囲外（`/R 2`・`/R 3`・`/R 5`・`/R 6`・`/AESV3`・`/Adobe.PubSec`など）:** パスワードでは解決しないため、パスワード入力欄は出さず、Security Handler・`/V`・`/R`・`/Length`・`/EncryptMetadata`・Crypt Filter・推定方式・`/P`権限を、「確定できる情報」（辞書の記載）と「推定」を見出しを分けて表示する診断専用の画面になります（パスワード状態は常に「未判定 / PoC対象外」）。
+
+どちらの場合も、PDFプレビューは（読み取れたbytesがある限り）本文解析の成否とは独立に表示を試みます。`/Encrypt`辞書のobject番号・生の`/Length`・`/StmF`・`/StrF`・診断JSON全体など内部的な値は、認証の成否に関わらず「詳細・デバッグ情報」の中に別枠で表示し、通常の要約とは分けています。「複数PDF評価」の結果表には、この診断・認証結果から作った短い要約（`暗号化PDF（Standard / AES-128 / R4）`や`暗号化PDF（文書変更が許可されていません／P permission）`のような形式）がエラー分類として表示されますが、認証・復号に成功しても`load: ○ / extract: ○`止まりで、`/P`のpermission拒否や再暗号化保存の未対応により、編集成功（`writeback` / `save`まで成功）とはみなしません。
 
 `web/text-search.js`の自動テスト（`test/text-search.test.js`）では、単一run内の一致、複数runにまたがる一致、一致なし、別content stream境界を跨がないこと、**同じcontent stream内の別`BT ... ET`（`textObjectId`）を跨がないこと**、同じ文字列の複数一致、置換後の文字数一致・不一致による自動対応可否、実際のPDFに対する検索→置換→save→reopenの一連を回帰検証しています。
 

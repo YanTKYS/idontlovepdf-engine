@@ -1,5 +1,6 @@
 import { skipWhite as skipSpace } from "./syntax.js";
 import { decodeStreamBytes } from "./flate.js";
+import { firstIdBytes } from "./pdf-dictionary-text.js";
 
 const latin1 = new TextDecoder("latin1");
 
@@ -290,7 +291,10 @@ async function collectXref(bytes) {
   // refused later, once the Encrypt dictionary has been read for diagnosis — see
   // PdfTextEditor#listTextRuns() in pdf-document.js.
   const encryptReference = reference(latestTrailer, "Encrypt");
-  return { entries, root, size, previousXref: startXref, encryptReference };
+  // The Standard Security Handler's key derivation hashes in the trailer's first
+  // /ID element (PDF spec 7.6.3.3, Algorithm 2 step e) -- see src/security/decrypt.js.
+  const idBytes = firstIdBytes(latestTrailer);
+  return { entries, root, size, previousXref: startXref, encryptReference, idBytes };
 }
 
 function parseReferenceArray(text, key) {

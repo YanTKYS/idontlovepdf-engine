@@ -14,76 +14,7 @@
  */
 
 import { directInteger } from "./pdf-structure.js";
-
-function nameValue(text, key) {
-  return text.match(new RegExp(`/${key}\\s*/([A-Za-z0-9_.+-]+)`))?.[1] ?? null;
-}
-
-/** `/P` is a signed 32-bit integer (commonly negative — see decodePermissions()). */
-function signedInteger(text, key) {
-  const match = text.match(new RegExp(`/${key}\\s+([+-]?\\d+)(?!\\s+\\d+\\s+R)`, "s"));
-  return match ? Number(match[1]) : null;
-}
-
-function booleanValue(text, key, fallback) {
-  const match = text.match(new RegExp(`/${key}\\s+(true|false)`));
-  return match ? match[1] === "true" : fallback;
-}
-
-/**
- * Extracts every top-level `/Name << ... >>` entry from `text` (e.g. each named
- * filter inside `/CF`), tracking `<<`/`>>` nesting depth so a filter's own nested
- * dictionaries don't confuse where it ends.
- */
-function namedSubDictionaries(text) {
-  if (!text) return [];
-  const results = [];
-  const nameStart = /\/([A-Za-z0-9_.+-]+)\s*<</g;
-  let match;
-  while ((match = nameStart.exec(text))) {
-    const name = match[1];
-    const openIndex = nameStart.lastIndex - 2;
-    let depth = 0;
-    let cursor = openIndex;
-    while (cursor < text.length) {
-      if (text.startsWith("<<", cursor)) {
-        depth += 1;
-        cursor += 2;
-      } else if (text.startsWith(">>", cursor)) {
-        depth -= 1;
-        cursor += 2;
-        if (depth === 0) break;
-      } else {
-        cursor += 1;
-      }
-    }
-    results.push({ name, text: text.slice(openIndex, cursor) });
-    nameStart.lastIndex = cursor;
-  }
-  return results;
-}
-
-/** Same nesting-aware extraction as namedSubDictionaries(), but for one specific key. */
-function nestedDictionaryText(text, key) {
-  const start = text.match(new RegExp(`/${key}\\s*<<`));
-  if (!start) return null;
-  const openIndex = start.index + start[0].length - 2;
-  let depth = 0;
-  let cursor = openIndex;
-  while (cursor < text.length) {
-    if (text.startsWith("<<", cursor)) {
-      depth += 1;
-      cursor += 2;
-    } else if (text.startsWith(">>", cursor)) {
-      depth -= 1;
-      cursor += 2;
-      if (depth === 0) break;
-    } else {
-      cursor += 1;
-    }
-  }
-  return text.slice(openIndex, cursor);
-}
+import { booleanValue, nameValue, namedSubDictionaries, nestedDictionaryText, signedInteger } from "./pdf-dictionary-text.js";
 
 /** Human-readable family for a /CFM crypt filter method. Diagnostic label only. */
 function cfmLabel(cfm) {
@@ -103,7 +34,7 @@ function cfmLabel(cfm) {
  * printing the raw byte count next to a "bit" label, which would understate the key
  * size by 8x (e.g. AESV2's `/Length 16` is a 128-bit key, not a 16-bit one).
  */
-function parseCryptFilters(dictionaryText) {
+export function parseCryptFilters(dictionaryText) {
   const cfText = nestedDictionaryText(dictionaryText, "CF");
   if (!cfText) return [];
   return namedSubDictionaries(cfText).map(({ name, text }) => {

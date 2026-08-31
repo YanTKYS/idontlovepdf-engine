@@ -244,11 +244,17 @@ function classicEncryptedPdf() {
 
 /* --------------------------------------------------- 10: Encrypt reference from a classic trailer */
 
-test("resolves /Encrypt from a classic trailer without failing xref resolution, and refuses content extraction", async () => {
+test("resolves /Encrypt from a classic trailer without failing xref resolution, and diagnoses before refusing", async () => {
+  // This fixture's Encrypt dictionary has no real /O or /U (see ENCRYPT_DICTIONARY),
+  // so -- now that Standard/V4/R4/AESV2 is actually decrypted, not just diagnosed
+  // (see src/security/decrypt.js) -- authentication itself cannot proceed. The
+  // diagnosis (computed before that check) is still exactly what matters here: xref
+  // resolution completed and the dictionary was read correctly. Genuine
+  // authenticate-and-decrypt fixtures (with real /O//U) live in test/pdf-decrypt.test.js.
   const pdf = classicEncryptedPdf();
   const editor = new PdfTextEditor(pdf);
   await assert.rejects(editor.listTextRuns(), (error) => {
-    assert.match(error.message, /^Encrypted PDFs are not supported \(Standard \/ AES-128 \/ R4\)$/);
+    assert.match(error.message, /^Encrypted PDFs are not supported \(Encrypt dictionary is missing \/O or \/U\)$/);
     assert.equal(error.encryptionDiagnosis.encrypted, true);
     assert.equal(error.encryptionDiagnosis.standardHandler, true);
     assert.equal(error.encryptionDiagnosis.estimatedMethod, "Standard Security Handler / AES-128系");
@@ -357,7 +363,11 @@ test("diagnoses /Encrypt through the same combination the real target PDF uses: 
 
   const editor = new PdfTextEditor(pdf);
   await assert.rejects(editor.listTextRuns(), (error) => {
-    assert.equal(error.message, "Encrypted PDFs are not supported (Standard / AES-128 / R4)");
+    // See the classic-trailer test above: this fixture also has no real /O or /U,
+    // so authentication cannot proceed -- the diagnosis below is what this test
+    // actually exercises. A full authenticate-and-decrypt xref-stream+Predictor
+    // fixture lives in test/pdf-decrypt.test.js.
+    assert.equal(error.message, "Encrypted PDFs are not supported (Encrypt dictionary is missing /O or /U)");
     const diagnosis = error.encryptionDiagnosis;
     assert.equal(diagnosis.standardHandler, true);
     assert.equal(diagnosis.version, 4);
