@@ -252,7 +252,9 @@ test("does not fail the whole xref stream over a type 2 entry, only accessing th
   });
   const editor = new PdfTextEditor(pdf);
   assert.deepEqual((await editor.listTextRuns()).map((run) => run.text), ["Type 2 present"]);
-  assert.throws(() => editor.document.object(6), /Object streams are not supported/);
+  // object() is the synchronous, type-1-only accessor; a compressed object needs
+  // resolveObject() instead (see test/object-stream.test.js for that path).
+  assert.throws(() => editor.document.object(6), /use resolveObject\(\) instead of object\(\)/);
 });
 
 test("rejects malformed cross-reference streams instead of hanging or over-allocating", async () => {
