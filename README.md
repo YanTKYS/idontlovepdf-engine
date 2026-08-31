@@ -94,6 +94,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - classic xrefとcross-reference streamが`/Prev`で混在していても、最新版のobjectを正しくたどれること（`save()`が生成するincremental updateは常にclassic xrefのため、xref stream由来のPDFを保存・再読込みするたびにこの経路を通ります）
 - type 2 entry（object stream内のobject）が存在してもxref解析全体は失敗させず、そのobjectへ実際にアクセスした場合にのみ明確なエラーになること
 - 不正な`/W`・奇数個の`/Index`・`/W`と`/Index`が示す長さに合わないstreamで、ハングや過大なメモリ確保をせず例外になること
+- `/Index`の各subsectionが`/Size`を超える、順序が昇順でない、subsection同士が重複する、といった`/Index`と`/Size`の矛盾を例外にすること
 - cross-reference stream由来のPDFで`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること
 
 これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。

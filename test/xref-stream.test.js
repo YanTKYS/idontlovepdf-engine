@@ -260,7 +260,13 @@ test("rejects malformed cross-reference streams instead of hanging or over-alloc
     ["a /W with the wrong number of fields", { w: [1, 4] }, /invalid \/W/],
     ["a negative /W field", { w: [-1, 4, 2] }, /invalid \/W/],
     ["an odd-length /Index", { index: [[0, 3]], extraTrailingEntries: [], sizeOverride: 3, indexOddOverride: true }, /invalid \/Index/],
-    ["an /Index claiming far more entries than the stream actually holds", { index: [[0, 1_000_000_000]], sizeOverride: 1_000_000_000 }, /length does not match \/W and \/Index/]
+    ["an /Index claiming far more entries than the stream actually holds", { index: [[0, 1_000_000_000]], sizeOverride: 1_000_000_000 }, /length does not match \/W and \/Index/],
+    // A subsection reaching object 6 while /Size says objects only go up to 5 (i.e.
+    // object numbers 0-4): /Size is defined as "one greater than the highest object
+    // number used in the file", so /Index [4 2] under /Size 5 is self-contradictory.
+    ["an /Index subsection whose range exceeds /Size", { index: [[4, 2]], sizeOverride: 5 }, /invalid \/Index/],
+    ["/Index subsections out of ascending order", { index: [[10, 2], [5, 2]], sizeOverride: 20 }, /invalid \/Index/],
+    ["overlapping /Index subsections", { index: [[1, 4], [3, 2]], sizeOverride: 20 }, /invalid \/Index/]
   ];
 
   for (const [label, options, pattern] of attempts) {

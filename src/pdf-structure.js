@@ -171,10 +171,20 @@ function parseIndexPairs(dictionaryText, size) {
     throw new Error("Cross-reference stream has an invalid /Index");
   }
   const pairs = [];
+  let previousEnd = 0;
   for (let cursor = 0; cursor < numbers.length; cursor += 2) {
     const [start, count] = [numbers[cursor], numbers[cursor + 1]];
-    if (start < 0 || count < 0) throw new Error("Cross-reference stream has an invalid /Index");
+    const end = start + count;
+    // The PDF spec requires /Index subsections to be ascending, non-overlapping, and
+    // within [0, /Size). A subsection whose end exceeds /Size claims object numbers
+    // the file's own /Size says do not exist (e.g. /Size 5 with /Index [4 2] reaches
+    // object 5); one that starts before the previous subsection's end is out of order
+    // or overlapping. Both are rejected rather than silently accepted.
+    if (start < 0 || count < 0 || end > size || start < previousEnd) {
+      throw new Error("Cross-reference stream has an invalid /Index");
+    }
     pairs.push([start, count]);
+    previousEnd = end;
   }
   return pairs;
 }
