@@ -238,6 +238,47 @@ test("rejects an unrecognised /Predictor value", () => {
   );
 });
 
+test("rejects a decimal /Predictor, /Columns, or /BitsPerComponent instead of truncating it to an integer", () => {
+  // A naive \d+ pattern reads "/Predictor 12.5" as 12 and silently drops the ".5" —
+  // exactly the kind of guessing this module is meant to avoid. The whole token must
+  // be a valid PDF integer or the value is rejected outright.
+  assert.throws(
+    () => reversePredictor(Uint8Array.of(1, 2, 3), decodeParmsDict({ Predictor: "12.5", Columns: 4 }), "t"),
+    /invalid \/Predictor/
+  );
+  assert.throws(
+    () => reversePredictor(Uint8Array.of(1, 2, 3), decodeParmsDict({ Predictor: 12, Columns: "4.5" }), "t"),
+    /invalid \/Columns/
+  );
+  assert.throws(
+    () => reversePredictor(Uint8Array.of(1, 2, 3), decodeParmsDict({ Predictor: 12, Columns: 4, BitsPerComponent: "8.5" }), "t"),
+    /invalid \/BitsPerComponent/
+  );
+});
+
+test("rejects a non-numeric /Columns value", () => {
+  assert.throws(
+    () => reversePredictor(Uint8Array.of(1, 2, 3), decodeParmsDict({ Predictor: 12, Columns: "foo" }), "t"),
+    /invalid \/Columns/
+  );
+});
+
+test("rejects a /BitsPerComponent outside the PDF spec's allowed set {1, 2, 4, 8, 16}", () => {
+  // PNG accepts any of the five spec values arithmetically, but the spec itself
+  // limits /BitsPerComponent to exactly these; 3, 5, and similar must be rejected
+  // explicitly rather than silently producing a mis-sized row.
+  for (const bits of [3, 5, 7, 24]) {
+    assert.throws(
+      () => reversePredictor(Uint8Array.of(1, 2, 3, 4), decodeParmsDict({ Predictor: 15, Columns: 4, BitsPerComponent: bits }), "t"),
+      new RegExp(`invalid \\/BitsPerComponent: ${bits}`)
+    );
+  }
+  // The five legal values are still accepted (parsing, not full row decoding here).
+  for (const bits of [1, 2, 4, 8, 16]) {
+    assert.equal(parseDecodeParms(decodeParmsDict({ Predictor: 15, Columns: 4, BitsPerComponent: bits })).bitsPerComponent, bits);
+  }
+});
+
 test("rejects non-positive /Columns, /Colors, and /BitsPerComponent", () => {
   assert.throws(() => reversePredictor(Uint8Array.of(1), decodeParmsDict({ Predictor: 12, Columns: 0 }), "t"), /invalid \/Columns/);
   assert.throws(() => reversePredictor(Uint8Array.of(1), decodeParmsDict({ Predictor: 12, Columns: 4, Colors: -1 }), "t"), /invalid \/Colors/);

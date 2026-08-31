@@ -25,16 +25,37 @@ function readDecodeParmsText(dictionary) {
   return arrayForm ?? dictionary.match(/\/DecodeParms\s*(<<[\s\S]*?>>)/)?.[1] ?? null;
 }
 
+/**
+ * Reads the full token following `/key` — up to whitespace or a PDF delimiter — not
+ * just a leading run of digits. A value like `12.5` or `foo` must be rejected as a
+ * whole rather than silently truncated to whatever digits happen to come first (a
+ * naive `\d+` pattern would read `/Predictor 12.5` as 12 and drop the rest). Returns
+ * `undefined` when the key is not present at all, so callers can tell "absent, use
+ * the default" apart from "present but malformed, reject".
+ */
+function readToken(text, key) {
+  if (!text) return undefined;
+  const match = text.match(new RegExp(`/${key}\\s+([^\\s()<>\\[\\]{}/%]*)`));
+  return match ? match[1] : undefined;
+}
+
+/** A PDF integer is an optionally signed digit sequence — no decimal point, nothing else. */
+function parseStrictInteger(token) {
+  if (!/^[+-]?\d+$/.test(token)) return null;
+  const value = Number(token);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 /** Reads /Predictor, /Columns, /Colors, /BitsPerComponent, applying the PDF spec's defaults. */
-export function parseDecodeParms(dictionary) {
+export function parseDecodeParms(dictionary, context = "") {
+  const prefix = context ? `${context}: ` : "";
   const text = readDecodeParmsText(dictionary);
   const read = (key, fallback) => {
-    if (!text) return fallback;
-    // Allow a leading minus so a malformed negative value (illegal for these keys,
-    // but syntactically a valid PDF integer) is parsed and rejected explicitly by
-    // requirePositiveInteger(), rather than silently falling back to the default.
-    const match = text.match(new RegExp(`/${key}\\s+([+-]?\\d+)`));
-    return match ? Number(match[1]) : fallback;
+    const token = readToken(text, key);
+    if (token === undefined) return fallback;
+    const value = parseStrictInteger(token);
+    if (value === null) throw new Error(`${prefix}Predictor has an invalid /${key}`);
+    return value;
   };
   return {
     predictor: read("Predictor", 1),
@@ -46,6 +67,15 @@ export function parseDecodeParms(dictionary) {
 
 function requirePositiveInteger(value, name, prefix) {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${prefix}Predictor has an invalid /${name}`);
+}
+
+// The PDF spec restricts a Predictor's /BitsPerComponent to these values (16 only
+// from PDF 1.5 on, which this prototype does not distinguish by version); anything
+// else — 3, 5, 24, ... — is not a value real predictor-encoded data would ever use.
+const VALID_BITS_PER_COMPONENT = new Set([1, 2, 4, 8, 16]);
+
+function requireValidBitsPerComponent(value, prefix) {
+  if (!VALID_BITS_PER_COMPONENT.has(value)) throw new Error(`${prefix}Predictor has an invalid /BitsPerComponent: ${value}`);
 }
 
 /** Row byte count from /Columns, /Colors, /BitsPerComponent, rounding up any partial byte. */
@@ -140,12 +170,13 @@ function undoTiffPredictor(data, rowBytes, colors, bitsPerComponent, prefix) {
  */
 export function reversePredictor(data, dictionary, context = "") {
   const prefix = context ? `${context}: ` : "";
-  const { predictor, columns, colors, bitsPerComponent } = parseDecodeParms(dictionary);
+  const { predictor, columns, colors, bitsPerComponent } = parseDecodeParms(dictionary, context);
   if (predictor === 1) return data;
 
   requirePositiveInteger(columns, "Columns", prefix);
   requirePositiveInteger(colors, "Colors", prefix);
   requirePositiveInteger(bitsPerComponent, "BitsPerComponent", prefix);
+  requireValidBitsPerComponent(bitsPerComponent, prefix);
 
   const rowBytes = rowByteCount(columns, colors, bitsPerComponent, prefix);
 

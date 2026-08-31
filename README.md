@@ -73,6 +73,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
   - **Predictor 10〜15**（PNG Predictor: None/Sub/Up/Average/Paeth）: PDF仕様どおり、値の大小に関わらずrowごとの先頭1バイトで実際のfilter typeを読み取って復元します（`/Predictor`の数値はどのfilterが多いかの目安に過ぎず、行ごとの判定は仕様上常に必要です）
   - **Predictor 2**（TIFF Predictor）: `/BitsPerComponent 8`のみ対応。それ以外のbit depth（1/2/4/16）は`Unsupported TIFF Predictor BitsPerComponent: N`という明確なエラーになります
   - `/Columns`・`/Colors`・`/BitsPerComponent`省略時はそれぞれ既定値1・1・8を使用。`/DecodeParms << ... >>`と単要素配列`/DecodeParms [ << ... >> ]`の両形式に対応（複数filter chain全般は対象外）
+  - `/Predictor`・`/Columns`・`/BitsPerComponent`等の値は、キーに続くトークン全体をPDF整数として厳密に検証します。`/Predictor 12.5`のような小数や`/Columns foo`のような非数値は、先頭の数字部分だけを読んで推測することなく、そのまま不正値として拒否します。`/BitsPerComponent`はPDF仕様が定める`1`・`2`・`4`・`8`・`16`以外（例: `3`や`5`）も明示的に拒否します
   - Predictor解除はxref stream・page content stream・ToUnicode CMap streamのいずれからも共通利用し（`src/predictor.js`と`src/flate.js`に集約）、失敗時のエラーには`content stream object 45: ...`のようにどのstreamで失敗したかを付記します
   - 保存時（`save()`）は、編集済みcontent streamを常にPredictorなしの素の`/FlateDecode`として書き戻します（`/DecodeParms`も削除）。元PDFがPredictor付きでも、incremental updateとして追記される新しいstreamにはPredictorを再付与しません
 - cross-reference streamのtype 2 entry（object stream内のobject）は、xref解析自体は失敗させず内部的に保持しますが、そのobjectへ実際にアクセスした時点で「Object streams are not supported」という明確なエラーになります。object stream（`/ObjStm`）そのものの実装はまだ行っていません。Catalog / Pages / Contentsなど今回必要なobjectがtype 1（通常のindirect object）であれば処理を継続できます。
@@ -107,6 +108,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - TIFF Predictor 2が、`Colors`が2以上（同一color componentの前サンプルを正しく参照）でも復元できること。8bit以外の`BitsPerComponent`は明確なエラーになること
 - `/Columns`・`/Colors`・`/BitsPerComponent`省略時の既定値（1・1・8）、および`/DecodeParms`の`<< >>`形式・単要素配列`[ << >> ]`形式の両方を正しく解釈できること
 - rowサイズがstream長と合わない場合・未知のPNG filter typeの場合・`/Columns`等が0以下または安全な整数範囲外の場合に、ハングや過大なメモリ確保をせず例外になること
+- `/Predictor 12.5`・`/Columns foo`のような小数・非数値のDecodeParms値を、先頭の数字だけを読んで推測せず拒否すること。`/BitsPerComponent`が仕様の許容値（1・2・4・8・16）以外の場合（例: 3、5）に例外になること
 - Predictor付きのxref stream・content stream・ToUnicode CMap streamそれぞれから正しく本文runやCMapを取得できること
 - Predictor付きcontent streamに対して`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること。保存後のstreamはPredictorなしの`/FlateDecode`として書き戻され、`/DecodeParms`も除去されること
 
