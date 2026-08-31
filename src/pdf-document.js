@@ -114,12 +114,14 @@ export class PdfTextEditor {
       await this.document.ensureXref();
       // The xref table itself is unaffected by encryption, so it resolves either
       // way. Content extraction only continues once (a) the encryption in use is
-      // something this engine actually decrypts (Standard/V4/R4/AESV2 -- anything
-      // else throws, non-recoverable, from authenticateEncryptedPdf itself) and
-      // (b) the given password authenticates against it (recoverable: a caller can
-      // retry with a different password). See src/security/decrypt.js.
+      // something this engine actually decrypts (Standard/V4/R4/AESV2 or
+      // Standard/V5/R6/AESV3 -- anything else throws, non-recoverable, from
+      // authenticateEncryptedPdf itself) and (b) the given password authenticates
+      // against it (recoverable: a caller can retry with a different password).
+      // See src/security/decrypt.js. authenticateEncryptedPdf() is async because
+      // revision 6 authentication hashes via crypto.subtle (Algorithm 2.B).
       if (this.document.encryptReference) {
-        const security = authenticateEncryptedPdf(this.document, password ?? "");
+        const security = await authenticateEncryptedPdf(this.document, password ?? "");
         if (!security.authenticated) {
           const summary = summarizeEncryption(security.diagnosis);
           const error = new Error(`Password required to open this encrypted PDF${summary ? ` (${summary})` : ""}`);

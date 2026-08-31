@@ -458,6 +458,14 @@ test("rejects a candidate password containing a character PDFDocEncoding cannot 
   });
 });
 
+test("rejects a Crypt Filter whose /Length is inconsistent with /CFM /AESV2 (32 instead of 16 bytes)", async () => {
+  const pdf = buildEncryptedPdf({ userPassword: "" });
+  const text = Buffer.from(pdf).toString("latin1").replace("/CFM /AESV2 /Length 16", "/CFM /AESV2 /Length 32");
+  assert.notEqual(text, Buffer.from(pdf).toString("latin1"));
+  const editor = new PdfTextEditor(Buffer.from(text, "latin1"));
+  await assert.rejects(editor.listTextRuns(""), /Crypt filter \/Length is inconsistent/);
+});
+
 test("raises an explicit error for corrupted AES ciphertext instead of returning garbage", async () => {
   const pdf = buildEncryptedPdf({ userPassword: "" });
   // AES-CBC decryption only scrambles the *specific* 16-byte plaintext block whose

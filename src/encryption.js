@@ -107,12 +107,14 @@ function decodePermissions(p, revision) {
 function estimateMethod(version, cryptFilters, streamFilterName) {
   if (version === 1) return "Standard Security Handler / RC4-40";
   if (version === 2) return "Standard Security Handler / RC4（可変長鍵）";
-  if (version === 4) {
+  if (version === 4 || version === 5) {
     const streamFilter = cryptFilters.find((filter) => filter.name === streamFilterName);
     if (streamFilter?.methodLabel) return `Standard Security Handler / ${streamFilter.methodLabel}`;
-    return null;
+    // /V 5 always means a 256-bit AES key by spec, even when /CF/StmF cannot be
+    // read for some reason -- unlike /V 4, where the family genuinely depends on
+    // the (here unreadable) crypt filter and nothing can be assumed.
+    return version === 5 ? "Standard Security Handler / AES-256系" : null;
   }
-  if (version === 5) return "Standard Security Handler / AES-256系";
   return null;
 }
 
