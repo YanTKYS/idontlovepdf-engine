@@ -108,6 +108,24 @@ function deriveObjectKey(fileKey, objectNumber, generation) {
   return md5(concatBytes([fileKey, extra])).subarray(0, 16);
 }
 
+/**
+ * Encodes raw bytes as a PDF literal string `( ... )`, escaping bytes the same way
+ * a real PDF writer would (named escapes for `(`/`)`/`\`, octal for anything
+ * outside printable ASCII) -- independent of, and a cross-check on,
+ * src/content-stream.js's readLiteral(), which src/pdf-dictionary-text.js reuses to
+ * parse this same syntax back out for /O, /U, and /ID.
+ */
+function encodeLiteralPdfString(bytes) {
+  const out = ["("];
+  for (const byte of bytes) {
+    if (byte === 0x28 || byte === 0x29 || byte === 0x5c) out.push("\\", String.fromCharCode(byte));
+    else if (byte < 0x20 || byte > 0x7e) out.push("\\", byte.toString(8).padStart(3, "0"));
+    else out.push(String.fromCharCode(byte));
+  }
+  out.push(")");
+  return out.join("");
+}
+
 function aesEncrypt(key, plaintext) {
   const iv = randomBytes(16);
   const cipher = createCipheriv("aes-128-cbc", key, iv);
@@ -152,19 +170,34 @@ function pngUpEncode(raw, columns) {
 function buildEncryptedPdf({
   userPassword = "",
   ownerPassword = "ownersecret",
+  // Overrides the ASCII-only encode(userPassword)/encode(ownerPassword) above with
+  // exact bytes -- used only by the non-ASCII password test, which needs the
+  // *fixture* to use genuine PDFDocEncoding bytes (not UTF-8) so it does not
+  // coincidentally validate the implementation under test against its own possible
+  // encoding bug. ASCII passwords are identical under PDFDocEncoding/UTF-8/ASCII,
+  // so every other test can keep using the plain string form unchanged.
+  userPasswordBytes = null,
+  ownerPasswordBytes = null,
   p = -1,
   encryptMetadata = true,
   streamFilter = "StdCF",
   stringFilter = "StdCF",
   content = "BT (Encrypted secret content) Tj ET",
   usePredictor = false,
-  fontAndCMap = null
+  fontAndCMap = null,
+  // /O, /U, /ID are always hex strings in the target real-world PDF and in every
+  // other test here; this exercises the literal-string ( ... ) form instead (with
+  // octal escapes reaching bytes 0x80-0x9F), per the reviewer's specific request.
+  literalStrings = false
 } = {}) {
   const keyLengthBytes = 16;
   const idBytes = randomBytes(16);
-  const o = computeO(encode(ownerPassword), encode(userPassword), keyLengthBytes);
-  const fileKey = computeFileKey(pad(encode(userPassword)), o, p, idBytes, keyLengthBytes, encryptMetadata);
+  const userBytes = userPasswordBytes ?? encode(userPassword);
+  const ownerBytes = ownerPasswordBytes ?? encode(ownerPassword);
+  const o = computeO(ownerBytes, userBytes, keyLengthBytes);
+  const fileKey = computeFileKey(pad(userBytes), o, p, idBytes, keyLengthBytes, encryptMetadata);
   const u = computeU(fileKey, idBytes);
+  const encodeBinaryString = (bytes) => (literalStrings ? encodeLiteralPdfString(bytes) : `<${Buffer.from(bytes).toString("hex")}>`);
 
   function encryptedStreamBytes(objectNumber, plaintext) {
     let filtered = usePredictor ? pngUpEncode(plaintext, 8).encoded : plaintext;
@@ -212,8 +245,8 @@ function buildEncryptedPdf({
     ? ""
     : " /CF << /StdCF << /CFM /AESV2 /Length 16 >> >>";
   const encryptDictionary = "<< /Filter /Standard /V 4 /R 4 /Length 128" +
-    ` /O <${Buffer.from(o).toString("hex")}>` +
-    ` /U <${Buffer.from(u).toString("hex")}>` +
+    ` /O ${encodeBinaryString(o)}` +
+    ` /U ${encodeBinaryString(u)}` +
     ` /P ${p} /EncryptMetadata ${encryptMetadata}` +
     ` /StmF /${streamFilter} /StrF /${stringFilter}${cfDictionary} >>`;
   place(5, encryptDictionary);
@@ -232,7 +265,7 @@ function buildEncryptedPdf({
     .join("");
   const trailerPiece = encode(
     `xref\n0 1\n0000000000 65535 f \n${table}trailer\n<< /Size ${maxNumber + 1} /Root 1 0 R /Encrypt 5 0 R` +
-    ` /ID [<${Buffer.from(idBytes).toString("hex")}> <${Buffer.from(idBytes).toString("hex")}>] >>` +
+    ` /ID [${encodeBinaryString(idBytes)} ${encodeBinaryString(idBytes)}] >>` +
     `\nstartxref\n${xrefOffset}\n%%EOF\n`
   );
   chunks.push(trailerPiece);
@@ -358,6 +391,72 @@ test("decrypts an AESV2-encrypted ToUnicode CMap stream and recovers Japanese te
 });
 
 /* --------------------------------------------------------------- 10: PKCS#7 */
+
+/* --------------------------------------------------- byte-exact /O, /U, /ID (literal strings) */
+
+test("authenticates against /O, /U, and /ID encoded as literal PDF strings, not just hex", async () => {
+  // Real-world PDFs almost always hex-encode these (every other fixture in this
+  // file does), but the spec allows the literal ( ... ) form too, and /O//U are
+  // essentially random 16/32-byte hashes -- overwhelmingly likely to contain bytes
+  // needing octal escaping (0x80-0x9F, control bytes) or named escapes ('(', ')',
+  // '\'). This is exactly the byte range a naive TextDecoder("latin1") round-trip
+  // (which is actually windows-1252, not true Latin-1) would silently corrupt.
+  const pdf = buildEncryptedPdf({ userPassword: "opensesame", ownerPassword: "ownersecret", p: -1, literalStrings: true });
+  assert.match(Buffer.from(pdf).toString("latin1"), /\/O \(/);
+  assert.match(Buffer.from(pdf).toString("latin1"), /\/ID \[\(/);
+  const editor = new PdfTextEditor(pdf);
+  const runs = await editor.listTextRuns("opensesame");
+  assert.deepEqual(runs.map((run) => run.text), ["Encrypted secret content"]);
+});
+
+test("authenticates against literal /O, /U, /ID even when many bytes need octal escaping", async () => {
+  // Runs the literal-string fixture repeatedly (each build uses a fresh random
+  // /ID and re-derives /O, /U from it) so that, across runs, both /O and /U are
+  // very likely to include at least one byte in 0x80-0x9F and at least one of
+  // '(', ')', '\' -- rather than relying on a single random draw to happen to
+  // exercise those escape paths.
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const pdf = buildEncryptedPdf({ userPassword: "", p: -1, literalStrings: true });
+    const editor = new PdfTextEditor(pdf);
+    const runs = await editor.listTextRuns();
+    assert.deepEqual(runs.map((run) => run.text), ["Encrypted secret content"]);
+  }
+});
+
+/* --------------------------------------------------------- PDFDocEncoding password */
+
+test("authenticates a non-ASCII password using PDFDocEncoding, not UTF-8", async () => {
+  // "café" in PDFDocEncoding is c-a-f-<0xE9> (one byte for e-acute, same value as
+  // Latin-1); in UTF-8 it would be c-a-f-<0xC3><0xA9> (two bytes) -- the previous
+  // (UTF-8-based) padPassword() would derive a different, wrong file key from this
+  // exact password string. The fixture is built from these exact bytes directly
+  // (bypassing any encoder), independent of src/security/pdfdoc-encoding.js, so
+  // this proves that module produces the bytes real R4 authentication needs, not
+  // just that it agrees with itself.
+  const passwordBytes = Uint8Array.of(0x63, 0x61, 0x66, 0xe9); // "caf" + e-acute
+  const pdf = buildEncryptedPdf({
+    userPasswordBytes: passwordBytes,
+    ownerPassword: "ownersecret",
+    p: -1,
+    content: "BT (PDFDocEncoding password content) Tj ET"
+  });
+  const editor = new PdfTextEditor(pdf);
+  const runs = await editor.listTextRuns("café");
+  assert.deepEqual(runs.map((run) => run.text), ["PDFDocEncoding password content"]);
+  assert.equal(editor.security.authType, "user");
+});
+
+test("rejects a candidate password containing a character PDFDocEncoding cannot represent as a wrong password, not a crash", async () => {
+  const pdf = buildEncryptedPdf({ userPassword: "opensesame", ownerPassword: "ownersecret", p: -1 });
+  const editor = new PdfTextEditor(pdf);
+  // U+00A0 (NBSP) has no PDFDocEncoding representation (0xA0 means EURO SIGN
+  // there) -- padPassword() throws for it, and that must surface as a normal
+  // "password required" retry, not an unrelated uncaught exception.
+  await assert.rejects(editor.listTextRuns("wrong password"), (error) => {
+    assert.equal(error.passwordRequired, true);
+    return true;
+  });
+});
 
 test("raises an explicit error for corrupted AES ciphertext instead of returning garbage", async () => {
   const pdf = buildEncryptedPdf({ userPassword: "" });

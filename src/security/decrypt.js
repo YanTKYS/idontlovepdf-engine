@@ -53,6 +53,24 @@ function readFields(dictionaryText) {
   };
 }
 
+/**
+ * Runs a candidate password through `authenticate` (authenticateUserPassword or
+ * authenticateOwnerPassword), treating a PDFDocEncoding encoding failure (see
+ * src/security/pdfdoc-encoding.js -- a character the candidate password contains
+ * that PDFDocEncoding cannot represent) the same as "wrong password": the real
+ * password, whatever it is, must itself have been representable when the document
+ * was encrypted, so an unrepresentable candidate cannot be it either. This keeps
+ * that failure recoverable (prompt again) rather than surfacing as an unrelated
+ * crash.
+ */
+function tryAuthenticate(authenticate, authArgs) {
+  try {
+    return authenticate(authArgs);
+  } catch {
+    return { success: false, fileKey: null };
+  }
+}
+
 /** Throws unless `filterName` is /Identity or an /AESV2 crypt filter -- the only two this PR decrypts. */
 function checkCryptFilterInScope(filterName, cryptFilters, diagnosis) {
   if (filterName === "Identity") return;
@@ -112,9 +130,9 @@ export function authenticateEncryptedPdf(structure, password) {
     encryptMetadata: fields.encryptMetadata
   };
 
-  const userAttempt = authenticateUserPassword(authArgs);
+  const userAttempt = tryAuthenticate(authenticateUserPassword, authArgs);
   const outcome = userAttempt.success ? { authType: "user", fileKey: userAttempt.fileKey } : (() => {
-    const ownerAttempt = authenticateOwnerPassword(authArgs);
+    const ownerAttempt = tryAuthenticate(authenticateOwnerPassword, authArgs);
     return ownerAttempt.success ? { authType: "owner", fileKey: ownerAttempt.fileKey } : null;
   })();
 

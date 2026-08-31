@@ -1,17 +1,27 @@
 /**
  * Low-level parsing helpers over an already-extracted PDF dictionary's *text* (the
- * `latin1`-decoded string form `PdfStructure` and `src/encryption.js` already work
- * with -- see `extractDictionary()` in pdf-structure.js). These only understand PDF
- * dictionary syntax; they know nothing about encryption, diagnosis, or decryption,
- * which is what lets both `src/encryption.js` (diagnosis) and
- * `src/security/decrypt.js` (authentication/decryption) share one implementation
- * instead of two that could quietly drift apart (as the Crypt Filter `/Length`
- * units bug showed -- a second, separately-written copy of that parsing logic could
- * easily reintroduce the same mistake).
+ * byte-preserving decoded string form `PdfStructure` and `src/encryption.js`
+ * already work with -- see `decodeBinaryString()`/`extractDictionary()` in
+ * pdf-structure.js). These only understand PDF dictionary syntax; they know
+ * nothing about encryption, diagnosis, or decryption, which is what lets both
+ * `src/encryption.js` (diagnosis) and `src/security/decrypt.js`
+ * (authentication/decryption) share one implementation instead of two that could
+ * quietly drift apart (as the Crypt Filter `/Length` units bug showed -- a second,
+ * separately-written copy of that parsing logic could easily reintroduce the same
+ * mistake).
  *
- * A `latin1` decode is a 1:1 byte<->code-point mapping for 0-255, so `charCodeAt()`
- * on this text recovers the exact original byte -- string() below relies on that.
+ * `textToBytes()` below recovers each character's code point directly via
+ * `charCodeAt()`. This is only byte-exact because pdf-structure.js decodes bytes to
+ * text with `decodeBinaryString()` (equivalent to `String.fromCharCode` per byte),
+ * NOT `TextDecoder("latin1")` -- despite the name, the WHATWG Encoding Standard
+ * defines "latin1" as an alias for windows-1252, which remaps bytes 0x80-0x9F to
+ * assorted non-ASCII code points instead of passing them through unchanged. Feeding
+ * windows-1252-decoded text through `charCodeAt() & 0xff` would silently corrupt
+ * any /O, /U, or /ID byte in that range -- exactly the values the Standard Security
+ * Handler's authentication depends on being exact.
  */
+
+import { readHex, readLiteral } from "./content-stream.js";
 
 function textToBytes(text) {
   const bytes = new Uint8Array(text.length);
@@ -89,41 +99,16 @@ export function nestedDictionaryText(text, key) {
   return text.slice(openIndex, cursor);
 }
 
+/**
+ * Delegates to content-stream.js's readLiteral()/readHex() -- the same PDF string
+ * syntax (octal/named escapes, line continuation, hex whitespace) applies whether
+ * the string is a Tj operand or an Encrypt/trailer dictionary value like /O, /U, or
+ * /ID, and that implementation is exercised far more (by every content-stream
+ * string in the existing test suite) than a second copy written only for this
+ * module would be.
+ */
 function readStringToken(bytes, openIndex) {
-  if (bytes[openIndex] === 0x28) {
-    // Literal string: track parenthesis depth and backslash escapes, same rules as
-    // dictionaryEnd() in pdf-structure.js uses to skip over one without parsing it.
-    let depth = 1;
-    let cursor = openIndex + 1;
-    const value = [];
-    while (cursor < bytes.length && depth > 0) {
-      const byte = bytes[cursor];
-      if (byte === 0x5c && cursor + 1 < bytes.length) {
-        value.push(bytes[cursor + 1]);
-        cursor += 2;
-        continue;
-      }
-      if (byte === 0x28) depth += 1;
-      else if (byte === 0x29) { depth -= 1; if (depth === 0) { cursor += 1; break; } }
-      value.push(byte);
-      cursor += 1;
-    }
-    return { end: cursor, value: Uint8Array.from(value) };
-  }
-  // Hex string: pair up digits, ignoring whitespace, padding a trailing odd digit
-  // with an implicit 0 (per PDF spec 7.3.4.3).
-  let cursor = openIndex + 1;
-  let digits = "";
-  while (cursor < bytes.length && bytes[cursor] !== 0x3e) {
-    const byte = bytes[cursor];
-    if (!(byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d || byte === 0x0c || byte === 0x00)) {
-      digits += String.fromCharCode(byte);
-    }
-    cursor += 1;
-  }
-  if (digits.length % 2) digits += "0";
-  const value = Uint8Array.from(digits.match(/../g)?.map((pair) => Number.parseInt(pair, 16)) ?? []);
-  return { end: cursor + 1, value };
+  return bytes[openIndex] === 0x28 ? readLiteral(bytes, openIndex) : readHex(bytes, openIndex);
 }
 
 /**

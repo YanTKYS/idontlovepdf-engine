@@ -2,7 +2,11 @@ import { isRegular, isWhite, skipWhite } from "./syntax.js";
 
 const latin1 = new TextDecoder("latin1");
 
-function readLiteral(bytes, start) {
+// Exported for reuse by src/pdf-dictionary-text.js (the /O, /U, and /ID binary
+// strings in an Encrypt dictionary/trailer use the exact same PDF string syntax --
+// escapes, octal, hex -- as a Tj operand). One implementation avoids a second,
+// separately-written copy quietly missing an escape case the other already handles.
+export function readLiteral(bytes, start) {
   let depth = 1;
   let cursor = start + 1;
   const value = [];
@@ -35,7 +39,7 @@ function readLiteral(bytes, start) {
   return { end: cursor, value: Uint8Array.from(value), syntax: "literal" };
 }
 
-function readHex(bytes, start) {
+export function readHex(bytes, start) {
   let cursor = start + 1;
   let digits = "";
   while (cursor < bytes.length && bytes[cursor] !== 0x3e) {

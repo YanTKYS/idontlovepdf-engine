@@ -18,6 +18,7 @@
  */
 
 import { md5 } from "./md5.js";
+import { encodePdfDocPassword } from "./pdfdoc-encoding.js";
 import { rc4 } from "./rc4.js";
 
 // PDF spec 7.6.3.3, Algorithm 2, step (a): the fixed 32-byte padding string used to
@@ -40,13 +41,13 @@ function concatBytes(chunks) {
 
 /**
  * Pads or truncates a password to exactly 32 bytes (PDF spec 7.6.3.3, Algorithm 2
- * step a). Passwords are taken as their UTF-8 bytes: exact for the ASCII passwords
- * that are the common case for this handler, and a documented limitation for
- * anything outside ASCII (real PDFDocEncoding differs from UTF-8 there) -- see
- * README.
+ * step a). Passwords for revision <= 4 are PDFDocEncoding, not UTF-8 (revision 5+
+ * uses UTF-8 for its own strings, but is out of this module's scope) -- see
+ * src/security/pdfdoc-encoding.js. A character PDFDocEncoding cannot represent
+ * throws, since the real password (whatever it is) must itself be representable.
  */
 export function padPassword(password) {
-  const bytes = new TextEncoder().encode(password ?? "");
+  const bytes = encodePdfDocPassword(password ?? "");
   const result = new Uint8Array(32);
   const take = Math.min(bytes.length, 32);
   result.set(bytes.subarray(0, take));

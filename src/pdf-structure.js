@@ -2,18 +2,40 @@ import { skipWhite as skipSpace } from "./syntax.js";
 import { decodeStreamBytes } from "./flate.js";
 import { firstIdBytes } from "./pdf-dictionary-text.js";
 
-const latin1 = new TextDecoder("latin1");
+/**
+ * A byte-preserving "binary string" codec: unlike `TextDecoder("latin1")` (which
+ * the WHATWG Encoding Standard defines as an alias for windows-1252, not true
+ * ISO-8859-1/binary passthrough -- bytes 0x80-0x9F decode to assorted non-ASCII
+ * code points instead of themselves), this maps each byte 0-255 to the identical
+ * UTF-16 code unit, so `charCodeAt()` on the result always recovers the exact
+ * original byte. Dictionary/trailer text below is parsed with ASCII-only regexes
+ * (names, integers, references, keywords), which either codec would get right --
+ * but /O, /U, and /ID inside it are real 8-bit binary data extracted from this
+ * same text (see pdf-dictionary-text.js's stringValue()/firstIdBytes()), and the
+ * Standard Security Handler's authentication depends on those being byte-exact.
+ */
+function decodeBinaryString(bytes) {
+  // Chunked to stay well under engines' call-argument-count limits for very large
+  // spreads (a dictionary/trailer is small, but this defends against pathological
+  // input reaching a huge single subarray).
+  const CHUNK = 0x2000;
+  let result = "";
+  for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+    result += String.fromCharCode(...bytes.subarray(offset, offset + CHUNK));
+  }
+  return result;
+}
 
 function readInteger(bytes, position) {
   const start = skipSpace(bytes, position);
   let cursor = start;
   while (bytes[cursor] >= 0x30 && bytes[cursor] <= 0x39) cursor += 1;
   if (cursor === start) throw new Error(`Expected an integer at PDF byte ${start}`);
-  return { value: Number(latin1.decode(bytes.subarray(start, cursor))), end: cursor };
+  return { value: Number(decodeBinaryString(bytes.subarray(start, cursor))), end: cursor };
 }
 
 function keywordAt(bytes, position, keyword) {
-  return latin1.decode(bytes.subarray(position, position + keyword.length)) === keyword;
+  return decodeBinaryString(bytes.subarray(position, position + keyword.length)) === keyword;
 }
 
 function skipLiteral(bytes, position) {
@@ -58,12 +80,12 @@ function extractDictionary(bytes, position) {
   const start = skipSpace(bytes, position);
   if (bytes[start] !== 0x3c || bytes[start + 1] !== 0x3c) return null;
   const end = dictionaryEnd(bytes, start);
-  return { start, end, text: latin1.decode(bytes.subarray(start, end)) };
+  return { start, end, text: decodeBinaryString(bytes.subarray(start, end)) };
 }
 
 function findLastStartXref(bytes) {
   const tailStart = Math.max(0, bytes.length - 8192);
-  const tail = latin1.decode(bytes.subarray(tailStart));
+  const tail = decodeBinaryString(bytes.subarray(tailStart));
   const matches = [...tail.matchAll(/startxref\s+(\d+)/g)];
   if (!matches.length) throw new Error("PDF startxref was not found");
   return Number(matches.at(-1)[1]);
@@ -72,7 +94,7 @@ function findLastStartXref(bytes) {
 function parseTrailerDictionary(bytes, position) {
   const start = skipSpace(bytes, position);
   const end = dictionaryEnd(bytes, start);
-  return { text: latin1.decode(bytes.subarray(start, end)), end };
+  return { text: decodeBinaryString(bytes.subarray(start, end)), end };
 }
 
 function directInteger(dictionary, key) {
@@ -104,7 +126,7 @@ function parseClassicXrefSection(bytes, cursor) {
         while (end < bytes.length && bytes[end] !== 10 && bytes[end] !== 13) end += 1;
         return end;
       })();
-      const line = latin1.decode(bytes.subarray(cursor, lineEnd));
+      const line = decodeBinaryString(bytes.subarray(cursor, lineEnd));
       const match = line.match(/^(\d{10})\s+(\d{5})\s+([nf])/);
       if (!match) throw new Error(`Malformed xref entry for object ${first.value + index}`);
       entries.push({
