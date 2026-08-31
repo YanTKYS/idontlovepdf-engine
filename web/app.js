@@ -149,6 +149,118 @@ function revokePreview() {
   frame.removeAttribute("src");
 }
 
+/* ------------------------------------------------------ 暗号化PDFの診断表示 */
+/*
+ * error.encryptionDiagnosis (src/encryption.js の analyzeEncryption() の戻り値) を
+ * 画面向けに整形するだけ。復号やパスワード検証は一切行わない。
+ * 「確定できる情報」（Encrypt dictionaryの記載）と「推定」（V/R/CFMからの推測）は
+ * 見出しを分け、混同されないようにする。
+ */
+
+const PERMISSION_LABELS = {
+  print: "印刷",
+  modify: "文書変更",
+  copy: "内容コピー",
+  annotate: "注釈",
+  fillForms: "フォーム入力",
+  extractForAccessibility: "アクセシビリティ抽出",
+  assembleDocument: "文書構成変更",
+  printHighQuality: "高品質印刷"
+};
+
+function permissionLine(name, value) {
+  if (value === null) return `${PERMISSION_LABELS[name]}: 該当なし（/R 2 には定義がない項目）`;
+  return `${PERMISSION_LABELS[name]}: ${value ? "許可されている" : "制限されている"}`;
+}
+
+function dl(rows) {
+  const node = element("dl");
+  for (const [label, value] of rows) node.append(element("dt", { text: label }), element("dd", { text: String(value) }));
+  return node;
+}
+
+/** 通常ユーザー向けの構造化された診断ブロック。単なる赤いエラー表示の代わりに使う。 */
+function renderEncryptionDiagnosis(container, diagnosis) {
+  clear(container);
+  container.hidden = false;
+  container.append(element("p", { className: "error-title", text: "暗号化PDFを検出しました（診断のみ・復号や編集は行いません）" }));
+
+  if (!diagnosis.standardHandler) {
+    container.append(element("h4", { text: "確定できる情報（Encrypt dictionaryの記載）" }));
+    container.append(dl([
+      ["Filter", diagnosis.filter ?? "不明"],
+      ["SubFilter", diagnosis.subFilter ?? "(なし)"]
+    ]));
+    container.append(element("p", { text: "Standard Security Handler以外（例: 公開鍵方式の /Adobe.PubSec）のため、これ以上の項目は解釈しません（診断のみ対応）。" }));
+    container.append(element("p", { text: "パスワード状態: 未判定 / PoC対象外。このPoCはパスワードの検証・復号を一切行いません。" }));
+    return;
+  }
+
+  container.append(element("h4", { text: "確定できる情報（Encrypt dictionaryの記載）" }));
+  container.append(dl([
+    ["Security Handler", "Standard"],
+    ["V（バージョン）", diagnosis.version ?? "不明"],
+    ["R（リビジョン）", diagnosis.revision ?? "不明"],
+    ["Length（鍵長・bit）", diagnosis.lengthBits ?? "不明"],
+    ["EncryptMetadata", diagnosis.encryptMetadata === null ? "不明" : (diagnosis.encryptMetadata ? "true（メタデータも暗号化）" : "false（メタデータは平文）")]
+  ]));
+
+  if (diagnosis.cryptFilters.length) {
+    container.append(element("h4", { text: "Crypt Filter（/CF）" }));
+    const list = element("ul");
+    for (const filter of diagnosis.cryptFilters) {
+      const role = [
+        filter.name === diagnosis.streamFilter ? "stream用" : null,
+        filter.name === diagnosis.stringFilter ? "string用" : null
+      ].filter(Boolean).join("・");
+      list.append(element("li", {
+        text: `${filter.name}${role ? `（${role}）` : ""}: CFM=${filter.method ?? "不明"}（${filter.methodLabel ?? "不明"}） / Length=${filter.length ?? "不明"} bit / AuthEvent=${filter.authEvent ?? "(なし)"}`
+      }));
+    }
+    container.append(list);
+  }
+
+  container.append(element("h4", { text: "推定される暗号化方式（推定・参考情報）" }));
+  container.append(element("p", { className: "estimate", text: diagnosis.estimatedMethod ?? "V / R / CFM の組み合わせからは推定できませんでした" }));
+
+  container.append(element("h4", { text: "権限 /P（確定できる情報。復号・制限解除は行いません）" }));
+  if (diagnosis.permissions) {
+    const list = element("ul");
+    for (const name of Object.keys(PERMISSION_LABELS)) list.append(element("li", { text: permissionLine(name, diagnosis.permissions[name]) }));
+    container.append(list);
+  } else {
+    container.append(element("p", { text: "/P を解析できませんでした。" }));
+  }
+
+  container.append(element("h4", { text: "パスワード状態" }));
+  container.append(element("p", {
+    text: "未判定 / PoC対象外。このPoCはパスワードの検証・復号を一切行わないため判定できません。他の閲覧ソフトで開けたことは「パスワードなし」を意味しません。"
+  }));
+}
+
+/** デバッグ用: Encrypt objectそのものの内部値。「詳細・デバッグ情報」の中だけに表示する。 */
+function renderEncryptionDebug(container, diagnosis, encryptReference) {
+  clear(container);
+  container.hidden = false;
+  container.append(element("h3", { text: "暗号化診断の内部情報" }));
+  container.append(dl([
+    ["Encrypt object", encryptReference ? `${encryptReference.number} ${encryptReference.generation} R` : "(不明)"],
+    ["Filter", diagnosis.filter ?? "(なし)"],
+    ["SubFilter", diagnosis.subFilter ?? "(なし)"],
+    ["standardHandler", String(diagnosis.standardHandler)],
+    ["V", String(diagnosis.version)],
+    ["R", String(diagnosis.revision)],
+    ["Length（raw, bit）", String(diagnosis.lengthBits)],
+    ["StmF", diagnosis.streamFilter ?? "(なし)"],
+    ["StrF", diagnosis.stringFilter ?? "(なし)"],
+    ["EFF", diagnosis.encryptFileFilter ?? "(なし)"],
+    ["EncryptMetadata（raw）", String(diagnosis.encryptMetadata)],
+    ["P（raw）", String(diagnosis.permissionsRaw)]
+  ]));
+  const json = element("pre", { className: "mono", text: JSON.stringify(diagnosis, null, 2) });
+  container.append(json);
+}
+
 /* ------------------------------------------------------- デバッグ: run一覧 */
 
 function renderRunRow(run) {
@@ -411,6 +523,8 @@ async function handleSingleFile(file) {
   single.bytes = null;
   single.runs = [];
   hide($("single-error"));
+  hide($("single-encryption"));
+  hide($("debug-encryption"));
   clear($("run-body"));
   revokePreview();
   $("editor-grid").hidden = true;
@@ -461,7 +575,17 @@ async function handleSingleFile(file) {
     runs = await editor.listTextRuns();
   } catch (error) {
     hide(summary);
-    showError($("single-error"), { title: `${file.name}: 本文runを抽出できませんでした`, error, stage: "extract" });
+    const diagnosis = error.encryptionDiagnosis;
+    if (diagnosis?.encrypted) {
+      // 暗号化PDFは単なる赤いエラーではなく、Security Handler/V/R/CF/権限を
+      // 読み取れる範囲まで構造化して見せる。原文のエラーメッセージも
+      // showError() 経由でそのまま併記する（隠さない方針は変えない）。
+      showError($("single-error"), { title: `${file.name}: 暗号化PDFのため本文を抽出できません`, error, stage: "extract" });
+      renderEncryptionDiagnosis($("single-encryption"), diagnosis);
+      renderEncryptionDebug($("debug-encryption"), diagnosis, editor.document.encryptReference);
+    } else {
+      showError($("single-error"), { title: `${file.name}: 本文runを抽出できませんでした`, error, stage: "extract" });
+    }
     return;
   }
 

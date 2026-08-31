@@ -285,8 +285,12 @@ async function collectXref(bytes) {
   const root = reference(latestTrailer, "Root");
   const size = directInteger(latestTrailer, "Size");
   if (!root || !size) throw new Error("PDF trailer must contain /Root and /Size");
-  if (/\/Encrypt\b/.test(latestTrailer)) throw new Error("Encrypted PDFs are not supported");
-  return { entries, root, size, previousXref: startXref };
+  // The xref table itself is not affected by encryption (object offsets, /Root, and
+  // /Size are always readable), so resolving it succeeds either way. Editing is
+  // refused later, once the Encrypt dictionary has been read for diagnosis — see
+  // PdfTextEditor#listTextRuns() in pdf-document.js.
+  const encryptReference = reference(latestTrailer, "Encrypt");
+  return { entries, root, size, previousXref: startXref, encryptReference };
 }
 
 function parseReferenceArray(text, key) {

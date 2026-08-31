@@ -1,5 +1,6 @@
 import { replaceTextRuns, scanTextRuns } from "./content-stream.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
+import { analyzeEncryption, summarizeEncryption } from "./encryption.js";
 import { deflate, decodeStreamBytes, filters } from "./flate.js";
 import { PdfStructure, reference } from "./pdf-structure.js";
 
@@ -78,6 +79,17 @@ export class PdfTextEditor {
       // (async) to read. Resolving it here, on first use, keeps the constructor
       // itself synchronous and free of I/O.
       await this.document.ensureXref();
+      // The xref table itself is unaffected by encryption, so it resolves either
+      // way; only content extraction (and by extension replace/save) is refused.
+      // The diagnosis is attached to the error so a caller (the Browser PoC) can
+      // show what was detected instead of just this message. See src/encryption.js.
+      if (this.document.encryptReference) {
+        const diagnosis = analyzeEncryption(this.document);
+        const summary = summarizeEncryption(diagnosis);
+        const error = new Error(`Encrypted PDFs are not supported${summary ? ` (${summary})` : ""}`);
+        error.encryptionDiagnosis = diagnosis;
+        throw error;
+      }
       this.streams = [];
       const seen = new Set();
       for (const { object, resources } of this.document.pageContentObjects()) {

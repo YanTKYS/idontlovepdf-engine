@@ -70,6 +70,8 @@ test("reports the failing stage without throwing and leaves later stages unattem
 test("classifies known engine errors into readable causes and keeps the raw message", () => {
   const cases = [
     ["load: Encrypted PDFs are not supported", "暗号化PDF"],
+    ["load: Encrypted PDFs are not supported (Standard / AES-128 / R4)", "暗号化PDF（Standard / AES-128 / R4）"],
+    ["load: Encrypted PDFs are not supported (Standard以外のSecurity Handler: Adobe.PubSec)", "暗号化PDF（Standard以外のSecurity Handler: Adobe.PubSec）"],
     ["extract: Unsupported stream filter: ASCII85Decode", "unsupported filter（未対応の圧縮・符号化）"],
     ["extract: PDF object 12 is missing from the xref table", "objectがxrefに存在しない（破損の可能性）"],
     ["extract: Object streams are not supported (PDF object 12 is stored in object stream 7)", "object stream未対応（xref streamのtype 2 entry）"],
@@ -152,7 +154,52 @@ test("builds assessment.json with the required fields and manual readerDisplay",
     reopen: true,
     runCount: 1,
     readerDisplay: null,
-    error: null
+    error: null,
+    encryption: null
   });
   assert.match(parsed.results[1].error, /^load: /);
+  assert.equal(parsed.results[1].encryption, null);
+});
+
+test("attaches a short encryption summary to the assessment record when extract fails on an encrypted PDF", async () => {
+  // Reuses classicEncryptedPdf()'s shape inline: Catalog/Pages/Page/Contents plus an
+  // Encrypt object referenced from the trailer.
+  const header = encode("%PDF-1.6\n");
+  const objects = [
+    { number: 1, text: "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" },
+    { number: 2, text: "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n" },
+    { number: 3, text: "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n" },
+    { number: 5, text: "5 0 obj\n<< /Filter /Standard /V 2 /R 3 /Length 128 /P -1 >>\nendobj\n" }
+  ];
+  const chunks = [header];
+  const offsets = new Map();
+  let pos = header.length;
+  for (const object of objects) {
+    offsets.set(object.number, pos);
+    const bytes = encode(object.text);
+    chunks.push(bytes);
+    pos += bytes.length;
+  }
+  offsets.set(4, pos);
+  const content = encode("BT (unreachable) Tj ET");
+  const streamHead = encode(`4 0 obj\n<< /Length ${content.length} >>\nstream\n`);
+  chunks.push(streamHead, content, encode("\nendstream\nendobj\n"));
+  pos += streamHead.length + content.length + "\nendstream\nendobj\n".length;
+
+  const xrefOffset = pos;
+  const table = [1, 2, 3, 4, 5]
+    .map((number) => `${number} 1\n${String(offsets.get(number)).padStart(10, "0")} 00000 n \n`)
+    .join("");
+  chunks.push(encode(
+    `xref\n0 1\n0000000000 65535 f \n${table}trailer\n<< /Size 6 /Root 1 0 R /Encrypt 5 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+  ));
+  const pdf = new Uint8Array(chunks.flatMap((chunk) => [...chunk]));
+
+  const { record } = await assessPdfBytes("encrypted.pdf", pdf);
+  assert.equal(record.load, true);
+  assert.equal(record.extract, false);
+  assert.deepEqual(record.encryption, { filter: "Standard", V: 2, R: 3, method: "Standard Security Handler / RC4（可変長鍵）" });
+
+  const parsed = JSON.parse(toAssessmentJson([record]));
+  assert.deepEqual(parsed.results[0].encryption, { filter: "Standard", V: 2, R: 3, method: "Standard Security Handler / RC4（可変長鍵）" });
 });

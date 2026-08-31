@@ -62,7 +62,14 @@ export async function assessPdfBytes(file, bytes) {
   try {
     runs = await editor.listTextRuns();
   } catch (error) {
-    return { record: failedRecord(file, "extract", error, { load: true }), output: null };
+    // listTextRuns() attaches a diagnosis (see src/encryption.js) instead of just
+    // refusing encrypted PDFs outright; surface a short summary of it on the record
+    // so a corpus run can tell "encrypted, and here's what kind" from a bare failure.
+    const diagnosis = error?.encryptionDiagnosis;
+    const partial = diagnosis?.encrypted
+      ? { load: true, encryption: { filter: diagnosis.filter, V: diagnosis.version, R: diagnosis.revision, method: diagnosis.estimatedMethod } }
+      : { load: true };
+    return { record: failedRecord(file, "extract", error, partial), output: null };
   }
   if (runs.length === 0) {
     return { record: failedRecord(file, "extract", "no editable text-showing operands found", { load: true }), output: null };
