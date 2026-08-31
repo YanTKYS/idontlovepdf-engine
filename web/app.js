@@ -184,8 +184,19 @@ function permissionLine(name, value) {
  * 省略されている場合、実際の鍵長はCrypt Filter（/CF）側が決めるため、仕様上の
  * 既定値40bitを当てはめると誤り（例: AES-128を40bit RC4のように見せてしまう）。
  * そのため「明記」「仕様上の既定値」「不明・Crypt Filter側で決まる」を区別する。
+ *
+ * /V 5（R6含む）はさらに一段注意が必要: 実際にAES-256（256 bit）を使っていても、
+ * PDF書き出し側の実装によってはEncrypt辞書直下に/Lengthを（本来の単位を誤って、
+ * あるいは無意味な値のまま）残していることがある。この値はV5では実際のAES鍵長の
+ * 判定に使っていない（256 bit固定）ため、たとえ数値が明記されていても、それを
+ * そのまま「n bit暗号」と読める形では表示しない。実際の鍵長はCrypt Filter側の
+ * /Length（bytes単位、下記一覧を参照）が示す。
  */
 function lengthBitsLine(diagnosis) {
+  if (diagnosis.version === 5) {
+    const rawText = diagnosis.lengthBitsSource === "explicit" ? String(diagnosis.lengthBits) : "(なし)";
+    return `${rawText}（V5/R6ではAES鍵長の判定には使用しません。実際の鍵長は下記Crypt Filterの/Lengthを参照してください）`;
+  }
   if (diagnosis.lengthBitsSource === "explicit") return `${diagnosis.lengthBits} bit`;
   if (diagnosis.lengthBitsSource === "default") return `${diagnosis.lengthBits} bit（/Length省略時の仕様上の既定値）`;
   return "未指定（/CF側の鍵長を参照。下記Crypt Filterを参照）";

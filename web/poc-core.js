@@ -40,6 +40,7 @@ const ERROR_CATEGORIES = [
   },
   { pattern: /modification is not permitted.*modify permission denied/i, label: "暗号化PDF（文書変更が許可されていません／P permission）" },
   { pattern: /Saving edits to an encrypted PDF is not supported/i, label: "暗号化PDF（再暗号化保存は未対応）" },
+  { pattern: /Perms validation failed/i, label: "暗号化PDF（/Perms検証失敗。file keyが不正または/Perms自体が破損している可能性）" },
   {
     pattern: /Encrypted PDFs are not supported|\/Encrypt/i,
     label: "暗号化PDF",
