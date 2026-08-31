@@ -23,14 +23,23 @@ export const ASSESSMENT_FIELDS = [
   "reopen",
   "runCount",
   "readerDisplay",
-  "error"
+  "error",
+  // Present only when extract failed on an encrypted PDF (see src/encryption.js);
+  // null otherwise. A short summary, not the full diagnosis, to keep this schema small.
+  "encryption"
 ];
 
 const ERROR_CATEGORIES = [
   { pattern: /Object streams are not supported/i, label: "object stream未対応（xref streamのtype 2 entry）" },
   { pattern: /cross-reference stream/i, label: "xref stream解析失敗（/W・/Index・stream長など）" },
   { pattern: /predictor/i, label: "Predictor未対応または不正（値・row長・bit depthなど）" },
-  { pattern: /Encrypted PDFs are not supported|\/Encrypt/i, label: "暗号化PDF" },
+  {
+    pattern: /Encrypted PDFs are not supported|\/Encrypt/i,
+    label: "暗号化PDF",
+    // "Encrypted PDFs are not supported (Standard / AES-128 / R4)" のように、
+    // src/encryption.js の診断が付いている場合はその要約を括弧内に添える。
+    detail: (text) => text.match(/Encrypted PDFs are not supported \(([^)]+)\)/)?.[1] ?? null
+  },
   { pattern: /Unsupported stream filter/i, label: "unsupported filter（未対応の圧縮・符号化）" },
   { pattern: /missing from the xref table|Unsupported non-dictionary PDF object/i, label: "objectがxrefに存在しない（破損の可能性）" },
   { pattern: /no editable text-showing operands/i, label: "本文runなし" },
@@ -56,7 +65,10 @@ const ERROR_CATEGORIES = [
 export function classifyError(message) {
   if (!message) return null;
   const text = String(message);
-  return ERROR_CATEGORIES.find((category) => category.pattern.test(text))?.label ?? "その他のエラー（原文を参照）";
+  const category = ERROR_CATEGORIES.find((entry) => entry.pattern.test(text));
+  if (!category) return "その他のエラー（原文を参照）";
+  const detail = category.detail?.(text);
+  return detail ? `${category.label}（${detail}）` : category.label;
 }
 
 /** `"extract: ..."` 形式のエラー文字列から失敗段階を取り出す。 */

@@ -46,7 +46,7 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 
 ### `new PdfTextEditor(input)`
 
-`ArrayBuffer` または `Uint8Array` の PDF を読み込みます。classic xref table・cross-reference stream・両者が`/Prev`で混在する構成のいずれにも対応します。暗号化PDFは対象外です。xref解析自体はFlateDecodeの展開を含み非同期になり得るため、コンストラクタは同期のまま、実際の解析は最初の`listTextRuns()`（内部的には`replaceText()`・`save()`も経由）呼び出し時に遅延して行われます。
+`ArrayBuffer` または `Uint8Array` の PDF を読み込みます。classic xref table・cross-reference stream・両者が`/Prev`で混在する構成のいずれにも対応します。トレーラーが`/Encrypt`を持つ暗号化PDFでも、xref解析自体（object位置・`/Root`・`/Size`の取得）はここでは失敗しません。暗号化の有無はcontent（文字列やstream本体）を読まなくても分かる情報のためです。実際に本文を読もうとする`listTextRuns()`の時点で初めて拒否され、その際に何が検出されたかの診断が付きます（後述「暗号化PDFの診断」）。xref解析自体はFlateDecodeの展開を含み非同期になり得るため、コンストラクタは同期のまま、実際の解析は最初の`listTextRuns()`（内部的には`replaceText()`・`save()`も経由）呼び出し時に遅延して行われます。
 
 ### `await editor.listTextRuns()`
 
@@ -67,7 +67,8 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 ## 制約と次の段階
 
 - ページ上の座標、フォント名、文字サイズはまだ公開していません。
-- `/ASCII85Decode`、画像化された文字、暗号化PDFは未対応です。
+- `/ASCII85Decode`、画像化された文字は未対応です。
+- 暗号化PDFは、`/Encrypt`辞書の内容を読み取って画面へ診断表示するところまでは対応しています（後述「暗号化PDFの診断」）が、本文抽出・置換・保存（=実際の復号）は未対応です。
 - `/DecodeParms /Predictor`は、`src/predictor.js`が次の範囲に対応します。
   - **Predictor 1**（補正なし）: そのまま
   - **Predictor 10〜15**（PNG Predictor: None/Sub/Up/Average/Paeth）: PDF仕様どおり、値の大小に関わらずrowごとの先頭1バイトで実際のfilter typeを読み取って復元します（`/Predictor`の数値はどのfilterが多いかの目安に過ぎず、行ごとの判定は仕様上常に必要です）
@@ -76,6 +77,14 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
   - `/Predictor`・`/Columns`・`/BitsPerComponent`等の値は、キーに続くトークン全体をPDF整数として厳密に検証します。`/Predictor 12.5`のような小数や`/Columns foo`のような非数値は、先頭の数字部分だけを読んで推測することなく、そのまま不正値として拒否します。`/BitsPerComponent`はPDF仕様が定める`1`・`2`・`4`・`8`・`16`以外（例: `3`や`5`）も明示的に拒否します
   - Predictor解除はxref stream・page content stream・ToUnicode CMap streamのいずれからも共通利用し（`src/predictor.js`と`src/flate.js`に集約）、失敗時のエラーには`content stream object 45: ...`のようにどのstreamで失敗したかを付記します
   - 保存時（`save()`）は、編集済みcontent streamを常にPredictorなしの素の`/FlateDecode`として書き戻します（`/DecodeParms`も削除）。元PDFがPredictor付きでも、incremental updateとして追記される新しいstreamにはPredictorを再付与しません
+- **暗号化PDF（`/Encrypt`）は、`src/encryption.js`が診断のみ対応します。**トレーラー（またはxref streamの辞書）が持つ`/Encrypt N 0 R`を検出しても、xref解析自体は失敗させず先まで進めます。実際に本文を読もうとした時点（`listTextRuns()`）で、`Error`に`encryptionDiagnosis`という診断結果を添えて拒否します。診断は次を読み取ります（**復号やパスワード検証は一切行いません**）。
+  - `/Filter`が`/Standard`かどうか（Standard Security Handlerかどうか）。`/Adobe.PubSec`のような別方式の場合は、`/Filter`・`/SubFilter`のみ報告し、それ以上（`/P`・`/CF`など）はStandard固有の解釈を当てはめず`null`のまま止めます
+  - `/V`（暗号化バージョン）・`/R`（リビジョン）・`/Length`（Encrypt辞書直下、**bit**単位）・`/EncryptMetadata`（省略時は仕様どおり`true`）。`/Length`省略時の仕様上の既定値40bitは`/V 1`・`/V 2`（RC4のみ）にのみ適用します。`/V 4`・`/V 5`では実際の鍵長は`/CF`側（またはAES-256固定）が決めるため、`/Length`省略時は40bitとみなさず「未指定」として区別します（`lengthBitsSource`: `explicit`/`default`/`unspecified`）
+  - `/CF`（Crypt Filter辞書）内の各filterの`/CFM`（`/None`・`/V2`＝RC4系・`/AESV2`＝AES-128系・`/AESV3`＝AES-256系のいずれかを日本語ラベル付きで報告）・`/Length`・`/AuthEvent`、および`/StmF`・`/StrF`（どのfilterをstream/stringに使うか）。**Crypt Filterの`/Length`はEncrypt辞書直下の`/Length`と異なり`bytes`単位**（PDF仕様 7.6.5 表25）のため、`lengthBytes`（原文の値）と`lengthBits`（`× 8`した値）の両方を返し、bytesの値をbitのラベルで表示してしまう取り違えを防ぎます（例: `/Length 16` は128bit鍵であり16bit鍵ではありません）
+  - `/P`の権限bit（符号付き32bit整数として解釈）: 印刷・文書変更・内容コピー・注釈の4項目に加え、`/R >= 3`の場合のみフォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷の4項目。`/R 2`ではこの4項目を仕様上未定義として`null`のまま返し、bitを読んで推測することはしません
+  - `/V`・`/R`・`/CFM`の組み合わせからの**推定**方式（`estimatedMethod`）。これは辞書の記載そのもの（`filter`・`version`・`revision`・`cryptFilters`など）とは別のフィールドとして返し、「確定できる情報」と「推定」を混同しないようにしています
+  - パスワードの検証は行わないため、パスワード状態は常に「未判定 / PoC対象外」です。他のPDF readerで開けたことをもって「パスワードなし」と判定することもありません
+  - 実装しないもの（意図的なスコープ外）: 復号そのもの、ユーザー/オーナーパスワードの検証、パスワード入力UI、パスワード総当たり、権限制限の回避、暗号化鍵の生成、RC4/AES復号、暗号化されたstream・stringの復号、object stream（`/ObjStm`）対応
 - cross-reference streamのtype 2 entry（object stream内のobject）は、xref解析自体は失敗させず内部的に保持しますが、そのobjectへ実際にアクセスした時点で「Object streams are not supported」という明確なエラーになります。object stream（`/ObjStm`）そのものの実装はまだ行っていません。Catalog / Pages / Contentsなど今回必要なobjectがtype 1（通常のindirect object）であれば処理を継続できます。
 - inline image（`BI ... ID ... EI`）の画像データは本文走査から除外します。画像そのものは編集対象外です。
 - 1ページの`/Contents`が複数streamに分かれている場合、各streamを独立に走査します。`BT`〜`ET`がstream境界をまたぐと、そのrunは列挙されません。
@@ -111,6 +120,10 @@ CMapがない、または逆引きできない特殊なfontでは、既存font�
 - `/Predictor 12.5`・`/Columns foo`のような小数・非数値のDecodeParms値を、先頭の数字だけを読んで推測せず拒否すること。`/BitsPerComponent`が仕様の許容値（1・2・4・8・16）以外の場合（例: 3、5）に例外になること
 - Predictor付きのxref stream・content stream・ToUnicode CMap streamそれぞれから正しく本文runやCMapを取得できること
 - Predictor付きcontent streamに対して`listTextRuns()` → `replaceText()` → `save()` → 再読込みが通ること。保存後のstreamはPredictorなしの`/FlateDecode`として書き戻され、`/DecodeParms`も除去されること
+- `/Encrypt`を持つトレーラーでもxref解析自体は失敗せず、`listTextRuns()`の時点で初めて拒否されること。診断（`encryptionDiagnosis`）が`/V`（1・2・4・5）・`/R`・`/Length`（`/V 1`・`/V 2`のみ省略時40、`/V 4`・`/V 5`では省略時`unspecified`のまま推測しない）・`/EncryptMetadata`（true/false/省略時true）・`/CF`の`/CFM`（`/None`・`/V2`・`/AESV2`・`/AESV3`のラベル付け、bytes単位の`/Length`をbit単位に変換した値と併記）を正しく読み取ること
+- 既知の`/P`値（`R4`で`-44`）から、印刷・内容コピーは許可、文書変更・注釈は制限、かつ`/R >= 3`の4項目（フォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷）はすべて許可、という仕様どおりのbit解釈になること。`/R 2`ではこの4項目を`null`のまま返し、bitを読んで推測しないこと
+- `/Filter /Adobe.PubSec`のようなStandard以外のSecurity Handlerを誤ってStandardとして扱わず、`/P`・`/CF`など固有フィールドを解釈しないこと
+- 暗号化されたトレーラーがcross-reference stream由来（classic xrefの`trailer`ではなく`/Type /XRef`辞書の`/Encrypt`）でも参照解決できること。また、xref stream + `/FlateDecode` + PNG Predictorという実PDFで見られる組み合わせと`/Encrypt`が同時に成立していても、診断まで到達できること
 
 これらは構造上の回帰fixtureであり、Wordや各種業務製品から出力されたPDFの互換性を証明するものではありません。実PDFの判定では、出力元ごとに複数fixtureを用意し、Acrobat Reader等の独立したreaderによる表示確認も必要です。object streamで失敗するファイルが多い場合は自作方式を一般用途へ昇格させず、Apryse/Foxit PoCへ戻す判断材料としてください。
 
@@ -143,6 +156,7 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 | `src/assessment.js` | 評価パイプライン本体。Node版CLIとブラウザPoCで共有する |
 | `src/flate.js` | `/FlateDecode`の展開・`/Filter`解釈。content stream・CMap stream・cross-reference streamで共有する |
 | `src/predictor.js` | `/DecodeParms /Predictor`（TIFF・PNG）の解除。stream種別に依存せず`src/flate.js`から共通利用する |
+| `src/encryption.js` | `/Encrypt`辞書の診断（復号は行わない）。DOM非依存で、Nodeのテストからも読み込む |
 
 ### 単一PDF検証: PDFプレビュー＋文字列検索・置換
 
@@ -166,6 +180,8 @@ bundle工程は追加していません。`index.html`はES Modulesとして`web
 `text`はfontの`/ToUnicode` CMapによる復号結果です。復号できないrunがあってもPoC全体は止めず、「詳細・デバッグ情報」のrun一覧でそのrunに「復号不可を含む」と表示します。置換は常に元バイト列の複製に対して行うため、**元のPDFファイルは変更されません**。失敗時は、失敗した段階・推定される原因・エラー原文・元PDFが無変更であることを表示します（エラーは握り潰しません）。
 
 **詳細・デバッグ情報。** `<details>`内に、従来どおりの本文run一覧（`id` / `objectNumber` / `fontName` / `text` / 文字数 / bytes数 / bytes hex、既定で折りたたみ）と、run一覧から1件を直接選んで置換する検証用UIを残しています。通常操作には使いませんが、検索・置換モデルが内部でどのrunを操作しているかを確認する用途で利用できます。
+
+**暗号化PDFの診断表示。** 選択したPDFが`/Encrypt`を持つ場合、本文抽出（`listTextRuns()`）は失敗しますが、単なる赤いエラー表示だけでは終わりません。エラー原文の下に、Security Handler（Standardかどうか）・`/V`・`/R`・`/Length`・`/EncryptMetadata`・Crypt Filter（`/CFM`とそのラベル）・推定される暗号化方式・`/P`権限（印刷・文書変更・内容コピー・注釈、および`/R >= 3`ならフォーム入力・アクセシビリティ抽出・文書構成変更・高品質印刷）を、**「確定できる情報」（辞書の記載）と「推定」を見出しを分けて**表示します。パスワード状態は常に「未判定 / PoC対象外」と表示し、判定を試みません。Standard以外のSecurity Handler（`/Adobe.PubSec`など）では`/Filter`・`/SubFilter`のみを表示し、それ以上は解釈しない旨を明記します。この間もPDFプレビューは（読み取れたbytesがある限り）通常どおり表示を試みます。`/Encrypt`辞書のobject番号・生の`/Length`・`/StmF`・`/StrF`など内部的な値は「詳細・デバッグ情報」の中に別枠で表示し、通常の要約とは分けています。「複数PDF評価」の結果表には、この診断から作った短い要約（`暗号化PDF（Standard / AES-128 / R4）`のような形式）がエラー分類として表示されますが、`load: ○ / extract: ×`のまま扱われ、編集成功とはみなしません。
 
 `web/text-search.js`の自動テスト（`test/text-search.test.js`）では、単一run内の一致、複数runにまたがる一致、一致なし、別content stream境界を跨がないこと、**同じcontent stream内の別`BT ... ET`（`textObjectId`）を跨がないこと**、同じ文字列の複数一致、置換後の文字数一致・不一致による自動対応可否、実際のPDFに対する検索→置換→save→reopenの一連を回帰検証しています。
 
