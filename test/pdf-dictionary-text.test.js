@@ -122,3 +122,45 @@ test("topLevelInteger() reads /V and /R the same depth-aware way (no realistic c
   assert.equal(topLevelInteger(NESTED_CF_BEFORE_TOP_LEVEL, "V"), 5);
   assert.equal(topLevelInteger(NESTED_CF_BEFORE_TOP_LEVEL, "R"), 6);
 });
+
+/* ------------------------------------------------------- key/value alternation regression (review round 2) */
+/* A depth-only scanner cannot tell a name in *key* position from a structurally
+ * identical name that is merely the *value* of a preceding key. In
+ * << /Foo /Length /Length 256 >>, the first /Length is /Foo's value, not a key --
+ * topLevelValueOffset()/topLevelInteger() must skip exactly one value per key and
+ * only match a name when it is actually read in key position. */
+
+test("topLevelInteger() is not fooled by a name-shaped value that equals the key being searched for", () => {
+  const text = dictionaryText("<< /Foo /Length /Length 256 >>");
+  assert.equal(topLevelInteger(text, "Length"), 256);
+});
+
+test("topLevelValueOffset() skips a preceding key's indirect-reference value (N G R) as a single value", () => {
+  const text = dictionaryText("<< /Root 1 0 R /Length 256 >>");
+  assert.equal(topLevelInteger(text, "Length"), 256);
+});
+
+/* ------------------------------------------------------------- strict integer parsing (review round 2) */
+/* topLevelInteger() must validate the *entire* value token as a PDF integer
+ * (parseStrictInteger()-equivalent), not just scan a leading run of digits. */
+
+test("topLevelInteger() accepts a plain PDF integer", () => {
+  assert.equal(topLevelInteger(dictionaryText("<< /Length 256 >>"), "Length"), 256);
+});
+
+test("topLevelInteger() accepts a PDF integer with an explicit leading +", () => {
+  assert.equal(topLevelInteger(dictionaryText("<< /Length +256 >>"), "Length"), 256);
+});
+
+test("topLevelInteger() rejects a value with trailing non-digit characters instead of truncating to the leading digits", () => {
+  assert.equal(topLevelInteger(dictionaryText("<< /Length 256foo >>"), "Length"), null);
+});
+
+test("topLevelInteger() rejects a real number (contains a decimal point), it is not a PDF integer", () => {
+  assert.equal(topLevelInteger(dictionaryText("<< /Length 256.0 >>"), "Length"), null);
+  assert.equal(topLevelInteger(dictionaryText("<< /R 6.5 >>"), "R"), null);
+});
+
+test("topLevelInteger() rejects a digit run followed by trailing letters", () => {
+  assert.equal(topLevelInteger(dictionaryText("<< /R 6abc >>"), "R"), null);
+});

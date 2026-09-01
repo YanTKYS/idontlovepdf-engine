@@ -37,77 +37,124 @@ function bytesToText(bytes, start, end) {
 }
 
 /**
+ * Skips exactly one PDF object value starting at `start` (which must already be
+ * past any leading whitespace/comments): a name, a literal or hex string, an
+ * array, a dictionary, or a number -- including the three-token `N G R` indirect
+ * reference form, which is a single value even though it is not a single token.
+ * Used only by topLevelValueOffset() below, to advance past a key's value when
+ * that value is NOT the key being searched for, so the next name token read is
+ * always genuinely the *next key*, never mistaken for one just because it happens
+ * to look like a name (e.g. a value of `/Length` for some unrelated key `/Foo`).
+ */
+function skipOneValue(bytes, start) {
+  if (bytes[start] === 0x3c && bytes[start + 1] === 0x3c) return skipDictionary(bytes, start);
+  if (bytes[start] === 0x5b) return skipArray(bytes, start);
+  if (bytes[start] === 0x28) return readLiteral(bytes, start).end;
+  if (bytes[start] === 0x3c) return readHex(bytes, start).end;
+  if (bytes[start] === 0x2f) {
+    let cursor = start + 1;
+    while (isRegular(bytes[cursor])) cursor += 1;
+    return cursor;
+  }
+  if (isRegular(bytes[start])) {
+    let cursor = start;
+    while (cursor < bytes.length && isRegular(bytes[cursor])) cursor += 1;
+    // Only a bare non-negative integer can be the object-number half of an
+    // indirect reference ("5 0 R") -- check whether this token is followed by a
+    // second integer and then the literal "R" keyword; if so, the whole
+    // three-token sequence is one value, not just the first number.
+    if (/^\d+$/.test(bytesToText(bytes, start, cursor))) {
+      const secondStart = skipWhite(bytes, cursor);
+      let secondEnd = secondStart;
+      while (secondEnd < bytes.length && isRegular(bytes[secondEnd])) secondEnd += 1;
+      if (/^\d+$/.test(bytesToText(bytes, secondStart, secondEnd))) {
+        const rStart = skipWhite(bytes, secondEnd);
+        if (bytes[rStart] === 0x52 && !isRegular(bytes[rStart + 1])) return rStart + 1; // 'R'
+      }
+    }
+    return cursor;
+  }
+  // A delimiter where a value was expected (malformed dictionary text) -- advance
+  // by one byte so the scan can never get stuck rather than trying to recover a
+  // meaningful value from it.
+  return start + 1;
+}
+
+/**
  * Locates the byte offset where `/key`'s value begins, considering only an
- * occurrence that appears directly inside `text` itself -- depth 0 relative to
- * `text`'s own outer `<< >>` -- and skipping over anything nested one level
- * deeper: a nested dictionary (e.g. a Crypt Filter sub-dictionary), an array, a
- * literal string, or a hex string. This is what makes a key like /Length safe to
- * read from an Encrypt dictionary that also has a /CF sub-dictionary with its own
- * /Length: a plain whole-text search finds whichever `/Length` happens to come
- * first in the raw bytes, nested or not -- which silently returns the Crypt
- * Filter's key length in *bytes* instead of the Encrypt dictionary's own top-level
- * /Length in *bits* whenever the sub-dictionary happens to be written first, as a
- * real PDF this engine needed to open does (`/CF << /StdCF << ... /Length 32 >>
- * >> /Length 256`).
+ * occurrence that appears directly inside `text` itself as a genuine key -- depth
+ * 0 relative to `text`'s own outer `<< >>`, and, within that depth, only a name
+ * token in *key position* (immediately followed by exactly one value, per PDF
+ * dictionary syntax), never a name that happens to appear as some other key's
+ * *value* (e.g. `/Foo /Length` -- the `/Length` there is /Foo's value, not a key
+ * named /Length). Achieves this by walking the dictionary strictly as alternating
+ * key/value pairs: read a name (the key), skip exactly one value (skipOneValue()
+ * above) unless that key is the one being searched for, repeat. Also skips over
+ * anything nested one level deeper regardless of key/value position: a nested
+ * dictionary (e.g. a Crypt Filter sub-dictionary), an array, a literal string, or
+ * a hex string.
+ *
+ * This is what makes a key like /Length safe to read from an Encrypt dictionary
+ * that also has a /CF sub-dictionary with its own /Length: a plain whole-text
+ * search finds whichever `/Length` happens to come first in the raw bytes, nested
+ * or not -- which silently returns the Crypt Filter's key length in *bytes*
+ * instead of the Encrypt dictionary's own top-level /Length in *bits* whenever the
+ * sub-dictionary happens to be written first, as a real PDF this engine needed to
+ * open does (`/CF << /StdCF << ... /Length 32 >> >> /Length 256`).
  *
  * `text` must be a full dictionary including its own outer `<< >>`, as
  * PdfStructure#object()'s `.dictionary` and this module's own
  * nestedDictionaryText()/namedSubDictionaries() results always are. Returns
  * `undefined` when `/key` does not appear at the top level at all (whether or not
- * it appears nested somewhere) -- the caller reads the value itself starting from
- * the returned offset (a digit run for topLevelInteger() below, or any other shape
- * a future caller needs).
+ * it appears nested, or as some other key's value, somewhere) -- the caller reads
+ * the value itself starting from the returned offset (a full integer token for
+ * topLevelInteger() below, or any other shape a future caller needs).
  */
 export function topLevelValueOffset(text, key) {
   const bytes = textToBytes(text);
   if (bytes[0] !== 0x3c || bytes[1] !== 0x3c) return undefined;
   const keyToken = `/${key}`;
   let cursor = 2;
-  while (cursor < bytes.length) {
+  while (true) {
     cursor = skipWhite(bytes, cursor);
-    if (cursor >= bytes.length || (bytes[cursor] === 0x3e && bytes[cursor + 1] === 0x3e)) break; // this dictionary's own end
-    if (bytes[cursor] === 0x3c && bytes[cursor + 1] === 0x3c) {
-      cursor = skipDictionary(bytes, cursor);
-    } else if (bytes[cursor] === 0x28) {
-      cursor = readLiteral(bytes, cursor).end;
-    } else if (bytes[cursor] === 0x3c) {
-      cursor = readHex(bytes, cursor).end;
-    } else if (bytes[cursor] === 0x5b) {
-      cursor = skipArray(bytes, cursor);
-    } else if (bytes[cursor] === 0x2f) {
-      const nameStart = cursor;
-      cursor += 1;
-      while (isRegular(bytes[cursor])) cursor += 1;
-      if (bytesToText(bytes, nameStart, cursor) === keyToken) return skipWhite(bytes, cursor);
-    } else if (isRegular(bytes[cursor])) {
-      while (cursor < bytes.length && isRegular(bytes[cursor])) cursor += 1;
-    } else {
-      cursor += 1;
+    if (cursor >= bytes.length || (bytes[cursor] === 0x3e && bytes[cursor + 1] === 0x3e)) return undefined; // this dictionary's own end
+    if (bytes[cursor] !== 0x2f) {
+      // Not a name where a key was expected (malformed dictionary text) -- skip
+      // one value defensively and keep scanning rather than getting stuck.
+      cursor = skipOneValue(bytes, cursor);
+      continue;
     }
+    const nameStart = cursor;
+    cursor += 1;
+    while (isRegular(bytes[cursor])) cursor += 1;
+    const name = bytesToText(bytes, nameStart, cursor);
+    const valueStart = skipWhite(bytes, cursor);
+    if (name === keyToken) return valueStart;
+    cursor = skipOneValue(bytes, valueStart);
   }
-  return undefined;
 }
 
 /**
  * Reads `/key`'s value as a direct (non-indirect-reference) integer, but only a
- * top-level (depth-0) occurrence of `/key` -- see topLevelValueOffset() above.
- * Like pdf-structure.js's directInteger() (used for structural values this parser
- * already trusts, e.g. /Size, /Prev, a stream's own /Length -- none of which share
- * a key name with anything that can legitimately be nested one level deeper the
- * way an Encrypt dictionary's /Length and its Crypt Filter's /Length do), this
- * truncates to a leading digit run rather than requiring the full token to be a
- * clean integer -- this function fixes *where* it looks for /key, not how
- * strictly it reads the digits once found. Returns `null` when `/key` is absent
- * at the top level.
+ * top-level (depth-0), key-position occurrence of `/key` -- see
+ * topLevelValueOffset() above. Unlike pdf-structure.js's directInteger() (used for
+ * structural values this parser already trusts, e.g. /Size, /Prev, a stream's own
+ * /Length -- none of which share a key name with anything that can legitimately be
+ * nested one level deeper, or appear as another key's value, the way an Encrypt
+ * dictionary's /Length and its Crypt Filter's /Length can), this requires the
+ * FULL token at that position to be a clean PDF integer (via parseStrictInteger()
+ * below) -- `256foo` or `6.5` are rejected outright, not silently truncated to
+ * `256`/`6`, and a leading `+` (valid PDF integer syntax) is accepted. Returns
+ * `null` when `/key` is absent at the top level, or its value is not a valid
+ * integer token.
  */
 export function topLevelInteger(text, key) {
   const offset = topLevelValueOffset(text, key);
   if (offset === undefined) return null;
   const bytes = textToBytes(text);
   let end = offset;
-  while (end < bytes.length && bytes[end] >= 0x30 && bytes[end] <= 0x39) end += 1;
-  if (end === offset) return null;
-  return Number(bytesToText(bytes, offset, end));
+  while (end < bytes.length && isRegular(bytes[end])) end += 1;
+  return parseStrictInteger(bytesToText(bytes, offset, end));
 }
 
 export function nameValue(text, key) {
