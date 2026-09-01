@@ -59,12 +59,14 @@ export function readHex(bytes, start) {
  * Skips a PDF array `[ ... ]` appearing inside a content-stream dictionary operand
  * (e.g. `/BBox [0 0 100 100]`, `/Items [(A) <42>]`), tracking `[`/`]` depth and
  * reusing readLiteral()/readHex()/skipDictionary() for anything nested inside it --
- * a literal string, hex string, dictionary, or another array. Only skipDictionary()
- * (mutually recursive with this) calls it; scanTextRuns() itself never sees an
- * array except as a TJ operand, which it reads element-by-element on its own (see
- * below), not via this helper.
+ * a literal string, hex string, dictionary, or another array. Exported alongside
+ * skipDictionary() for reuse by src/pdf-dictionary-text.js's top-level (depth-1)
+ * dictionary field reader, which needs to skip over an array value the same way
+ * when scanning past it in search of a different key; within this module,
+ * scanTextRuns() itself never sees an array except as a TJ operand, which it reads
+ * element-by-element on its own (see below), not via this helper.
  */
-function skipArray(bytes, start) {
+export function skipArray(bytes, start) {
   let cursor = start + 1;
   let depth = 1;
   while (cursor < bytes.length && depth > 0) {

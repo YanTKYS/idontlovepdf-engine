@@ -269,8 +269,19 @@ function renderEncryptionDiagnosis(container, diagnosis) {
   }));
 }
 
-/** デバッグ用: Encrypt objectそのものの内部値。「詳細・デバッグ情報」の中だけに表示する。 */
-function renderEncryptionDebug(container, diagnosis, encryptReference) {
+/** R6の/O・/U zero-padding互換normalizationの要約行。長さ情報のみ（raw bytesは含まない）。 */
+function validationEntryNormalizationLine(name, summary) {
+  if (!summary) return `${name}: (使用しませんでした)`;
+  if (!summary.zeroPaddingCompatibilityApplied) return `${name}: ${summary.rawLength} bytes（そのまま使用）`;
+  return `${name}: ${summary.rawLength} bytes → ${summary.normalizedLength} bytes（末尾zero-padding互換処理を適用）`;
+}
+
+/**
+ * デバッグ用: Encrypt objectそのものの内部値。「詳細・デバッグ情報」の中だけに表示する。
+ * `validationEntryNormalization`（R6のみ、`editor.security.validationEntryNormalization`）は
+ * 認証成功後にだけ渡され、/O・/Uの長さ情報だけを表示する（実際のbytesは含まない）。
+ */
+function renderEncryptionDebug(container, diagnosis, encryptReference, validationEntryNormalization) {
   clear(container);
   container.hidden = false;
   container.append(element("h3", { text: "暗号化診断の内部情報" }));
@@ -288,6 +299,13 @@ function renderEncryptionDebug(container, diagnosis, encryptReference) {
     ["EncryptMetadata（raw）", String(diagnosis.encryptMetadata)],
     ["P（raw）", String(diagnosis.permissionsRaw)]
   ]));
+  if (validationEntryNormalization) {
+    container.append(element("h4", { text: "R6 /O・/U（zero-padding互換normalization）" }));
+    container.append(dl([
+      ["/O", validationEntryNormalizationLine("O", validationEntryNormalization.O)],
+      ["/U", validationEntryNormalizationLine("U", validationEntryNormalization.U)]
+    ]));
+  }
   const json = element("pre", { className: "mono", text: JSON.stringify(diagnosis, null, 2) });
   container.append(json);
 }
@@ -672,7 +690,9 @@ async function attemptLoad(file, editor, password, passwordWasEntered) {
 
   if (editor.security) {
     renderEncryptionAuthenticated($("single-encryption"), editor.security, passwordWasEntered);
-    renderEncryptionDebug($("debug-encryption"), editor.security.diagnosis, editor.document.encryptReference);
+    renderEncryptionDebug(
+      $("debug-encryption"), editor.security.diagnosis, editor.document.encryptReference, editor.security.validationEntryNormalization
+    );
   } else {
     hide($("single-encryption"));
     hide($("debug-encryption"));

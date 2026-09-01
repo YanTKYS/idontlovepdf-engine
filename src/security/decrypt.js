@@ -19,11 +19,10 @@
  * code and are never called from within each other).
  */
 
-import { directInteger } from "../pdf-structure.js";
-import { booleanValue, nameValue, signedInteger, stringValue } from "../pdf-dictionary-text.js";
+import { booleanValue, nameValue, signedInteger, stringValue, topLevelInteger } from "../pdf-dictionary-text.js";
 import { analyzeEncryption, parseCryptFilters } from "../encryption.js";
 import { authenticateOwnerPassword, authenticateUserPassword, deriveObjectKey } from "./standard-r4.js";
-import { authenticateOwnerPasswordR6, authenticateUserPasswordR6, validatePerms } from "./standard-r6.js";
+import { authenticateOwnerPasswordR6, authenticateUserPasswordR6, normalizeR6ValidationEntry, validatePerms } from "./standard-r6.js";
 import { decryptAesCbc } from "./aes.js";
 
 /** An error whose message always starts with the existing "encrypted PDF" prefix, so
@@ -38,8 +37,12 @@ function encryptionError(reason, diagnosis) {
 
 function readFields(dictionaryText) {
   const filter = nameValue(dictionaryText, "Filter");
-  const versionRaw = directInteger(dictionaryText, "V");
-  const revisionRaw = directInteger(dictionaryText, "R");
+  // topLevelInteger(), not directInteger(): see the matching comment in
+  // src/encryption.js's analyzeEncryption() -- a Crypt Filter sub-dictionary under
+  // /CF can declare its own same-named keys, and a whole-text search must not
+  // return one of those instead of this dictionary's own top-level field.
+  const versionRaw = topLevelInteger(dictionaryText, "V");
+  const revisionRaw = topLevelInteger(dictionaryText, "R");
   const o = stringValue(dictionaryText, "O");
   const u = stringValue(dictionaryText, "U");
   const oe = stringValue(dictionaryText, "OE");
@@ -156,10 +159,12 @@ async function authenticateR4({ fields, structure, password, diagnosis }) {
 }
 
 /**
- * Revision 6's /O, /U, /OE, /UE, /Perms are each a fixed, exact byte length (ISO
- * 32000-2 §7.6.4.4.6-4.4.8); a PDF whose Encrypt dictionary has one of these fields
- * at any other length is malformed (or the field is missing outright, read as
- * `null` by stringValue()) -- never truncated or otherwise guessed at to fit.
+ * Revision 6's /OE, /UE, /Perms are each a fixed, exact byte length (ISO 32000-2
+ * §7.6.4.4.6-4.4.8); a PDF whose Encrypt dictionary has one of these fields at any
+ * other length is malformed (or the field is missing outright, read as `null` by
+ * stringValue()) -- never truncated or otherwise guessed at to fit. /O and /U are
+ * NOT read through this: see normalizeR6Field() below, which tolerates one narrow,
+ * real-world zero-padding form for those two specifically.
  */
 function requireR6FieldLength(bytes, expectedLength, name, diagnosis) {
   if (!bytes || bytes.length !== expectedLength) {
@@ -168,20 +173,52 @@ function requireR6FieldLength(bytes, expectedLength, name, diagnosis) {
   return bytes;
 }
 
+/**
+ * Wraps standard-r6.js's normalizeR6ValidationEntry() (the actual zero-padding
+ * compatibility logic -- see its own docstring) so a rejection surfaces the same
+ * way every other out-of-scope/malformed-field error in this module does: prefixed
+ * "Encrypted PDFs are not supported (...)" and carrying `diagnosis`, so
+ * classifyError() in the browser PoC and any other caller keeps recognising it as
+ * an encryption failure. This function adds no normalization logic of its own.
+ */
+function normalizeR6Field(bytes, name, diagnosis) {
+  try {
+    return normalizeR6ValidationEntry(bytes, name);
+  } catch (error) {
+    throw encryptionError(error.message, diagnosis);
+  }
+}
+
+/** The subset of normalizeR6ValidationEntry()'s result safe to surface for
+ * diagnostics/UI (e.g. "/U: 127 bytes -> 48 bytes, zero-padding compatibility
+ * applied") -- deliberately excludes `.bytes` itself, which is real key-derivation
+ * input material and must never reach a log, an error message, or the UI. */
+function normalizationSummary(normalization) {
+  const { rawLength, normalizedLength, zeroPaddingCompatibilityApplied } = normalization;
+  return { rawLength, normalizedLength, zeroPaddingCompatibilityApplied };
+}
+
 async function authenticateR6({ fields, password, diagnosis }) {
-  const o = requireR6FieldLength(fields.o, 48, "O", diagnosis);
-  const u = requireR6FieldLength(fields.u, 48, "U", diagnosis);
+  // /U is needed unconditionally (both the user-password branch and, mixed in, the
+  // owner-password branch use it), so it is normalized eagerly. /O is only ever
+  // needed if user authentication does not succeed -- normalizing (and therefore
+  // validating) it eagerly as well would reject a PDF over a malformed /O it might
+  // never actually need, purely because /O happens to come first in the dictionary.
+  const uNormalization = normalizeR6Field(fields.u, "U", diagnosis);
   const oe = requireR6FieldLength(fields.oe, 32, "OE", diagnosis);
   const ue = requireR6FieldLength(fields.ue, 32, "UE", diagnosis);
   const perms = requireR6FieldLength(fields.perms, 16, "Perms", diagnosis);
 
-  const userAttempt = await tryAuthenticate(authenticateUserPasswordR6, { password: password ?? "", u, ue });
-  const outcome = userAttempt.success
-    ? { authType: "user", fileKey: userAttempt.fileKey }
-    : await (async () => {
-      const ownerAttempt = await tryAuthenticate(authenticateOwnerPasswordR6, { password: password ?? "", o, oe, u });
-      return ownerAttempt.success ? { authType: "owner", fileKey: ownerAttempt.fileKey } : null;
-    })();
+  const userAttempt = await tryAuthenticate(authenticateUserPasswordR6, { password: password ?? "", u: fields.u, ue });
+  let outcome = null;
+  let oNormalization = null;
+  if (userAttempt.success) {
+    outcome = { authType: "user", fileKey: userAttempt.fileKey };
+  } else {
+    oNormalization = normalizeR6Field(fields.o, "O", diagnosis);
+    const ownerAttempt = await tryAuthenticate(authenticateOwnerPasswordR6, { password: password ?? "", o: fields.o, oe, u: fields.u });
+    if (ownerAttempt.success) outcome = { authType: "owner", fileKey: ownerAttempt.fileKey };
+  }
   if (!outcome) return null;
 
   // A password hash matching /U or /O is not, on its own, proof that the recovered
@@ -191,7 +228,13 @@ async function authenticateR6({ fields, password, diagnosis }) {
   // authentication means something is inconsistent about the PDF or the recovered
   // key itself; this never silently continues to decrypt content with that key.
   validatePerms(outcome.fileKey, perms, fields.p, fields.encryptMetadata);
-  return outcome;
+  return {
+    ...outcome,
+    validationEntryNormalization: {
+      U: normalizationSummary(uNormalization),
+      O: oNormalization ? normalizationSummary(oNormalization) : null
+    }
+  };
 }
 
 /**
@@ -257,7 +300,12 @@ export async function authenticateEncryptedPdf(structure, password) {
     cryptFilters: fields.cryptFilters,
     diagnosis,
     revision: configuration.revision,
-    encryptionMethod: configuration.cfm
+    encryptionMethod: configuration.cfm,
+    // R6 only (undefined for R4): length-only metadata about the zero-padding
+    // compatibility normalization applied to /O//U, if any -- see
+    // normalizeR6ValidationEntry() in standard-r6.js. Never includes the bytes
+    // themselves; safe to surface in a UI's debug details.
+    validationEntryNormalization: outcome.validationEntryNormalization
   };
 }
 

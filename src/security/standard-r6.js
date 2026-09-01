@@ -240,11 +240,81 @@ function requireLength(bytes, expected, name) {
   }
 }
 
+// ISO 32000-2 fixes /O and /U at exactly 48 bytes. Some real-world PDF writers
+// instead pad them to a fixed, longer buffer size with trailing 0x00 bytes -- a
+// PDF this engine has actually needed to open used 127 bytes (48 valid bytes plus
+// 79 zero bytes). This is NOT stringprep/SASLprep padding and has nothing to do
+// with the password: it is purely a quirk of how some writers serialize these two
+// particular fixed-size binary strings. `zeroPaddingCompatibilityLimit` bounds how
+// far this compatibility reading extends -- past it, a long /O or /U is malformed,
+// never silently truncated.
+const R6_VALIDATION_ENTRY_LENGTH = 48;
+const R6_VALIDATION_ENTRY_ZERO_PADDING_LIMIT = 128;
+
+/**
+ * Normalizes a raw /O or /U value to the spec's 48 bytes, accepting -- and ONLY
+ * accepting -- one specific, narrow compatibility form on top of the exact-48-byte
+ * case: a longer buffer (49 to 128 bytes) whose bytes from index 48 onward are
+ * entirely 0x00. Anything else (shorter than 48, longer than 128, or a 49-128 byte
+ * value with even one non-zero trailing byte) is rejected explicitly -- this is
+ * deliberately not "trim trailing NUL bytes" as a general string operation, which
+ * would risk quietly corrupting a genuinely different value that just happens to
+ * end in 0x00; it only ever discards bytes past position 48 once every one of them
+ * has already been confirmed to be exactly 0x00.
+ *
+ * This normalization is intentionally scoped to /O and /U alone (see the docstrings
+ * on authenticateUserPasswordR6()/authenticateOwnerPasswordR6() below for where
+ * it's applied) -- /OE, /UE, and /Perms keep their own strict, non-negotiable
+ * requireLength() checks (32, 32, 16 bytes) elsewhere in this module, R4's /O and
+ * /U are a completely different code path (standard-r4.js) this function is never
+ * called from, and nothing calls this from the general-purpose PDF string parser
+ * (src/pdf-dictionary-text.js) at all -- padding tolerance is a revision-6-specific,
+ * /O//U-specific compatibility decision, not a general "trim trailing NUL" rule
+ * that every PDF binary string would then silently be subject to.
+ *
+ * Returns `{ bytes, rawLength, normalizedLength, zeroPaddingCompatibilityApplied }`
+ * -- `bytes` is always exactly 48 bytes (a subarray view onto the input, not a
+ * copy, and never mutated in place); the other three fields are metadata a caller
+ * may surface for diagnostics (e.g. "/U: 127 bytes -> 48 bytes, zero-padding
+ * compatibility applied"), not anything security-sensitive on their own.
+ */
+export function normalizeR6ValidationEntry(bytes, name) {
+  if (!bytes || bytes.length < R6_VALIDATION_ENTRY_LENGTH) {
+    throw new Error(`Malformed /${name}: expected 48 bytes, got ${bytes ? bytes.length : "none"}`);
+  }
+  if (bytes.length === R6_VALIDATION_ENTRY_LENGTH) {
+    return { bytes, rawLength: 48, normalizedLength: 48, zeroPaddingCompatibilityApplied: false };
+  }
+  if (bytes.length > R6_VALIDATION_ENTRY_ZERO_PADDING_LIMIT) {
+    throw new Error(
+      `Malformed /${name}: expected 48 bytes, got ${bytes.length} ` +
+      `(exceeds the ${R6_VALIDATION_ENTRY_ZERO_PADDING_LIMIT}-byte zero-padding compatibility limit)`
+    );
+  }
+  const tail = bytes.subarray(R6_VALIDATION_ENTRY_LENGTH);
+  if (!tail.every((byte) => byte === 0)) {
+    throw new Error(
+      `Malformed /${name}: expected 48 bytes, got ${bytes.length} with non-zero trailing bytes ` +
+      "(not a recognized zero-padding compatibility form)"
+    );
+  }
+  return {
+    bytes: bytes.subarray(0, R6_VALIDATION_ENTRY_LENGTH),
+    rawLength: bytes.length,
+    normalizedLength: 48,
+    zeroPaddingCompatibilityApplied: true
+  };
+}
+
 /**
  * Authenticates a candidate user password against /U (ISO 32000-2 Algorithm 2.A,
  * user-password branch) and, on success, recovers the 32-byte file encryption key
- * from /UE. /U is 48 bytes: [0:32) the validation hash, [32:40) the validation
- * salt, [40:48) the key salt (ISO 32000-2 §7.6.4.4.6/4.7's "Algorithm 8" layout).
+ * from /UE. `u` is normalized to 48 bytes first (see normalizeR6ValidationEntry()
+ * above -- accepting the one specific zero-padded compatibility form some real PDF
+ * writers use, on top of the exact-48-byte case); the resulting 48-byte value is
+ * then read per spec: [0:32) the validation hash, [32:40) the validation salt,
+ * [40:48) the key salt (ISO 32000-2 §7.6.4.4.6/4.7's "Algorithm 8" layout). `ue`
+ * keeps its own strict, non-negotiable 32-byte check -- no padding tolerance.
  *
  * Recovering the file key: a second Algorithm 2.B run, keyed by the *key* salt
  * (not the validation salt), produces a 32-byte "intermediate key" used as an
@@ -255,13 +325,13 @@ function requireLength(bytes, expected, name) {
  * this function's success alone being trusted as proof of the *right* key.
  */
 export async function authenticateUserPasswordR6({ password, u, ue }) {
-  requireLength(u, 48, "U");
+  const normalizedU = normalizeR6ValidationEntry(u, "U").bytes;
   requireLength(ue, 32, "UE");
   const passwordBytes = preprocessR6Password(password);
-  const validationSalt = u.subarray(32, 40);
-  const keySalt = u.subarray(40, 48);
+  const validationSalt = normalizedU.subarray(32, 40);
+  const keySalt = normalizedU.subarray(40, 48);
   const validationHash = await algorithm2B(passwordBytes, validationSalt, null);
-  const success = constantTimeEqual(validationHash, u.subarray(0, 32));
+  const success = constantTimeEqual(validationHash, normalizedU.subarray(0, 32));
   if (!success) return { success: false, fileKey: null };
   const intermediateKey = await algorithm2B(passwordBytes, keySalt, null);
   const fileKey = aesCbcNoPaddingDecrypt(intermediateKey, new Uint8Array(16), ue);
@@ -275,18 +345,25 @@ export async function authenticateUserPasswordR6({ password, u, ue }) {
  * every Algorithm 2.B call additionally mixes in the full 48-byte /U string (per
  * spec -- owner-password hashing always includes it, user-password hashing never
  * does), and the salts/ciphertext come from /O/OE instead of /U/UE.
+ *
+ * Both `o` and `u` go through normalizeR6ValidationEntry() before use -- `u` too,
+ * and this matters: a raw, still zero-padded 127/128-byte /U mixed directly into
+ * Algorithm 2.B (instead of its normalized 48-byte form) would compute a hash that
+ * matches neither this PDF's real /O (owner-hash mismatch, so owner authentication
+ * would simply fail even with the right password) nor, via /OE, the right file
+ * key. `oe` keeps its own strict 32-byte check, same as the user branch's `ue`.
  */
 export async function authenticateOwnerPasswordR6({ password, o, oe, u }) {
-  requireLength(o, 48, "O");
+  const normalizedO = normalizeR6ValidationEntry(o, "O").bytes;
+  const normalizedU = normalizeR6ValidationEntry(u, "U").bytes;
   requireLength(oe, 32, "OE");
-  requireLength(u, 48, "U");
   const passwordBytes = preprocessR6Password(password);
-  const validationSalt = o.subarray(32, 40);
-  const keySalt = o.subarray(40, 48);
-  const validationHash = await algorithm2B(passwordBytes, validationSalt, u);
-  const success = constantTimeEqual(validationHash, o.subarray(0, 32));
+  const validationSalt = normalizedO.subarray(32, 40);
+  const keySalt = normalizedO.subarray(40, 48);
+  const validationHash = await algorithm2B(passwordBytes, validationSalt, normalizedU);
+  const success = constantTimeEqual(validationHash, normalizedO.subarray(0, 32));
   if (!success) return { success: false, fileKey: null };
-  const intermediateKey = await algorithm2B(passwordBytes, keySalt, u);
+  const intermediateKey = await algorithm2B(passwordBytes, keySalt, normalizedU);
   const fileKey = aesCbcNoPaddingDecrypt(intermediateKey, new Uint8Array(16), oe);
   return { success: true, fileKey };
 }
