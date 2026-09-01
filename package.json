@@ -11,13 +11,32 @@
       "import": "./src/index.js"
     }
   },
-  "files": ["src", "README.md", "LICENSE"],
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
+    "pretest": "npm run build",
     "test": "node --test",
     "check": "for file in src/*.js scripts/*.js web/*.js test/*.js; do node --check \"$file\"; done",
+    "build": "node scripts/build.js",
+    "sync-version": "node scripts/sync-version.js",
     "assess:corpus": "node scripts/assess-corpus.js"
   },
-  "keywords": ["pdf", "offline", "browser", "text-editing"],
+  "keywords": [
+    "pdf",
+    "offline",
+    "browser",
+    "text-editing"
+  ],
   "license": "MIT",
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "playwright": "1.56.0"
+  }
 }
