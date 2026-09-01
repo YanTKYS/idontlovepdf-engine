@@ -127,7 +127,11 @@ console.log(ENGINE_VERSION); // 例: "0.2.0"
 
 ### distの管理方針
 
-`dist/idontlovepdf-engine.js` は Git 管理せず（`.gitignore` 対象）、代わりに **`v*` タグを push した際に GitHub Actions（`.github/workflows/release.yml`）が build し、GitHub Release の asset として配布**します。理由は、bundle は `src/` から機械的に再生成できる成果物であり、Git 管理するとタグ・コミットのたびに再生成物の差分がリポジトリ履歴を占有すること、また特定バージョンの bundle は Release から一意に取得できれば十分なためです。`idontlovepdf-engine.js.sha256` も同じ Release に添付します。CI（`.github/workflows/ci.yml`）は push・PR ごとに `npm run build` が成功することと `dist/idontlovepdf-engine.js` が生成されることを確認します。
+`dist/idontlovepdf-engine.js` は Git 管理せず（`.gitignore` 対象）、GitHub Release のassetとして配布します。bundleは`src/`から機械的に再生成できるため、生成物の差分をリポジトリ履歴へ積み上げません。`idontlovepdf-engine.js.sha256`も同じReleaseに添付します。CI（`.github/workflows/ci.yml`）はpush・PRごとに`npm run build`が成功することと`dist/idontlovepdf-engine.js`が生成されることを確認します。
+
+ReleaseはGitHubの **Actions → Release → Run workflow** から実行し、`tag`（例: `v0.2.0`）を入力します。workflowは正式な`main`をcheckoutし、`package.json`とのversion整合性確認、release note抽出、test/buildの完了後にtagとGitHub Releaseを作成します。そのため、tagを事前に作成またはpushする必要はありません。
+
+GitHub Releaseのtitleと本文のsource of truthは[`docs/release-notes.md`](docs/release-notes.md)です。Release前に対象versionのH2 sectionを同ファイルの先頭側へ追加してください。workflowは対象H2の内容をtitle、その配下から次のH2直前までをbodyとして使用します。
 
 ## 対応browser API
 

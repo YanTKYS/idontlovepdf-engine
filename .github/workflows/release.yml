@@ -1,15 +1,10 @@
 name: Release
 
-# Builds dist/idontlovepdf-engine.js and attaches it to a GitHub Release whenever a
-# `v*` tag is pushed, so a specific engine version's bundle can always be fetched
-# again later (see "distの管理方針" / "Distribution policy" in README.md).
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build and publish (for example, v0.3.0)
+        description: Release tag (for example, v0.2.0 or 0.2.0)
         required: true
         type: string
 
@@ -20,31 +15,83 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # A manual run starts from a branch by default, so explicitly check out
-          # the release tag supplied by the operator.
-          ref: ${{ env.RELEASE_TAG }}
+          ref: main
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
-      - name: Verify the pushed tag matches package.json's version
-        # Guards against e.g. pushing tag v0.3.0 while package.json (and therefore
-        # the bundle's ENGINE_VERSION, synced from it) still says 0.2.0 -- that
-        # would attach a mislabeled bundle to the v0.3.0 Release.
+      - name: Normalize the release tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          release_version="${INPUT_TAG#v}"
+          if [ -z "$release_version" ]; then
+            echo "::error::A release tag is required."
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=v$release_version" >> "$GITHUB_ENV"
+
+      - name: Verify the tag matches package.json's version
         run: |
           pkg_version="$(node -p "require('./package.json').version")"
-          expected_tag="v${pkg_version}"
-          if [ "$RELEASE_TAG" != "$expected_tag" ]; then
-            echo "::error::Tag '$RELEASE_TAG' does not match package.json's version ($pkg_version, expected tag $expected_tag)."
+          if [ "$RELEASE_VERSION" != "$pkg_version" ]; then
+            echo "::error::Tag '$RELEASE_TAG' does not match package.json version '$pkg_version'."
             exit 1
           fi
           echo "Tag $RELEASE_TAG matches package.json version $pkg_version"
+
+      - name: Extract release notes
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          import sys
+          import uuid
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          notes_path = Path("docs/release-notes.md")
+          lines = notes_path.read_text(encoding="utf-8").splitlines()
+          heading_pattern = re.compile(
+              rf"^##\s+({re.escape(tag)}(?:\s+-\s+.+)?)\s*$"
+          )
+
+          start = None
+          title = None
+          for index, line in enumerate(lines):
+              match = heading_pattern.match(line)
+              if match:
+                  start = index + 1
+                  title = match.group(1)
+                  break
+
+          if start is None:
+              print(
+                  f"::error::Tag '{tag}' not found in docs/release-notes.md",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          end = next(
+              (index for index in range(start, len(lines)) if lines[index].startswith("## ")),
+              len(lines),
+          )
+          body = "\n".join(lines[start:end]).strip()
+          Path("release_body.txt").write_text(body + "\n", encoding="utf-8")
+
+          delimiter = f"RELEASE_TITLE_{uuid.uuid4().hex}"
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env_file:
+              env_file.write(f"RELEASE_TITLE<<{delimiter}\n{title}\n{delimiter}\n")
+          PY
 
       - name: Install dependencies
         run: npm ci
@@ -70,11 +117,18 @@ jobs:
       - name: Checksum the bundle
         run: sha256sum dist/idontlovepdf-engine.js | awk '{print $1}' > dist/idontlovepdf-engine.js.sha256
 
-      - name: Publish the GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          files: |
-            dist/idontlovepdf-engine.js
+      - name: Replace the release tag at main HEAD
+        run: |
+          gh release delete "$RELEASE_TAG" --yes || true
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa "$RELEASE_TAG" -m "Release $RELEASE_TAG"
+          git push -f origin "refs/tags/$RELEASE_TAG"
+
+      - name: Create the GitHub Release
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TITLE" \
+            --notes-file release_body.txt \
+            dist/idontlovepdf-engine.js \
             dist/idontlovepdf-engine.js.sha256
-          generate_release_notes: true
