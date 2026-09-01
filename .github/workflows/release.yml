@@ -6,6 +6,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and publish (for example, v0.3.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,8 +19,14 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A manual run starts from a branch by default, so explicitly check out
+          # the release tag supplied by the operator.
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: actions/setup-node@v4
         with:
@@ -28,11 +40,11 @@ jobs:
         run: |
           pkg_version="$(node -p "require('./package.json').version")"
           expected_tag="v${pkg_version}"
-          if [ "${{ github.ref_name }}" != "$expected_tag" ]; then
-            echo "::error::Tag '${{ github.ref_name }}' does not match package.json's version ($pkg_version, expected tag $expected_tag)."
+          if [ "$RELEASE_TAG" != "$expected_tag" ]; then
+            echo "::error::Tag '$RELEASE_TAG' does not match package.json's version ($pkg_version, expected tag $expected_tag)."
             exit 1
           fi
-          echo "Tag ${{ github.ref_name }} matches package.json version $pkg_version"
+          echo "Tag $RELEASE_TAG matches package.json version $pkg_version"
 
       - name: Install dependencies
         run: npm ci
@@ -61,6 +73,7 @@ jobs:
       - name: Publish the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             dist/idontlovepdf-engine.js
             dist/idontlovepdf-engine.js.sha256
