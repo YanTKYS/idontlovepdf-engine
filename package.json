@@ -1,7 +1,7 @@
 {
-  "name": "@idontlovepdf/local-text-editor",
+  "name": "@idontlovepdf/engine",
   "version": "0.2.0",
-  "description": "Offline, browser-native prototype for replacing text in existing PDF content streams",
+  "description": "Offline, browser-native engine for replacing text in existing PDF content streams",
   "type": "module",
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -19,8 +19,10 @@
   ],
   "scripts": {
     "pretest": "npm run build",
-    "test": "node --test",
-    "check": "for file in src/*.js scripts/*.js web/*.js test/*.js; do node --check \"$file\"; done",
+    "test": "node --test 'test/*.test.js'",
+    "pretest:browser": "npm run build",
+    "test:browser": "node --test 'test/browser/*.test.js'",
+    "check": "for file in src/*.js scripts/*.js web/*.js test/*.js test/browser/*.js; do node --check \"$file\"; done",
     "build": "node scripts/build.js",
     "sync-version": "node scripts/sync-version.js",
     "assess:corpus": "node scripts/assess-corpus.js"

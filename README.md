@@ -39,7 +39,7 @@
 外部リポジトリ（`idontlovepdf` を含む）から利用してよいのは `src/index.js`（および bundle 後の `dist/idontlovepdf-engine.js`）が export する、以下の**正式公開 API のみ**です。
 
 ```ts
-import { PdfTextEditor, ENGINE_VERSION } from "@idontlovepdf/local-text-editor"; // またはbundle経由
+import { PdfTextEditor, ENGINE_VERSION } from "@idontlovepdf/engine"; // またはbundle経由
 ```
 
 - `new PdfTextEditor(bytes)`
@@ -178,7 +178,7 @@ console.log(ENGINE_VERSION); // 例: "0.2.0"
 5. 一致を1件選ぶと置換後テキスト欄にその一致テキストが入り、置換後の文字列を編集できる
 6. 「置換してPDFを保存」を押すと、`replaceText()` → `save()` → 保存結果の再読込確認（reopen）の順に検証し、成功した場合だけ`元ファイル名.edited.pdf`としてローカル保存する
 
-暗号化PDF（対応範囲: `Standard`/`V4`/`R4`/`AESV2`または`Identity`）は、空passwordでの自動認証 → 失敗時はパスワード入力欄を表示、という流れです。入力したパスワードは送信・保存されません。対応範囲外（`/R 2`・`/R 3`・`/R 5`・`/AESV3`・`/Adobe.PubSec`など）は診断専用の画面になります。
+暗号化PDF（対応範囲: `Standard`/`V4`/`R4`/`AESV2`、および`Standard`/`V5`/`R6`/`AESV3`〈AES-256〉。いずれも`Identity`との併用可）は、空passwordでの自動認証 → 失敗時はパスワード入力欄を表示、という流れです。入力したパスワードは送信・保存されません。対応範囲外（`/R 2`・`/R 3`・`/R 5`・`/Adobe.PubSec`など）は診断専用の画面になります。
 
 ### 複数PDF corpus評価
 
@@ -207,14 +207,20 @@ python3 -m http.server 8000
 
 ```sh
 npm ci
-npm test        # node --test。pretestでdist/を自動ビルドし、dist経由のbundle smoke test / fixture testも実行
-npm run check   # src/・scripts/・web/・test/ の構文検査
-npm run build   # dist/idontlovepdf-engine.js を生成
+npm test              # node --test（test/*.test.js のみ）。pretestでdist/を自動ビルドし、dist経由のfixture testも実行
+npm run check         # src/・scripts/・web/・test/ の構文検査
+npm run build         # dist/idontlovepdf-engine.js を生成
 ```
 
-`npm test`には、bundle自体を対象にした以下のテストを含みます。
+**`npm ci && npm test`だけで、追加インストールなしに上記が再現できます。** `npm test`が対象にする`test/*.test.js`（サブディレクトリを含みません）は Node 標準APIのみで完結し、`test/dist-bundle.test.js`（後述）を含め Playwright は必要ありません。
 
-- `test/browser-smoke.test.js`: Playwright（Chromium、headless）で`dist/idontlovepdf-engine.js`を実際のbrowserへ`import`し、`PdfTextEditor`・`ENGINE_VERSION`のexportと、最小PDFの`listTextRuns()`成功までを確認します
-- `test/dist-bundle.test.js`: 通常PDF・xref stream・Object Stream・ToUnicode日本語という代表的な組み合わせを、`src/index.js`ではなく`dist/idontlovepdf-engine.js`からimportした`PdfTextEditor`で処理し、bundle化によって主要機能が壊れていないことを確認します
+```sh
+npx playwright install chromium   # 初回のみ（ローカルにChromiumがない場合）
+npm run test:browser              # node --test（test/browser/*.test.js）。pretest:browserでdist/を自動ビルド
+```
+
+`test/browser/smoke.test.js`は実際のheadless Chromium（Playwright）で`dist/idontlovepdf-engine.js`をbrowserへ`import`し、`PdfTextEditor`・`ENGINE_VERSION`のexportと、最小PDFの`listTextRuns()`成功までを確認します。Playwrightのbrowser本体は`npm ci`だけでは用意されないため、`npm test`（Node専用）とは別の`npm run test:browser`に分離しています。CIでは`npm test` → `npx playwright install --with-deps chromium` → `npm run test:browser`の順で両方とも実行します（`.github/workflows/ci.yml`）。
+
+`test/dist-bundle.test.js`は通常PDF・xref stream・Object Stream・ToUnicode日本語という代表的な組み合わせを、`src/index.js`ではなく`dist/idontlovepdf-engine.js`からimportした`PdfTextEditor`で処理し、bundle化によって主要機能が壊れていないことを確認します（Node専用APIのみで完結するため`npm test`に含まれます）。
 
 `web/poc-core.js`と`web/text-search.js`はどちらもDOMに依存しないため、ブラウザPoCの純粋関数は`test/browser-poc.test.js`と`test/text-search.test.js`でNodeから直接検証しています。DOMテスト環境は追加していません。

@@ -4,10 +4,11 @@
 // PDF and list its text runs -- all inside the page, with no Node APIs involved. This
 // is deliberately not a string search over the bundle's source text.
 //
-// Run `npm run build` first (the "pretest" npm script does this automatically for
-// `npm test`). Playwright's Chromium browser must be available locally -- see
-// PLAYWRIGHT_BROWSERS_PATH in this project's CI workflow (.github/workflows/ci.yml)
-// or run `npx playwright install chromium` locally.
+// Run via `npm run test:browser` (its "pretest:browser" hook builds dist/ first).
+// This is kept separate from the plain `npm test` (Node-only) suite because it needs
+// Playwright's Chromium browser installed, which `npm ci` alone does not provide --
+// run `npx playwright install chromium` locally, or see this project's CI workflow
+// (.github/workflows/ci.yml) for the exact install step.
 import assert from "node:assert/strict";
 import { createReadStream, existsSync } from "node:fs";
 import http from "node:http";
@@ -17,7 +18,7 @@ import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright";
 
-const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const root = path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
 const distFile = path.join(root, "dist/idontlovepdf-engine.js");
 
 /** Serves dist/idontlovepdf-engine.js and an inline HTML harness over plain HTTP,

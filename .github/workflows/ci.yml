@@ -19,11 +19,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run tests (Node)
+        run: npm test
+
       - name: Install Playwright's Chromium (used by the browser bundle smoke test)
         run: npx playwright install --with-deps chromium
 
-      - name: Run tests
-        run: npm test
+      - name: Run browser smoke test
+        run: npm run test:browser
 
       - name: Type/syntax check
         run: npm run check

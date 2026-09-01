@@ -6,8 +6,8 @@
 // The bundle's only runtime dependencies are browser-native APIs (Uint8Array,
 // TextEncoder/TextDecoder, CompressionStream/DecompressionStream, crypto.subtle);
 // nothing from Node (node:crypto, node:zlib, Buffer, ...) is reachable from
-// src/index.js, so none of it ends up in the bundle. See test/dist-bundle-node.test.js
-// and test/dist-bundle-browser.test.js for the checks that back this up.
+// src/index.js, so none of it ends up in the bundle. See test/dist-bundle.test.js
+// and test/browser/smoke.test.js for the checks that back this up.
 import { build } from "esbuild";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
