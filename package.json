@@ -1,7 +1,7 @@
 {
-  "name": "@idontlovepdf/local-text-editor",
+  "name": "@idontlovepdf/engine",
   "version": "0.2.0",
-  "description": "Offline, browser-native prototype for replacing text in existing PDF content streams",
+  "description": "Offline, browser-native engine for replacing text in existing PDF content streams",
   "type": "module",
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -11,13 +11,34 @@
       "import": "./src/index.js"
     }
   },
-  "files": ["src", "README.md", "LICENSE"],
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "node --test",
-    "check": "for file in src/*.js scripts/*.js web/*.js test/*.js; do node --check \"$file\"; done",
+    "pretest": "npm run build",
+    "test": "node --test \"test/*.test.js\"",
+    "pretest:browser": "npm run build",
+    "test:browser": "node --test \"test/browser/*.test.js\"",
+    "check": "for file in src/*.js scripts/*.js web/*.js test/*.js test/browser/*.js; do node --check \"$file\"; done",
+    "build": "node scripts/build.js",
+    "sync-version": "node scripts/sync-version.js",
     "assess:corpus": "node scripts/assess-corpus.js"
   },
-  "keywords": ["pdf", "offline", "browser", "text-editing"],
+  "keywords": [
+    "pdf",
+    "offline",
+    "browser",
+    "text-editing"
+  ],
   "license": "MIT",
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "playwright": "1.56.0"
+  }
 }

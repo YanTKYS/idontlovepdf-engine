@@ -1,0 +1,67 @@
+name: Release
+
+# Builds dist/idontlovepdf-engine.js and attaches it to a GitHub Release whenever a
+# `v*` tag is pushed, so a specific engine version's bundle can always be fetched
+# again later (see "distの管理方針" / "Distribution policy" in README.md).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify the pushed tag matches package.json's version
+        # Guards against e.g. pushing tag v0.3.0 while package.json (and therefore
+        # the bundle's ENGINE_VERSION, synced from it) still says 0.2.0 -- that
+        # would attach a mislabeled bundle to the v0.3.0 Release.
+        run: |
+          pkg_version="$(node -p "require('./package.json').version")"
+          expected_tag="v${pkg_version}"
+          if [ "${{ github.ref_name }}" != "$expected_tag" ]; then
+            echo "::error::Tag '${{ github.ref_name }}' does not match package.json's version ($pkg_version, expected tag $expected_tag)."
+            exit 1
+          fi
+          echo "Tag ${{ github.ref_name }} matches package.json version $pkg_version"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests (Node)
+        run: npm test
+
+      - name: Install Playwright's Chromium (used by the browser bundle smoke test)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser smoke test
+        run: npm run test:browser
+
+      - name: Type/syntax check
+        run: npm run check
+
+      - name: Build the browser bundle
+        run: npm run build
+
+      - name: Verify the bundle was produced
+        run: test -s dist/idontlovepdf-engine.js
+
+      - name: Checksum the bundle
+        run: sha256sum dist/idontlovepdf-engine.js | awk '{print $1}' > dist/idontlovepdf-engine.js.sha256
+
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/idontlovepdf-engine.js
+            dist/idontlovepdf-engine.js.sha256
+          generate_release_notes: true

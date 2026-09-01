@@ -1,3 +1,6 @@
+/** The engine's version, synced from package.json's "version" at build time (see scripts/sync-version.js). */
+export const ENGINE_VERSION: string;
+
 export interface PdfTextRun {
   readonly id: string;
   readonly objectNumber: number;
