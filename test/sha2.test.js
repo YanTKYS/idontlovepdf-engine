@@ -10,32 +10,18 @@ import { createHash, randomBytes } from "node:crypto";
 import test from "node:test";
 
 import { sha256, sha256Hex } from "../src/sha2.js";
-
-const secureContextCrypto = globalThis.crypto;
-
-/** Runs `body` with `crypto.subtle` unavailable, as it is on a page served over plain HTTP. */
-async function withoutWebCrypto(body) {
-  Object.defineProperty(globalThis, "crypto", {
-    configurable: true,
-    value: { getRandomValues: (array) => secureContextCrypto.getRandomValues(array) }
-  });
-  try {
-    assert.equal(globalThis.crypto.subtle, undefined, "the substitution must have taken effect");
-    return await body();
-  } finally {
-    Object.defineProperty(globalThis, "crypto", { configurable: true, value: secureContextCrypto });
-  }
-}
+import { withWebCrypto, withoutWebCrypto } from "./helpers/web-crypto.js";
 
 const LENGTHS = [0, 1, 31, 32, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 1000, 65_536, 4_667_376];
 const hex = (bytes) => [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 
 test("Web Crypto path matches node:crypto across the block and length-field boundaries", async () => {
-  assert.ok(globalThis.crypto?.subtle, "this test needs a Secure Context to be testing anything");
-  for (const length of LENGTHS) {
-    const bytes = new Uint8Array(randomBytes(length));
-    assert.equal(hex(await sha256(bytes)), createHash("sha256").update(bytes).digest("hex"), `length ${length}`);
-  }
+  await withWebCrypto(async () => {
+    for (const length of LENGTHS) {
+      const bytes = new Uint8Array(randomBytes(length));
+      assert.equal(hex(await sha256(bytes)), createHash("sha256").update(bytes).digest("hex"), `length ${length}`);
+    }
+  });
 });
 
 test("JavaScript path matches node:crypto across the same boundaries", async () => {
@@ -52,18 +38,22 @@ test("the two paths agree, so a digest written by one is recognised by the other
   // HTTPS has to match the one computed for the same font over HTTP, and the other way round.
   for (const length of LENGTHS) {
     const bytes = new Uint8Array(randomBytes(length));
-    const withWebCrypto = await sha256Hex(bytes);
+    const viaWebCrypto = await withWebCrypto(() => sha256Hex(bytes));
     const inJavaScript = await withoutWebCrypto(() => sha256Hex(bytes));
-    assert.equal(inJavaScript, withWebCrypto, `length ${length}`);
+    assert.equal(inJavaScript, viaWebCrypto, `length ${length}`);
   }
 });
 
 test("hex output is lowercase, zero-padded, and 64 characters", async () => {
-  for (const digest of [await sha256Hex(new Uint8Array(0)), await withoutWebCrypto(() => sha256Hex(new Uint8Array(0)))]) {
-    assert.equal(digest, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  const empty = new Uint8Array(0);
+  for (const run of [withWebCrypto, withoutWebCrypto]) {
+    assert.equal(await run(() => sha256Hex(empty)), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
   }
 });
 
-test("restores crypto after each helper call, so no later test runs blind", () => {
-  assert.ok(globalThis.crypto?.subtle, "crypto.subtle must be back");
+test("each helper puts back the crypto it found, so no later test runs blind", async () => {
+  const before = globalThis.crypto;
+  await withWebCrypto(() => {});
+  await withoutWebCrypto(() => {});
+  assert.equal(globalThis.crypto, before);
 });

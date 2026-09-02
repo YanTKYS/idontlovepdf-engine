@@ -22,7 +22,9 @@
 - **fontの埋め込みは1文書につき1回だけ**です。同一editor内はもちろん、`save()` → 開き直して置換を続けた場合も、engineが以前埋め込んだfontを検出して再利用します（widthsとToUnicode CMapだけを更新するため、2回目以降の保存の増分は数KBです）。1置換ごとにsave/reopenする利用でもファイルが膨らみません
 - 埋め込み済みfontの同一判定は **font programのSHA-256** で行います。既存fontへ書き足すということは、そのfontのglyph IDで新しい文字を書くことなので、同一familyの別ビルド（名前もサイズも同じでglyph番号が異なり得る）を取り違えると、後から追加した文字だけが別の字形になり得るためです。digestが一致しない場合は別fontとして追加で埋め込みます
 - ToUnicode CMapの `beginbfchar` を仕様どおり100件ずつに分割します（101件以上の1グループは不正）。1文書で100種類を超える文字をfallbackで使っても正しいCMapを生成します
-- browser bundle（`dist/idontlovepdf-engine.js`）から利用できます。font parserを含むため bundle は約116KB → 約472KBになりました
+- **HTTP運用（HTTPS化なし）を正式な動作要件としました。** `crypto.subtle`（Web Crypto API）は secure context 限定のため、庁内IISがHTTPで配信するページには存在しません（`localhost` / `127.0.0.1` は例外扱いのため、Node testもPlaywright testもこの状態を再現できていませんでした）。hash計算とAES-CBC復号は、Web Cryptoが使える環境ではWeb Cryptoを、使えない環境ではJavaScript実装を使うようになり、**fallback fontを含む全機能がHTTP配信下で動作します**。hashのJavaScript実装は自前実装ではなく [@noble/hashes](https://github.com/paulmillr/noble-hashes)（MIT、監査済、依存0）です
+- CIは全testを2回実行します（通常、およびprocessからWeb Cryptoを取り除いた状態）。`npm run test:no-subtle` としてローカルでも実行できます
+- browser bundle（`dist/idontlovepdf-engine.js`）から利用できます。font parserとhash実装を含むため bundle は約116KB → 約488KBになりました
 - v0.3.0の挙動を維持: 検索、同文字数multi-run置換、削除、単一run異文字数置換、`variable-length-safe`、opaque match ID・`MATCH_STALE`・`UNKNOWN_MATCH`、`/P` permission、暗号化PDFの保存制限、incremental update
 
 ## v0.3.0 - Safe variable-length multi-run replacement

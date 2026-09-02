@@ -307,7 +307,8 @@ adjustment の合計は、その数値が**どこに書かれているかによ�
 - entry point: `src/index.js`
 - format: ESM（`bundle: true`, `platform: "browser"`）
 - target: `es2022`
-- 実行時に必要なのは browser 標準 API（`Uint8Array`、`TextEncoder`/`TextDecoder`、`CompressionStream`/`DecompressionStream`、`crypto.subtle` = Web Crypto API）のみで、これらの独自 polyfill は含みません。対応していない古いブラウザでは、呼び出し側で必要な polyfill を用意してください
+- 実行時に必要なのは browser 標準 API（`Uint8Array`、`TextEncoder`/`TextDecoder`、`CompressionStream`/`DecompressionStream`）のみで、これらの独自 polyfill は含みません。対応していない古いブラウザでは、呼び出し側で必要な polyfill を用意してください
+- **`crypto.subtle`（Web Crypto API）は必須ではありません。** HTTP配信（secure contextではない）でも全機能が動作します。詳細は[HTTP配信での動作](#http配信での動作)を参照してください
 - CDN 参照・外部 API・license server などへの runtime 通信は一切行いません。選択した PDF は従来どおり browser 内だけで処理します
 
 ### `npm run build`
@@ -317,7 +318,7 @@ npm ci
 npm run build
 ```
 
-`scripts/build.js` が esbuild を実行し、`dist/idontlovepdf-engine.js` を生成します。`esbuild` は devDependency としてのみ使用し、生成物には含まれません（production/runtime 依存ではありません）。`opentype.js` は dependency で、bundle へ取り込まれます（この分、bundle は約 116KB から約 472KB になりました）。`npm test` は `pretest` npm script 経由でビルドを自動実行するため、`npm test` を一度実行すれば `dist/` は常に最新の状態になります。
+`scripts/build.js` が esbuild を実行し、`dist/idontlovepdf-engine.js` を生成します。`esbuild` は devDependency としてのみ使用し、生成物には含まれません（production/runtime 依存ではありません）。`opentype.js` と `@noble/hashes` は dependency で、bundle へ取り込まれます（この分、bundle は約 116KB から約 488KB になりました）。`npm test` は `pretest` npm script 経由でビルドを自動実行するため、`npm test` を一度実行すれば `dist/` は常に最新の状態になります。
 
 ### version 確認方法
 
@@ -345,9 +346,31 @@ GitHub Releaseのtitleと本文のsource of truthは[`docs/release-notes.md`](do
 - `Uint8Array`
 - `TextEncoder` / `TextDecoder`
 - `CompressionStream` / `DecompressionStream`（`/FlateDecode` の展開・生成）
-- Web Crypto API（`crypto.subtle`。AES-CBC 復号、R6 の hash 計算等）
 
 `node:crypto`・`node:zlib`・`Buffer` 等は `test/` 配下（fixture 構築用）と `scripts/assess-corpus.js`（Node CLI）でのみ使用し、`src/` および `dist/idontlovepdf-engine.js` には含まれません。
+
+Web Crypto API（`crypto.subtle`）は**あれば使う**位置づけで、必須ではありません（次節）。
+
+### HTTP配信での動作
+
+このengineは、庁内IISが**HTTPで**配信するページから利用されることを前提としています（HTTPS化は行いません）。
+
+`crypto.subtle` は [secure context](https://developer.mozilla.org/docs/Web/Security/Secure_Contexts) 限定のAPIで、HTTP配信のページには**存在しません**（`window.crypto` はあるが `window.crypto.subtle` が `undefined`）。そのため、hash計算とAES-CBC復号は次のように動作します。
+
+| 用途 | `crypto.subtle` あり | `crypto.subtle` なし（HTTP配信） |
+| --- | --- | --- |
+| fallback fontの同一判定（SHA-256） | Web Crypto | [@noble/hashes](https://github.com/paulmillr/noble-hashes)（`src/sha2.js`） |
+| 暗号化PDF R6 の Algorithm 2.B（SHA-256/384/512） | Web Crypto | 同上 |
+| 暗号化PDF AESV2/AESV3 の AES-CBC 復号 | Web Crypto | `src/security/aes-primitives.js`（FIPS 197 既知解ベクタで検証済）＋ PKCS#7 除去 |
+
+どちらの経路も同じ結果を返します。SHA-256のdigestが一致するため、HTTPS環境で埋め込んだfallback fontはHTTP環境からも同一と判定され、逆も同様です。
+
+`localhost` / `127.0.0.1` は secure context の例外扱いのため、Nodeのtestも Playwright（`127.0.0.1` 配信）のtestも、通常はWeb Cryptoが**使える**状態で動いてしまいます。これではHTTP配信を検証できないため、次を用意しています。
+
+- `npm run test:no-subtle` — process から Web Crypto を取り除いた状態で全testを実行します（CIでも通常実行と2回走ります）
+- `test/fallback-font-no-subtle.test.js` — `crypto.subtle` なしで `setFallbackFont()` → `令和 → しょうわ` → `save()` → 開き直しまでを検証します
+- `test/browser/fallback-font.test.js` — 同じ流れを、**配布bundleを読み込んだChromiumのページから `crypto.subtle` を取り除いた状態**で検証します
+- `test/sha2.test.js` / `test/aes.test.js` — 両経路の出力を `node:crypto`（OpenSSL）と、および相互に照合します
 
 ## モジュール構成（公開API / 内部実装）
 
@@ -361,6 +384,7 @@ GitHub Releaseのtitleと本文のsource of truthは[`docs/release-notes.md`](do
 | `src/predictor.js` | `/DecodeParms /Predictor`（TIFF・PNG）の解除 | 内部 |
 | `src/flate.js` | `/FlateDecode` の展開・`/Filter` 解釈 | 内部 |
 | `src/cmap.js` | `/ToUnicode` CMap の解析・エンコード/デコード | 内部 |
+| `src/sha2.js` | SHA-256/384/512（Web Cryptoがあればそれ、無ければ @noble/hashes） | 内部 |
 | `src/fallback-font.js` | fallback font の解析・PDF font object 生成（Type0/CIDFontType2/FontFile2/ToUnicode） | 内部 |
 | `src/content-stream.js` | content stream 内のテキスト表示オペランド・dictionary operand の走査 | 内部 |
 | `src/encryption.js` | `/Encrypt` 辞書の診断（復号は行わない） | 内部 |
@@ -421,6 +445,7 @@ python3 -m http.server 8000
 npm ci
 npm run test:font     # fallback font testが使う日本語font（BIZ UDGothic 1.05、約4.5MB）をtmp/へ取得。未取得だと該当testはskip
 npm test              # node --test（test/*.test.js のみ）。pretestでdist/を自動ビルドし、dist経由のfixture testも実行
+npm run test:no-subtle # 同じtestを、processからWeb Cryptoを取り除いた状態で実行（HTTP配信の再現）
 npm run check         # src/・scripts/・web/・test/ の構文検査
 npm run build         # dist/idontlovepdf-engine.js を生成
 ```
@@ -432,7 +457,7 @@ npx playwright install chromium   # 初回のみ（ローカルにChromiumがな
 npm run test:browser              # node --test（test/browser/*.test.js）。pretest:browserでdist/を自動ビルド
 ```
 
-`test/browser/smoke.test.js`は実際のheadless Chromium（Playwright）で`dist/idontlovepdf-engine.js`をbrowserへ`import`し、`PdfTextEditor`・`ENGINE_VERSION`のexportと、最小PDFの`listTextRuns()`成功、複数runへ分割された日本語（`令和6年度`）の`searchText()` → `replaceTextMatch()` → `save()` → reopen、および複数runにまたがる異文字数置換（`実績報告書` → `報告書`）を確認します。後者では保存したPDFをBlob URLとしてChromium自身のPDF viewerへ読み込ませ、engineとは無関係な実装が受け付けることも確認しています。Playwrightのbrowser本体は`npm ci`だけでは用意されないため、`npm test`（Node専用）とは別の`npm run test:browser`に分離しています。CIでは`npm test` → `npx playwright install --with-deps chromium` → `npm run test:browser`の順で両方とも実行します（`.github/workflows/ci.yml`）。
+`test/browser/smoke.test.js`は実際のheadless Chromium（Playwright）で`dist/idontlovepdf-engine.js`をbrowserへ`import`し、`PdfTextEditor`・`ENGINE_VERSION`のexportと、最小PDFの`listTextRuns()`成功、複数runへ分割された日本語（`令和6年度`）の`searchText()` → `replaceTextMatch()` → `save()` → reopen、および複数runにまたがる異文字数置換（`実績報告書` → `報告書`）を確認します。後者では保存したPDFをBlob URLとしてChromium自身のPDF viewerへ読み込ませ、engineとは無関係な実装が受け付けることも確認しています。Playwrightのbrowser本体は`npm ci`だけでは用意されないため、`npm test`（Node専用）とは別の`npm run test:browser`に分離しています。CIでは`npm test` → `npm run test:no-subtle` → `npx playwright install --with-deps chromium` → `npm run test:browser`の順ですべて実行します（`.github/workflows/ci.yml`）。
 
 `test/dist-bundle.test.js`は通常PDF・xref stream・Object Stream・ToUnicode日本語・複数runにまたがる`searchText()`/`checkTextMatchReplacement()`/`replaceTextMatch()`という代表的な組み合わせを、`src/index.js`ではなく`dist/idontlovepdf-engine.js`からimportした`PdfTextEditor`で処理し、bundle化によって主要機能が壊れていないことを確認します（Node専用APIのみで完結するため`npm test`に含まれます）。
 

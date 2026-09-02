@@ -43,6 +43,24 @@ jobs:
           fi
           grep -E '^# (tests|pass|skipped)' tmp/node-tests.log
 
+      # The engine is deployed on an intranet IIS serving plain HTTP, where `crypto.subtle`
+      # does not exist -- it is a Secure Context API, and `localhost`/`127.0.0.1` (all Node
+      # and Playwright ever use) are exempt from that rule. So the suite is run a second
+      # time with Web Crypto taken away from the process: nothing in src/ may depend on it.
+      - name: Run tests (Node, with no Web Crypto -- as on a plain-HTTP page)
+        run: |
+          set -o pipefail
+          npm run test:no-subtle 2>&1 | tee tmp/node-tests-no-subtle.log
+
+      - name: Verify no test was skipped without Web Crypto
+        run: |
+          if grep -qE '^# skipped [1-9]' tmp/node-tests-no-subtle.log; then
+            echo "::error::Tests were skipped -- the plain-HTTP run did not exercise everything."
+            grep -E '^# (tests|pass|fail|skipped)' tmp/node-tests-no-subtle.log
+            exit 1
+          fi
+          grep -E '^# (tests|pass|skipped)' tmp/node-tests-no-subtle.log
+
       - name: Install Playwright's Chromium (used by the browser bundle smoke test)
         run: npx playwright install --with-deps chromium
 
