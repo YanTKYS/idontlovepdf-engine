@@ -211,10 +211,50 @@ function withStreamContext(read, bytes, cursor, context) {
 }
 
 /**
+ * Operators that provably neither move the text cursor nor change the font in use, so
+ * two text-showing operators on either side of one still paint the same uninterrupted
+ * piece of running text. Everything *not* listed here breaks search continuity (see
+ * scanTextRuns() below): the list is an allow-list on purpose, so an operator this
+ * scanner has never been taught about can only ever cost a match, never invent one.
+ *
+ * - `Tc`/`Tw`/`Tz`/`Tr`: character/word spacing, horizontal scale, render mode. They
+ *   change how the following glyphs look or how wide they are, not where the text
+ *   object currently is; the run before and the run after remain the same line of text.
+ * - `TL`: sets the leading consumed by a later `T*`/`'`/`"`. Those operators break
+ *   continuity themselves (they are the ones that actually move); setting the value
+ *   does not.
+ * - colour operators: purely appearance.
+ * - marked-content operators: structural tagging (`/Span << /MCID 3 >> BDC` and the
+ *   like) wrapped around body text. Very common *inside* a single logical string, so
+ *   breaking on them would re-introduce exactly the bug this scanner exists to fix.
+ *
+ * Deliberately absent, and therefore continuity-breaking: `Ts` (text rise moves the
+ * baseline), `q`/`Q`/`cm` (the CTM they save/restore/change moves the text with it),
+ * `gs` (an ExtGState may carry its own /Font), and every path/XObject operator.
+ */
+const CONTINUITY_SAFE_OPERATORS = new Set([
+  "Tc", "Tw", "Tz", "Tr", "TL",
+  "g", "rg", "k", "cs", "sc", "scn", "G", "RG", "K", "CS", "SC", "SCN",
+  "BMC", "BDC", "EMC", "MP", "DP"
+]);
+
+const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
+
+/**
  * Extracts text-showing operands (Tj/TJ/'/" strings, inside BT...ET) from a content
  * stream, as a lightweight scanner -- not a full PDF content-stream parser or AST.
  * `context`, when given, is threaded into any parse-failure message via
  * withStreamContext() above; pdf-document.js passes `content stream object ${number}`.
+ *
+ * Each run also carries a `continuityId`. Runs sharing one are, per PDF's own drawing
+ * model, consecutive pieces of a single visible string, and only those may be joined
+ * into one searchable string (see searchText() in pdf-document.js). This is what makes
+ * "令和6年度", drawn as `[(令) 120 (和) -20 (6) 0 (年) 0 (度)] TJ` -- five separate
+ * operands, so five runs -- searchable as one word: a numeric adjustment inside a `TJ`
+ * array is inter-glyph spacing, not a break in the text. The id changes whenever the
+ * scanner sees anything that could move the text cursor or swap the font, so runs on
+ * either side of such an operator are never joined; the full list is above and in the
+ * operator dispatch below.
  */
 export function scanTextRuns(bytes, context = "") {
   const strings = [];
@@ -228,6 +268,8 @@ export function scanTextRuns(bytes, context = "") {
   // their runs must never be treated as adjacent text. Each `BT` gets its own id;
   // callers that concatenate runs into searchable text must also split on it.
   let textObjectId = -1;
+  // Incremented by every boundary below. Runs are joinable only while it holds still.
+  let continuityId = 0;
   while (cursor < bytes.length) {
     cursor = skipWhite(bytes, cursor);
     if (cursor >= bytes.length) break;
@@ -266,27 +308,44 @@ export function scanTextRuns(bytes, context = "") {
       continue;
     }
     const operator = latin1.decode(bytes.subarray(start, cursor));
+    // A number is an operand (`12` in `/F1 12 Tf`, an adjustment in a TJ array), not an
+    // operator: it must not clear the pending strings, the pending /Name, or continuity.
+    if (NUMBER.test(operator)) continue;
     if (operator === "BI") {
       cursor = skipInlineImage(bytes, cursor);
       strings.length = 0;
       lastName = null;
+      continuityId += 1;
     } else if (operator === "BT") {
       inText = true;
       currentFont = null;
       textObjectId += 1;
       strings.length = 0;
+      // A new text object starts wherever its own Td/Tm puts it, so text before this
+      // `BT` and text after it are unrelated positions on the page.
+      continuityId += 1;
     } else if (operator === "ET") {
       inText = false;
       strings.length = 0;
+      continuityId += 1;
     } else if (inText && operator === "Tf") {
+      // A replacement spanning two fonts would have to encode its characters through
+      // two different CMaps, so v0.2.1 does not join text across a font switch. Re-
+      // stating the *same* font (a size-only `Tf`) changes nothing and is not a break.
+      if (lastName !== currentFont) continuityId += 1;
       currentFont = lastName;
       strings.length = 0;
     } else if (inText && (operator === "Tj" || operator === "'" || operator === "\"" || operator === "TJ")) {
-      for (const string of strings) runs.push({ ...string, fontName: currentFont, textObjectId });
+      // `'` and `"` move to the next line before showing their string, so what they
+      // draw never continues the text that precedes them.
+      if (operator === "'" || operator === "\"") continuityId += 1;
+      for (const string of strings) runs.push({ ...string, fontName: currentFont, textObjectId, continuityId });
       strings.length = 0;
-    } else if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(operator)) {
+    } else {
       strings.length = 0;
       lastName = null;
+      // Td/TD/Tm/T* land here, as does every operator not vouched for above.
+      if (!CONTINUITY_SAFE_OPERATORS.has(operator)) continuityId += 1;
     }
   }
   return runs;

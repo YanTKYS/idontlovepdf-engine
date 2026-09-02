@@ -1,7 +1,7 @@
 /**
  * ブラウザPoCの画面制御。
  *
- * 判定ロジックは web/poc-core.js、検索・置換モデルは web/text-search.js、
+ * 判定ロジックは web/poc-core.js、
  * PDF処理は ../src/ の自作モジュールが行う。このファイルはDOM操作とファイル入出力
  * だけを担当する。fetch / XMLHttpRequest / WebSocket は使わない。
  * 選択されたPDFは端末外へ出ない（プレビューもBlob URLでこのブラウザ内に閉じる）。
@@ -26,7 +26,7 @@ import {
   summarize,
   toAssessmentJson
 } from "./poc-core.js";
-import { findMatches, matchFeasibility, planReplacement } from "./text-search.js";
+
 
 const $ = (id) => document.getElementById(id);
 
@@ -131,8 +131,12 @@ function setupTabs() {
 // on every new file selection. It exists purely so that a fresh PdfTextEditor
 // built for replace/save (see runMatchReplacement()/runDebugReplacement()) can
 // re-authenticate without asking the user to type the password again.
-const single = { name: null, bytes: null, runs: [], previewUrl: null, debugSelectedId: null, password: undefined, modifyBlocked: false };
-const search = { query: "", matches: [], selectedId: null };
+const single = { name: null, bytes: null, runs: [], editor: null, previewUrl: null, debugSelectedId: null, password: undefined, modifyBlocked: false };
+// `selectedIndex` rather than the match id: ids belong to the editor that issued them,
+// and runMatchReplacement() deliberately replays the search on a fresh editor built
+// from the untouched original bytes. Position within one search result is what carries
+// across; the engine re-checks the match itself before writing anything.
+const search = { query: "", matches: [], selectedIndex: null };
 
 /* --------------------------------------------------------- PDFプレビュー */
 
@@ -490,7 +494,25 @@ async function runDebugReplacement() {
 /* --------------------------------------------------------------- 検索・置換 */
 
 function matchLabel(match) {
-  return `${displayText(match.context.before)}${displayText(match.text)}${displayText(match.context.after)}`;
+  // displayText("") is "(空文字列)", which is right for an empty run but wrong here:
+  // empty context just means the match sits at the start or end of its string.
+  const context = (text) => (text ? displayText(text) : "");
+  return `${context(match.before)}${displayText(match.text)}${context(match.after)}`;
+}
+
+/**
+ * 置換前に分かる範囲での置換可否表示。`runCount`はengineが返す「その一致がPDF上いくつの
+ * 描画命令へ分かれているか」で、PDF内部構造の判断はengine側で完結している。CMap逆引きの
+ * 可否など実行してみないと分からないものは含めない（その場合は実行時エラーとして表示する）。
+ */
+function matchFeasibility(match) {
+  // "構造上" is deliberate: a single run can still fail at replace time (no ToUnicode,
+  // no reverse CMap entry, a glyph missing from the existing font).
+  if (match.runCount === 1) return { level: "ok", label: "○ 単一run（構造上置換可能）" };
+  return {
+    level: "conditional",
+    label: `△ ${match.runCount}runに分割されています（置換後の文字数が元の一致と同じ場合、または削除の場合に対応）`
+  };
 }
 
 function renderSearchResults() {
@@ -514,34 +536,41 @@ function renderSearchResults() {
     const label = element("label", { attributes: { for: `match-${index}` } });
 
     const radio = element("input", {
-      attributes: { type: "radio", name: "selected-match", value: match.id, id: `match-${index}` }
+      attributes: { type: "radio", name: "selected-match", value: String(index), id: `match-${index}` }
     });
-    radio.addEventListener("change", () => selectMatch(match));
+    radio.addEventListener("change", () => selectMatch(index));
     label.append(radio);
 
     const body = element("div", { className: "match-body" });
     body.append(element("span", { className: `chip chip-${feasibility.level === "ok" ? "ok" : "warn"}`, text: feasibility.label }));
     body.append(element("span", { className: "match-context", text: `${index + 1}. ${matchLabel(match)}` }));
-    body.append(element("span", {
-      className: "sub mono",
-      text: `run: ${match.runSpan.map((r) => r.runId).join(" → ")}（${match.runSpan.length}run構成）`
-    }));
+    body.append(element("span", { className: "sub", text: `${match.runCount}run構成` }));
     label.append(body);
     row.append(label);
     container.append(row);
   });
 }
 
-function runSearch(query) {
+/**
+ * 検索はengineの高レベルAPI `searchText()` に委ねる。PoC側はrunの連結条件（別
+ * `BT ... ET`、`Td`/`Tm`/`T*`、font変更など）を一切判断しない。
+ */
+async function runSearch(query) {
   search.query = query;
-  search.matches = query ? findMatches(single.runs, query) : [];
-  search.selectedId = null;
+  search.selectedIndex = null;
+  try {
+    search.matches = query ? await single.editor.searchText(query, single.password) : [];
+  } catch (error) {
+    search.matches = [];
+    showError($("single-error"), { title: "検索に失敗しました", error, stage: "extract" });
+  }
   renderSearchResults();
   resetMatchReplaceUi();
 }
 
-function selectMatch(match) {
-  search.selectedId = match.id;
+function selectMatch(index) {
+  const match = search.matches[index];
+  search.selectedIndex = index;
   hide($("replace-error"));
   hide($("replace-result"));
 
@@ -549,16 +578,12 @@ function selectMatch(match) {
   clear(detail);
   detail.hidden = false;
   detail.append(element("p", { text: `選択中の一致: ${displayText(match.text)}` }));
-  detail.append(element("p", {
-    className: "sub mono",
-    text: `run: ${match.runSpan.map((r) => r.runId).join(" → ")}（${match.runSpan.length}run構成）`
-  }));
   const feasibility = matchFeasibility(match);
   detail.append(element("p", { text: feasibility.label }));
-  if (!match.singleRun) {
+  if (match.runCount > 1) {
     detail.append(element("p", {
       className: "sub",
-      text: "複数runにまたがる一致です。置換後の文字数が元の一致（" + match.text.length + "文字）と完全に同じ場合のみ自動で置換します。異なる場合は「現在のPoCでは置換不可」と表示します。"
+      text: `複数runにまたがる一致です。置換後の文字数が元の一致（${[...match.text].length}文字）と同じ場合、または空文字（削除）の場合に置換できます。それ以外はengineが明確に拒否します。`
     }));
   }
 
@@ -574,7 +599,7 @@ function selectMatch(match) {
 }
 
 function resetMatchReplaceUi() {
-  search.selectedId = null;
+  search.selectedIndex = null;
   hide($("match-detail"));
   $("replace-input").value = "";
   $("replace-input").disabled = true;
@@ -586,18 +611,10 @@ function resetMatchReplaceUi() {
 async function runMatchReplacement() {
   hide($("replace-error"));
   hide($("replace-result"));
-  const match = search.matches.find((candidate) => candidate.id === search.selectedId);
+  const index = search.selectedIndex;
+  const match = index === null ? null : search.matches[index];
   const replacementText = $("replace-input").value;
   if (!match || !single.bytes) return;
-
-  const plan = planReplacement(match, replacementText);
-  if (plan.kind === "unsupported") {
-    const detail = plan.reason === "length-mismatch"
-      ? `複数run（${match.runSpan.length}run）にまたがる一致のため、置換後の文字数（${replacementText.length}）が元の一致の文字数（${match.text.length}）と異なる自動置換には対応していません。`
-      : "この一致箇所は現在のPoCでは置換できません。";
-    showError($("replace-error"), { title: "この一致箇所は現在のPoCでは置換不可です", error: detail, stage: "replace" });
-    return;
-  }
 
   // 置換のたびに元bytesの複製から新しいeditorを作る。元データには一切書き込まない。
   let output;
@@ -606,12 +623,18 @@ async function runMatchReplacement() {
     // 新しいeditorインスタンスは未認証のため、読込時に確認済みの同じパスワードで
     // 再認証する（暗号化PDFでない場合は無視される）。selectMatch()側で/P上
     // 文書変更が許可されていないPDFは置換UI自体を無効化しているが、ここでも
-    // replaceText()自身のpermissionチェックにより二重に拒否される。
-    await editor.listTextRuns(single.password);
-    for (const update of plan.updates) await editor.replaceText(update.runId, update.newText);
+    // engine自身のpermissionチェックにより二重に拒否される。
+    //
+    // match IDは発行したeditorインスタンス内でのみ有効なため、この新しいeditorで
+    // 同じ検索をやり直し、同じ順番の一致を選ぶ。一致が指す文字列が読込時から
+    // 変化していればengineが "match is stale" として拒否する。
+    const matches = await editor.searchText(search.query, single.password);
+    const target = matches[index];
+    if (!target || target.text !== match.text) throw new Error("match is stale: 検索結果が変化しました。再検索してください。");
+    await editor.replaceTextMatch(target.id, replacementText);
     output = await editor.save();
   } catch (error) {
-    const stage = /Unknown text run|ToUnicode|single-byte|modification is not permitted/.test(messageOf(error)) ? "replace" : "save";
+    const stage = /MULTI_RUN|stale|ToUnicode|single-byte|modification is not permitted/.test(`${error?.code ?? ""} ${messageOf(error)}`) ? "replace" : "save";
     showError($("replace-error"), { title: "置換または保存に失敗しました", error, stage });
     return;
   }
@@ -638,7 +661,7 @@ async function runMatchReplacement() {
   result.hidden = false;
   result.append(element("p", { className: "ok-title", text: `○ 成功: ${filename} をローカルへ保存しました。` }));
   result.append(element("p", {
-    text: `${plan.updates.length}件のrunを更新し、保存後PDFの再読込を確認してから incremental update として追記しました（${output.length.toLocaleString("ja-JP")} バイト）。元のPDFファイルは変更していません。`
+    text: `${match.runCount}件のrunにまたがる一致を置換し、保存後PDFの再読込を確認してから incremental update として追記しました（${output.length.toLocaleString("ja-JP")} バイト）。元のPDFファイルは変更していません。`
   }));
   result.append(element("p", { className: "warn", text: "保存できたことと、Acrobat Reader等で意図どおり表示されることは別です。保存したPDFを独立したreaderで必ず確認してください。" }));
 }
@@ -687,6 +710,8 @@ async function attemptLoad(file, editor, password, passwordWasEntered) {
   hide($("single-error"));
   single.password = password;
   single.runs = runs;
+  // searchText() は同じeditorインスタンス上で動く（match IDはそのeditor内でのみ有効）。
+  single.editor = editor;
 
   if (editor.security) {
     renderEncryptionAuthenticated($("single-encryption"), editor.security, passwordWasEntered);
@@ -731,13 +756,14 @@ async function attemptLoad(file, editor, password, passwordWasEntered) {
   } else {
     hide($("replace-permission-notice"));
   }
-  runSearch("");
+  await runSearch("");
 }
 
 async function handleSingleFile(file) {
   single.name = file.name;
   single.bytes = null;
   single.runs = [];
+  single.editor = null;
   single.password = undefined;
   hide($("single-error"));
   hide($("single-encryption"));
@@ -750,7 +776,8 @@ async function handleSingleFile(file) {
   $("search-section").hidden = true;
   $("search-input").value = "";
   $("search-input").disabled = true;
-  runSearch("");
+  // 空文字はengineへ渡さない（`searchText("")` は明確なerror）。ここでは表示の初期化だけ。
+  void runSearch("");
   resetDebugReplaceUi();
 
   const summary = $("single-summary");
@@ -916,7 +943,7 @@ function main() {
   }, { multiple: true });
 
   $("search-input").addEventListener("input", (event) => {
-    runSearch(event.target.value);
+    void runSearch(event.target.value);
   });
   $("replace-run").addEventListener("click", () => {
     void runMatchReplacement();

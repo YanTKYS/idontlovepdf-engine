@@ -91,7 +91,13 @@ test("classifies known engine errors into readable causes and keeps the raw mess
     ["extract: content stream object 45: Unsupported /Predictor value: 99", "Predictor未対応または不正（値・row長・bit depthなど）"],
     ["extract: content stream object 45: Unsupported TIFF Predictor BitsPerComponent: 4", "Predictor未対応または不正（値・row長・bit depthなど）"],
     ["extract: content stream object 45: PNG predictor row length does not match the stream length", "Predictor未対応または不正（値・row長・bit depthなど）"],
-    ["replace: 複数run（4run）にまたがる一致のため、置換後の文字数（3）が元の一致の文字数（4）と異なる自動置換には対応していません。", "複数runにまたがるため現在の方式では置換不可"]
+    // The high-level search/replace API's refusals (src/pdf-document.js). Each carries a
+    // stable `error.code` too; this only checks that the PoC can still name the cause.
+    ["replace: This match is drawn as 5 separate text runs, so a replacement of 3 characters cannot be written over 5 without moving text relative to the PDF's own spacing. Use an equal-length replacement, or an empty one to delete.", "複数runにまたがる一致で置換前後の文字数が異なるため置換不可（MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED）"],
+    ["replace: This match spans 2 fonts; replacing it would have to encode its characters through more than one font, which is not supported", "複数fontにまたがる一致のため置換不可（MULTI_RUN_FONT_CHANGE_UNSUPPORTED）"],
+    ["replace: This match is stale: the text it was found in has changed since searchText() returned it (run 4:2). Search again and replace the new match.", "検索結果が古くなっている（対象の文字列が変化したため置換を中止）"],
+    ["replace: Unknown search match: abc-1 (match ids come from this editor's most recent searchText() call and are superseded by the next one)", "match IDが無効（検索をやり直してください）"],
+    ["extract: searchText() requires a non-empty query; an empty string matches nothing rather than every text run", "検索文字列が空"]
   ];
   for (const [message, label] of cases) assert.equal(classifyError(message), label);
   assert.equal(classifyError("save: something entirely new"), "その他のエラー（原文を参照）");
