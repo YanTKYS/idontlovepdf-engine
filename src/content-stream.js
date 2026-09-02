@@ -292,6 +292,20 @@ function joinAcrossOperators(runs, continuityId, boundaryClean, displacement) {
  *                                           CONTINUITY_SAFE_OPERATORS above, since
  *                                           anything else would have ended the group
  *
+ * Each run also records `followedBy`: what happens to the text position after the
+ * operator that drew it, before anything else is drawn. Showing a string advances the
+ * text position by its glyphs' widths, so text drawn afterwards without an intervening
+ * reposition sits wherever this run happened to end -- meaning anything that changes this
+ * run's width moves it. The values are:
+ *
+ *   "end-of-text-object"    an `ET` (or a `BT`, which resets the text matrix) comes next,
+ *                           so nothing is drawn from this run's end position
+ *   "repositioned"          a `Td`/`TD`/`Tm`/`T*` -- or a `'`/`"`, which begin with a line
+ *                           move -- sets the position before anything else is drawn
+ *   "text-continues"        the next thing drawn starts exactly where this run ended
+ *   "end-of-content-stream" the stream ended inside an open text object, so a following
+ *                           stream of the same page may continue from this position
+ *
  * `adjustment` is the net `TJ` displacement between the two strings, in either case:
  * the sum of every number between them, wherever those numbers sit relative to the
  * operator boundary. It is 0 for two genuinely adjacent operands, and only a 0 there
@@ -319,6 +333,13 @@ export function scanTextRuns(bytes, context = "") {
   // True while nothing at all has run since the last text-showing operator, which is
   // what separates joinBefore's "adjacent-operator" from its "state-change".
   let boundaryClean = false;
+  // Runs drawn by the most recent text-showing operator, still waiting to find out what
+  // happens to the text position after them (see `followedBy` above).
+  let pendingRuns = [];
+  const resolveFollowedBy = (value) => {
+    for (const index of pendingRuns) runs[index].followedBy = value;
+    pendingRuns = [];
+  };
   // Numbers seen since the last string operand was collected. Summed, since `[(a) 5 -5
   // (b)]` is two of them and only their total decides whether (a) and (b) are adjacent
   // -- and deliberately NOT reset by a text-showing operator, so a number at the end of
@@ -385,6 +406,8 @@ export function scanTextRuns(bytes, context = "") {
       continuityId += 1;
       boundaryClean = false;
     } else if (operator === "BT") {
+      // `BT` resets the text matrix, so nothing after it draws from where a run ended.
+      resolveFollowedBy("end-of-text-object");
       inText = true;
       currentFont = null;
       currentFontSize = null;
@@ -396,6 +419,7 @@ export function scanTextRuns(bytes, context = "") {
       continuityId += 1;
       boundaryClean = false;
     } else if (operator === "ET") {
+      resolveFollowedBy("end-of-text-object");
       inText = false;
       strings.length = 0;
       displacement = 0;
@@ -415,6 +439,9 @@ export function scanTextRuns(bytes, context = "") {
     } else if (inText && (operator === "Tj" || operator === "'" || operator === "\"" || operator === "TJ")) {
       // `'` and `"` move to the next line before showing their string, so what they
       // draw never continues the text that precedes them.
+      // `'` and `"` reposition before drawing, so whatever came before them is not
+      // followed by text drawn from its own end position; `Tj`/`TJ` draw exactly there.
+      resolveFollowedBy(operator === "'" || operator === "\"" ? "repositioned" : "text-continues");
       if (operator === "'" || operator === "\"") continuityId += 1;
       strings.forEach((string, index) => {
         // Each string carries the net displacement accumulated since the previous string
@@ -437,8 +464,12 @@ export function scanTextRuns(bytes, context = "") {
           operatorEnd: cursor,
           textObjectId,
           continuityId,
-          joinBefore
+          joinBefore,
+          // Only the operator's last operand is still open: an earlier one is immediately
+          // followed by the next operand of the same operator, drawn where it ended.
+          followedBy: index === strings.length - 1 ? null : "text-continues"
         });
+        if (index === strings.length - 1) pendingRuns.push(runs.length - 1);
       });
       strings.length = 0;
       lastNumber = null;
@@ -449,6 +480,11 @@ export function scanTextRuns(bytes, context = "") {
       strings.length = 0;
       lastName = null;
       lastNumber = null;
+      // Td/TD/Tm/T* set the text position outright, so what they draw next does not
+      // depend on where the previous run ended.
+      if (operator === "Td" || operator === "TD" || operator === "Tm" || operator === "T*") {
+        resolveFollowedBy("repositioned");
+      }
       // Whatever numbers were pending were this operator's operands (`5 Tc`, `1 0 0 rg`,
       // `72 700 Td`), not spacing between two strings.
       displacement = 0;
@@ -460,6 +496,10 @@ export function scanTextRuns(bytes, context = "") {
       boundaryClean = false;
     }
   }
+  // Anything still open ran out with the stream rather than with an `ET`. A page's
+  // /Contents may be several streams read as one, so a later stream could carry on from
+  // here: that is not something this scanner can see, and so not something to call safe.
+  resolveFollowedBy("end-of-content-stream");
   return runs;
 }
 

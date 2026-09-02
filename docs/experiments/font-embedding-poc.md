@@ -37,10 +37,42 @@ font埋め込みだけを切り分けるため、意図的に次へ限定しま�
 - 単一run
 - run全体が一致（部分一致は対象外）
 - 置換前後で同じ文字数
+- **operatorが `Tj` であること**（`TJ` / `'` / `"` は対象外）
+- **そのrunの終端位置から他のテキストが描画されないこと**
 - 元fontのfont sizeを引き継ぐ
 
+### なぜ「終端位置から描画されないこと」が要るか
+
+置換後に元fontへ戻しても、**戻るのはfontであって現在位置ではありません**。
+`Tj` は使用したfontのglyph幅ぶん現在位置を進めるため、
+
+```text
+BT /FJP 36 Tf 20 60 Td <令和> Tj <です> Tj ET
+```
+
+のように同じtext object内で直後に文字が続く場合、`です` は「令和がどこで終わったか」から
+描画されます。fallback fontのglyph幅は元fontと同じとは限らないので、
+**同じ文字数でも `です` の位置が動きます。**
+
+したがって、次のどちらかを scanner が確認できる場合だけ許可します。
+
+- 直後が `ET`（または `BT`。text matrixがリセットされる）
+- 直後に `Td` / `TD` / `Tm` / `T*`、あるいは行送りを伴う `'` / `"` があり、
+  位置が明示的に設定し直される
+
+確認できない場合（同一text object内で `Tj` が続く、content streamが text object を開いた
+まま終わる等）は `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE` で拒否します。
+scannerに内部metadata `followedBy` を追加してこれを判定しています。
+
+### なぜ `Tj` だけか
+
+書換えはoperandとoperatorを一体で置き換えます。`TJ` のoperandは配列の中にあるため、
+同じ方式では文字列が配列の外へ出て `[` が閉じない**壊れたPDF**になります。
+`'` / `"` は行送りを含み（`"` はさらにword/character spacingのoperandを取る）、
+この単純なfont切替では扱えません。いずれも `FALLBACK_OPERATOR_UNSUPPORTED` で拒否します。
+
 文字数変更・複数run・部分run・レイアウト再計算は**この実験の対象外**です。
-該当する場合はエラーコードで明示的に拒否します(§9)。
+該当する場合はエラーコードで明示的に拒否します(§11)。
 
 ## 3. 選定したfallback font
 
@@ -183,7 +215,9 @@ scannerに内部metadataとして `fontSize`（`Tf` のsize）と `operatorEnd`
 | reopen（engine） | `listTextRuns()` → `["昭和"]` |
 | reopen後 `searchText("昭和")` | 1件 |
 | reopen後 `searchText("令和")` | 0件 |
-| 後続テキスト `です` | 元fontのまま、operandも位置も不変 |
+| 後続テキスト `です`（別text object・`Td`で再配置） | 元fontのまま、operandも位置も不変 |
+| 同一text object内で `Tj` が続く場合 | `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE` で拒否 |
+| `TJ` / `'` / `"` で描画されたrun | `FALLBACK_OPERATOR_UNSUPPORTED` で拒否 |
 
 ### 独立PDF実装での確認
 
@@ -198,8 +232,13 @@ scannerに内部metadataとして `fontSize`（`Tf` のsize）と `operatorEnd`
 | 置換後 | ![置換後](font-embedding-after.png) |
 
 `令和` → `昭和` になり、**元PDFに存在しなかった 昭 が正しい字形で描画**されています。
-続く `です` は元fontのまま同じ位置に残っており、**font復帰が効いている**ことが目視でも
+続く `です` は元fontのまま同じ位置に残っており、**`Tf` の復帰が効いている**ことが目視でも
 確認できます。
+
+なお、このfixtureの `です` は**別のtext objectで `Td` により独立して配置**されています。
+したがってこの画像が示すのは「fontが元に戻っている」ことであって、
+「glyph幅の差が吸収されている」ことではありません。後者は行っておらず、
+同一text object内で文字が続くケースは §2 のとおり拒否します。
 
 **Edge / Acrobat Reader は未確認です。** 自動testを行っていないため「確認済み」とは
 記載しません。正式実装前の実機確認項目とします。
@@ -242,7 +281,8 @@ exportしていないため）。
 
 ## 11. 意図的に対応していない範囲
 
-複数run、部分run、異文字数、非0 `TJ` adjustment、後続文字の位置補正、
+複数run、部分run、異文字数、`Tj` 以外のtext-showing operator、
+**後続テキストの位置補正（＝glyph幅差の吸収）**、非0 `TJ` adjustment、
 text matrix再計算、font subset化、OCR、annotation/overlay/白塗り/画像化、
 暗号化PDF再保存、`idontlovepdf` 本体の変更。
 
@@ -250,6 +290,8 @@ text matrix再計算、font subset化、OCR、annotation/overlay/白塗り/画�
 
 | code | 意味 |
 | --- | --- |
+| `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE` | そのrunの終端位置から他のテキストが描画される（幅が変わると動く） |
+| `FALLBACK_OPERATOR_UNSUPPORTED` | `Tj` 以外（`TJ` / `'` / `"`）で描画されている |
 | `FALLBACK_MULTI_RUN_UNSUPPORTED` | 一致が複数runにまたがる |
 | `FALLBACK_PARTIAL_RUN_UNSUPPORTED` | 一致がrunの一部だけ |
 | `FALLBACK_LENGTH_CHANGE_UNSUPPORTED` | 置換前後で文字数が違う |
@@ -282,27 +324,34 @@ whole-run同文字数置換にlayout engineが必須、Reader互換性、license
 
 段階の順序:
 
-- **Phase 2**: 同文字数・single-runの**部分**置換（`申請は令和です → 申請は昭和です`）。
+- **Phase 2**: 後続テキストが同一text object内で続くケースへの対応。
+  fallback fontのglyph幅と元fontのglyph幅の差を求め、`Td` で差分を補正するか、
+  後続の位置を計算し直す必要がある。ここで初めてglyph幅を「使う」ことになる
+- **Phase 2b**: 同文字数・single-runの**部分**置換（`申請は令和です → 申請は昭和です`）。
   prefix/suffixを元fontのまま残し、置換部分だけfallback fontへ切り替える
+- **Phase 2c**: `TJ` / `'` / `"` への対応（配列構造・行送りを保ったままのfont切替）
 - **Phase 3**: 現在の `variable-length-safe` 構造と組み合わせた異文字数置換
 - **Phase 4**: 複数run + fallback font
 - **Phase 5**: font subset化とサイズ削減
 
 正式統合までに必要なもの:
 
-1. **font subset化**（最重要）。1ファイル +3MB は実運用で厳しい。使用glyphだけを含む
+1. **後続テキストの位置補正**。今回は「位置が独立している場合だけ」に限定して回避したが、
+   実PDFでは同一text object内で文字が続く構成が普通にある。元fontとfallback fontの
+   advance width差を求めて `Td` で吸収する等の設計が要る（今回は意図的に未着手）
+2. **font subset化**（最重要）。1ファイル +3MB は実運用で厳しい。使用glyphだけを含む
    TrueTypeを再構成する必要があり、`glyf`/`loca`/`hmtx`/`cmap` の再生成が要る。
    browserで動くOSS subsetterの調査、または既存fontのsubsetを生成する仕組み
-2. **font assetの配布方法**。閉域環境で使うため、4.5MBのfontをどう配るか
+3. **font assetの配布方法**。閉域環境で使うため、4.5MBのfontをどう配るか
    （アプリ同梱 / 事前配置 / 利用者が指定）。`idontlovepdf` 側の設計判断が要る
-3. **font parserの正式採用可否**。opentype.jsをdependencyに加えるか、
+4. **font parserの正式採用可否**。opentype.jsをdependencyに加えるか、
    必要機能だけの薄い実装に留めるか（bundle +350KB の是非）
-4. **既存API統合の設計**。`replaceTextMatch()` を自動fallback化すると、利用側が意図せず
+5. **既存API統合の設計**。`replaceTextMatch()` を自動fallback化すると、利用側が意図せず
    巨大fontを埋め込むことになる。明示的なopt-in（fontを渡したときだけ有効）が要る
-5. **実機Reader確認**。Edge、Acrobat Reader、および実際に使う印刷経路
-6. **実PDFでの確認**。今回の検証はfixtureベース。実際に `令和 → しょうわ` で失敗した
+6. **実機Reader確認**。Edge、Acrobat Reader、および実際に使う印刷経路
+7. **実PDFでの確認**。今回の検証はfixtureベース。実際に `令和 → しょうわ` で失敗した
    PDFのうち、単一run・同文字数の箇所での確認
-7. **version同期**。engine v0.4.0 と `idontlovepdf` v0.4.0 の同期開始
+8. **version同期**。engine v0.4.0 と `idontlovepdf` v0.4.0 の同期開始
 
 ## 14. 再現方法
 
@@ -314,3 +363,7 @@ npm run test:browser  # test/browser/font-embedding-poc.test.js を含む
 ```
 
 `npm run poc:font` を実行していない場合、PoC testは失敗ではなくskipします。
+**CI（`.github/workflows/ci.yml`）では `npm run poc:font` を実行し、
+さらに「skipが1件でもあれば失敗させる」guardを入れています。**
+これがないと、font未取得のままCIが緑になり、本PoCの主目的を一度も実行しないまま
+成功と表示されてしまうためです。

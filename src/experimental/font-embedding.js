@@ -13,10 +13,16 @@
  * the page's own content stream is edited and the result is written as an incremental
  * update. No overlay, no annotation, no white box, no rasterisation.
  *
- * Deliberately narrow (see the PoC brief): one whole run, replaced by the same number of
- * characters, with the run's own `Tf` re-stated afterwards so following text is unaffected.
- * Anything else is refused rather than approximated -- widths are read from the font but
- * nothing is re-laid-out, and no subsetting is attempted.
+ * Deliberately narrow (see the PoC brief): one whole run drawn by a plain `Tj`, replaced
+ * by the same number of characters, and only where nothing is drawn from that run's own
+ * end position. Anything else is refused rather than approximated -- widths are read from
+ * the font but nothing is re-laid-out, and no subsetting is attempted.
+ *
+ * That last condition is the one that is easy to miss. Re-stating the original `Tf` after
+ * the replacement restores the *font*, not the text position: showing a string advances
+ * the position by its glyphs' widths, and the embedded font's glyphs are not the widths
+ * the original font's were. So text drawn afterwards from that position would move, even
+ * though the character count is unchanged. See followedBy in scanTextRuns().
  */
 import opentypeModule from "opentype.js";
 
@@ -265,6 +271,14 @@ function nextNumbers(editor, count) {
 }
 
 /**
+ * Where the text position after a run is set by something other than that run's own
+ * advance, so replacing it with glyphs of different widths cannot move anything else.
+ * Every other case -- including a stream that ends inside an open text object, which a
+ * later stream of the same page may continue from -- is refused.
+ */
+const POSITION_SAFE_AFTER = new Set(["end-of-text-object", "repositioned"]);
+
+/**
  * The PoC's own preconditions, checked before anything is written. Deliberately narrow:
  * this experiment is isolating font embedding, so anything that would also need layout
  * work is refused rather than attempted.
@@ -287,6 +301,22 @@ function fallbackPlan(editor, match, replacement) {
   if (!run) return experimentError("FALLBACK_RUN_NOT_FOUND", `Text run ${entry.runId} is no longer present`);
   if (!run.fontName) {
     return experimentError("FALLBACK_NO_ORIGINAL_FONT", "This run has no /Tf font to restore afterwards, so the embedded font could not be switched away from again");
+  }
+  // Only a plain `Tj`. The rewrite replaces the operand and the operator together, which
+  // for a `TJ` would drop the string out of its array and leave `[` unclosed; `'` and `"`
+  // carry a line move (and `"` two spacing operands) that this simple switch does not
+  // account for. Widening this is for a real implementation, not for isolating embedding.
+  if (run.operator !== "Tj") {
+    return experimentError("FALLBACK_OPERATOR_UNSUPPORTED", `This experiment replaces text drawn by Tj; this run is drawn by ${run.operator}`);
+  }
+  // Restoring the font does not restore the text position, and the embedded font's glyphs
+  // are not the widths the original's were -- so anything drawn from where this run ends
+  // would move. Only replace a run nothing is drawn after.
+  if (!POSITION_SAFE_AFTER.has(run.followedBy)) {
+    return experimentError(
+      "FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE",
+      `Text is drawn from where this run ends (${run.followedBy}), so replacing it with glyphs of different widths would move that text. Only a run followed by ET or an explicit Td/TD/Tm/T* is replaced here.`
+    );
   }
   if (editor.pending.has(entry.runId)) {
     return experimentError("FALLBACK_RUN_ALREADY_EDITED", `Text run ${entry.runId} already has an edit staged through the ordinary API`);

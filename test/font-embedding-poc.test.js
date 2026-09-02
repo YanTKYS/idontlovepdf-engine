@@ -134,7 +134,10 @@ test("switches to the embedded font for the run and straight back afterwards", {
   );
 });
 
-test("leaves following text in the original font untouched", { skip }, async () => {
+test("leaves following text in the original font untouched when it is positioned independently", { skip }, async () => {
+  // The second text object sets its own position, so it cannot be moved by the replaced
+  // run's width. That independence is why this replacement is allowed at all -- see the
+  // test below for what happens when the following text does depend on it.
   const content = `BT /FJP 36 Tf 20 60 Td ${glyphs("令和")} Tj ET BT /FJP 36 Tf 190 60 Td ${glyphs("です")} Tj ET`;
   const editor = new PdfTextEditor(makePdf(content));
   const [match] = await editor.searchText("令和");
@@ -144,6 +147,64 @@ test("leaves following text in the original font untouched", { skip }, async () 
   assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), ["昭和", "です"]);
   // です is still drawn by the original font, with its own operand untouched.
   assert.match(latin1.decode(reopened.streams[0].decoded), /ET BT \/FJP 36 Tf 190 60 Td <00030004> Tj ET$/);
+});
+
+test("refuses a run whose width other text is drawn from", { skip }, async () => {
+  // Restoring /FJP restores the font, not the position: です is drawn from wherever 令和
+  // ended, and the embedded font's glyphs are not the original's widths, so it would
+  // move. Replacing here would be the same character count and still shift the page.
+  const editor = new PdfTextEditor(makePdf(`BT /FJP 36 Tf 20 60 Td ${glyphs("令和")} Tj ${glyphs("です")} Tj ET`));
+  const [match] = await editor.searchText("令和");
+  const verdict = await checkTextMatchReplacementWithFallback(editor, match.id, "昭和", { font: fallback });
+  assert.equal(verdict.allowed, false);
+  assert.equal(verdict.code, "FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE");
+  await assert.rejects(replaceTextMatchWithFallbackFont(editor, match.id, "昭和", { font: fallback }), (error) => {
+    assert.equal(error.code, "FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE");
+    return true;
+  });
+  assert.equal(editor.pendingObjects.size, 0);
+});
+
+test("allows a run whose following text sets its own position", { skip }, async () => {
+  // Same text object, but an explicit Td puts です where it belongs regardless of how wide
+  // the replacement turned out to be.
+  const editor = new PdfTextEditor(makePdf(`BT /FJP 36 Tf 20 60 Td ${glyphs("令和")} Tj 100 0 Td ${glyphs("です")} Tj ET`));
+  const [match] = await editor.searchText("令和");
+  assert.deepEqual(
+    await checkTextMatchReplacementWithFallback(editor, match.id, "昭和", { font: fallback }),
+    { allowed: true, mode: "fallback-font-whole-run", usesFallbackFont: true }
+  );
+  await replaceTextMatchWithFallbackFont(editor, match.id, "昭和", { font: fallback });
+  assert.deepEqual((await new PdfTextEditor(await editor.save()).listTextRuns()).map((run) => run.text), ["昭和", "です"]);
+});
+
+test("refuses a stream that ends inside an open text object", { skip }, async () => {
+  // A page's /Contents may be several streams read as one, so a later stream could carry
+  // on from this position. Nothing here can see that, so it is not called safe.
+  const editor = new PdfTextEditor(makePdf(`BT /FJP 36 Tf 20 60 Td ${glyphs("令和")} Tj`));
+  const [match] = await editor.searchText("令和");
+  const verdict = await checkTextMatchReplacementWithFallback(editor, match.id, "昭和", { font: fallback });
+  assert.equal(verdict.code, "FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE");
+});
+
+test("refuses every text-showing operator but Tj", { skip }, async () => {
+  // A TJ's operand lives inside an array: replacing the operand and the operator together
+  // would drop the string out of it and leave `[` unclosed -- a broken PDF, not a wrong
+  // one. `'` and `"` carry a line move this simple font switch does not account for.
+  const cases = [
+    [`BT /FJP 36 Tf 20 60 Td [${glyphs("令和")}] TJ ET`, "TJ"],
+    [`BT /FJP 36 Tf 14 TL 20 60 Td ${glyphs("令和")} ' ET`, "'"],
+    [`BT /FJP 36 Tf 14 TL 20 60 Td 0 0 ${glyphs("令和")} " ET`, '"']
+  ];
+  for (const [content, operator] of cases) {
+    const editor = new PdfTextEditor(makePdf(content));
+    const [match] = await editor.searchText("令和");
+    const verdict = await checkTextMatchReplacementWithFallback(editor, match.id, "昭和", { font: fallback });
+    assert.equal(verdict.allowed, false, `${operator} should have been refused`);
+    assert.equal(verdict.code, "FALLBACK_OPERATOR_UNSUPPORTED");
+    assert.match(verdict.reason, new RegExp(`drawn by ${operator === '"' ? '"' : operator}`));
+    assert.equal(editor.pendingObjects.size, 0);
+  }
 });
 
 test("adds the font to the page's resources without disturbing the existing ones", { skip }, async () => {
@@ -248,7 +309,7 @@ test("refuses what this experiment deliberately does not cover", { skip }, async
     // Only part of a run: would need the run's other characters re-encoded too.
     [`BT /FJP 36 Tf 20 60 Td ${glyphs("令和です")} Tj ET`, "令和", "昭和", "FALLBACK_PARTIAL_RUN_UNSUPPORTED"],
     // Several runs: each would need its own switch, and the spacing between them decided.
-    [`BT /FJP 36 Tf 20 60 Td [${glyphs("令")} 0 ${glyphs("和")}] TJ ET`, "令和", "昭和", "FALLBACK_MULTI_RUN_UNSUPPORTED"],
+    [`BT /FJP 36 Tf 20 60 Td ${glyphs("令")} Tj ${glyphs("和")} Tj ET`, "令和", "昭和", "FALLBACK_MULTI_RUN_UNSUPPORTED"],
     // A different character count: needs the layout work this experiment is isolating.
     [REIWA, "令和", "昭和です", "FALLBACK_LENGTH_CHANGE_UNSUPPORTED"]
   ];
