@@ -34,7 +34,7 @@
 - 暗号化 PDF は `Standard` ハンドラの上記 2 組（R4/AESV2, R6/AESV3）のみ対応。`/R 2`・`/R 3`・`/R 5`・`/Adobe.PubSec` 等は診断のみで停止
 - **暗号化 PDF への変更の保存（再暗号化）は未対応**。変更がなければ元 bytes をそのまま返せます
 - ページ座標・フォントサイズは公開していません。置換後の文字幅に応じた再レイアウトはしません
-- 複数の text run にまたがる一致で文字数が変わる置換は、対象 run 間の `TJ` numeric adjustment がすべて 0 の場合、または対象 run 間に他の operator が一切ない連続した text-showing operator の場合のみ対応します。非 0 の字間調整や `Tc`/`Tw`/`Tz`/`Tr`・色指定・marked content をまたぐ場合は `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として拒否します（同じ文字数への置換と削除は構造によらず可能です）
+- 複数の text run にまたがる一致で文字数が変わる置換は、対象 run 間に他の operator がなく、かつ対象 run 間の `TJ` numeric adjustment の合計が 0 の場合のみ対応します。字間調整が残る場合や `Tc`/`Tw`/`Tz`/`Tr`・色指定・marked content をまたぐ場合は `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として拒否します（同じ文字数への置換と削除は構造によらず可能です）
 - 字間調整（`TJ` の numeric adjustment）の削除・合算・再計算、glyph 幅からの文字送り計算、text matrix の再構成は行いません
 - 検索は `Td` / `TD` / `Tm` / `T*`、別 `BT ... ET`、font 変更等をまたぎません。これらをまたいで 1 つの語が描画されている PDF では、その語は分断されたまま検索されます
 
@@ -173,19 +173,33 @@ await editor.checkTextMatchReplacement(id, "今年度");
 
 #### 複数 run にまたがる、文字数が変わる置換（`variable-length-safe`）
 
-対象 run どうしが**次のいずれかで接している場合に限り**対応します。
+対象 run どうしが**次の 2 つを同時に満たす場合に限り**対応します。
 
-- 同じ `TJ` 配列内で、**対象 run 間の numeric adjustment がすべて 0**（`[(実) 0 (績) 0 (報) 0 (告) 0 (書)] TJ`）。operand が隣接しているだけの場合、および `0.0`・`+0`・`-0`・`-0.0` のような表記も 0 として扱います
-- **対象 run 間に他の operator が一切ない**、連続した text-showing operator（`(実) Tj (績) Tj (報) Tj ...`）
+- **対象 run 間に他の operator が一切ない**こと（`Tc`・`Tw`・`Tz`・`Tr`・色指定・marked content などが挟まっていない）
+- **対象 run 間の `TJ` numeric adjustment の合計が 0** であること
 
-このとき、0 の adjustment は文字送りを 0 だけ動かし、空の string operand は何も描画せず何も進めません。つまり描画結果は **operand の連結だけで決まり、文字がどの operand に入っているかには依存しません**。そこで置換文字列全体を先頭の対象 operand へ入れ、残りの対象 operand を空にします。operand 数・operator 構造・adjustment はすべて元のまま保たれ、結果は既存の単一 run 置換と同じものになります。glyph 幅の推測も、text matrix の再計算も行いません。
+adjustment の合計は、その数値が**どこに書かれているかによらず**取ります。`TJ` の数値は次の文字列を字送りするため、配列の途中にあっても、配列の末尾にあっても、次の配列の先頭にあっても同じ意味を持つからです。
+
+```text
+[(実) 0 (績)] TJ              → 合計 0   : 隣接とみなす
+[(実)] TJ [(績)] TJ           → 合計 0   : 隣接とみなす
+(実) Tj (績) Tj               → 合計 0   : 隣接とみなす
+[(実) 120] TJ [-120 (績)] TJ  → 合計 0   : 相殺されるため隣接とみなす
+[(実) 120 (績)] TJ            → 合計 120 : 拒否
+[(実) 120] TJ [(績)] TJ       → 合計 120 : 拒否（配列末尾でも同じ字送り）
+(実) Tj [120 (績)] TJ         → 合計 120 : 拒否（次の配列先頭でも同じ字送り）
+```
+
+`0.0`・`+0`・`-0`・`-0.0` のような表記も、文字列としてではなく PDF の数値として 0 と判定します。なお `/F1 12 Tf` の `12` や `72 700 Td` の `72 700` は operator 自身の operand であり、字送りとしては数えません。
+
+この条件下では、合計 0 の adjustment は文字送りを動かさず、空の string operand は何も描画せず何も進めません。つまり描画結果は **operand の連結だけで決まり、文字がどの operand に入っているかには依存しません**。そこで置換文字列全体を先頭の対象 operand へ入れ、残りの対象 operand を空にします。operand 数・operator 構造・adjustment はすべて元のまま保たれ、結果は既存の単一 run 置換と同じものになります。glyph 幅の推測も、text matrix の再計算も行いません。
 
 ```text
 置換前: [(申請は) 120 (実) 0 (績) 0 (報告書) -35 (です)] TJ
 置換後: [(申請は) 120 (報告書) 0 <> 0 <> -35 (です)] TJ      ← 実績報告書 → 報告書
 ```
 
-対象 run 間に **非 0 の numeric adjustment**、または `Tc` / `Tw` / `Tz` / `Tr` / 色指定 / marked content（`BDC`・`EMC` 等）がある場合は**拒否**します。前者は特定の 2 文字の間隔として指定されたものであり、文字を動かした後に何であるべきかを決め直すことになるため。後者は 2 つの operand が異なる text state で描画されているため、文字をまたいで動かすと PDF が指定した見た目と変わってしまうためです。いずれも推測で埋めることはしません。
+対象 run 間の adjustment の**合計が 0 でない**場合、または `Tc` / `Tw` / `Tz` / `Tr` / 色指定 / marked content（`BDC`・`EMC` 等）がある場合は**拒否**します。前者は特定の 2 文字の間隔として指定されたものであり、文字を動かした後に何であるべきかを決め直すことになるため。後者は 2 つの operand が異なる text state で描画されているため、文字をまたいで動かすと PDF が指定した見た目と変わってしまうためです。いずれも推測で埋めることはしません。
 
 なお `Td` / `TD` / `Tm` / `T*`、別 `BT ... ET`、font 変更は `searchText()` の時点で連結しないため、そもそもそれらをまたぐ一致は存在しません。
 
@@ -195,7 +209,7 @@ await editor.checkTextMatchReplacement(id, "今年度");
 
 | `error.code` | 意味 |
 | --- | --- |
-| `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED` | 複数 run にまたがる一致で、上記の安全な構造ではないため文字数を変えられない。`unsafeReason` に `non-zero-tj-adjustment` / `text-state-boundary` / `unsupported-topology` のいずれかが入ります |
+| `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED` | 複数 run にまたがる一致で、上記の条件を満たさないため文字数を変えられない。`unsafeReason` に `non-zero-tj-adjustment` / `text-state-boundary` / `unsupported-topology` のいずれかが入ります |
 | `MULTI_RUN_FONT_CHANGE_UNSUPPORTED` | 一致が複数 font にまたがる（検索側で font 変更を境界にしているため通常は発生しません） |
 | `FONT_ENCODING_UNSUPPORTED` | 既存 font にその文字の glyph がない。新規 font 埋め込みや subset 再生成は行いません |
 | `MATCH_STALE` | 検索時点の文字列が現在の文書内容と食い違う。古い match ID で別の場所を書き換えないための保護です |

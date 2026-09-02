@@ -170,6 +170,72 @@ test("leaves the operators and the adjustments around the match exactly as they 
   assert.deepEqual(texts(await new PdfTextEditor(await editor.save()).listTextRuns()), ["申請は", "報告書", "", "", "です"]);
 });
 
+/* --------------------------------------------- spacing that spans an operator boundary */
+
+// A `TJ` adjustment displaces the next string whether it sits at the END of one array,
+// at the START of the next, or between two operands of a single one: `[(A) 120] TJ
+// [(B)] TJ`, `(A) Tj [120 (B)] TJ` and `[(A) 120 (B)] TJ` all move B by the same amount.
+// Reading only the numbers inside an array would call the first two a plain adjacency
+// and, on a length change, silently relocate that 120 to after the replacement.
+
+test("refuses a length change across an adjustment at the end of the previous TJ array", async () => {
+  const editor = new PdfTextEditor(makePdf(body(`[${glyphs("実")} 120] TJ [${glyphs("績報告書")}] TJ`)));
+  const [match] = await editor.searchText("実績報告書");
+  const check = await editor.checkTextMatchReplacement(match.id, "報告書");
+  assert.equal(check.allowed, false);
+  assert.equal(check.code, "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED");
+  assert.equal(check.unsafeReason, "non-zero-tj-adjustment");
+});
+
+test("refuses a length change across an adjustment at the start of the next TJ array", async () => {
+  const editor = new PdfTextEditor(makePdf(body(`${glyphs("実")} Tj [120 ${glyphs("績報告書")}] TJ`)));
+  const [match] = await editor.searchText("実績報告書");
+  const check = await editor.checkTextMatchReplacement(match.id, "報告書");
+  assert.equal(check.allowed, false);
+  assert.equal(check.unsafeReason, "non-zero-tj-adjustment");
+});
+
+test("refuses a length change when adjustments on either side of the boundary do not cancel", async () => {
+  const editor = new PdfTextEditor(makePdf(body(`[${glyphs("実")} 120] TJ [-60 ${glyphs("績報告書")}] TJ`)));
+  const [match] = await editor.searchText("実績報告書");
+  const check = await editor.checkTextMatchReplacement(match.id, "報告書");
+  assert.equal(check.allowed, false);
+  assert.equal(check.unsafeReason, "non-zero-tj-adjustment");
+});
+
+test("allows a length change across a zero adjustment at the end of the previous TJ array", async () => {
+  const content = body(`[${glyphs("実")} 0] TJ [${glyphs("績報告書")}] TJ`);
+  assert.deepEqual(await replaceThroughSaveAndReopen(content, "実績報告書", "報告書"), ["報告書", ""]);
+});
+
+test("allows a length change across a zero adjustment at the start of the next TJ array", async () => {
+  const content = body(`${glyphs("実")} Tj [0 ${glyphs("績報告書")}] TJ`);
+  assert.deepEqual(await replaceThroughSaveAndReopen(content, "実績報告書", "報告書"), ["報告書", ""]);
+});
+
+test("allows a length change when adjustments on either side of the boundary cancel out", async () => {
+  // Net displacement is zero, so the two strings really are adjacent -- and the 120 and
+  // -120 stay exactly where they were, still cancelling, after the replacement.
+  const content = body(`[${glyphs("実")} 120] TJ [-120 ${glyphs("績報告書")}] TJ`);
+  const editor = new PdfTextEditor(makePdf(content));
+  const [match] = await editor.searchText("実績報告書");
+  assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "報告書"), { allowed: true, mode: "variable-length-safe" });
+  await editor.replaceTextMatch(match.id, "報告書");
+  assert.equal(
+    new TextDecoder("latin1").decode(await editor.save()).match(/BT[\s\S]*?ET/g).at(-1),
+    `BT /FJP 12 Tf 72 700 Td [${glyphs("報告書")} 120] TJ [-120 <>] TJ ET`
+  );
+  assert.deepEqual(await replaceThroughSaveAndReopen(content, "実績報告書", "報告書"), ["報告書", ""]);
+});
+
+test("does not mistake an operator's own numeric operands for spacing between strings", async () => {
+  // `12` belongs to Tf and `72 700` to Td: neither displaces one string relative to
+  // another, so two plainly consecutive Tj operators stay adjacent.
+  const editor = new PdfTextEditor(makePdf(body(`${glyphs("実")} Tj ${glyphs("績報告書")} Tj`)));
+  const [match] = await editor.searchText("実績報告書");
+  assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "報告書"), { allowed: true, mode: "variable-length-safe" });
+});
+
 /* ----------------------------------------------------------------- unsafe structures */
 
 /** Each of these is searchable as one string, but must refuse a length change. */
@@ -273,7 +339,15 @@ test("still deletes a multi-run match by emptying each operand's own share", asy
 /* ------------------------------------------- the check and the replacement agree */
 
 test("never reports a replacement as allowed that the replacement itself then refuses", async () => {
-  const fixtures = [SAFE_TJ, SAFE_TJ_OPERATORS, ...Object.values(unsafeStructures).map(([content]) => content)];
+  const fixtures = [
+    SAFE_TJ,
+    SAFE_TJ_OPERATORS,
+    body(`[${glyphs("実")} 0] TJ [${glyphs("績報告書")}] TJ`),
+    body(`[${glyphs("実")} 120] TJ [${glyphs("績報告書")}] TJ`),
+    body(`${glyphs("実")} Tj [120 ${glyphs("績報告書")}] TJ`),
+    body(`[${glyphs("実")} 120] TJ [-120 ${glyphs("績報告書")}] TJ`),
+    ...Object.values(unsafeStructures).map(([content]) => content)
+  ];
   // Shorter, longer, equal-length, delete, and identical -- one of each replacement shape.
   const replacements = ["報告書", "事業実績報告書", "事業年度報", "", "実績報告書"];
   for (const content of fixtures) {

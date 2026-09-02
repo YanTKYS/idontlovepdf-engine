@@ -71,7 +71,12 @@ export type TextMatchReplacementMode =
  * never the document's content.
  */
 export type TextMatchReplacementObstacle =
-  /** A non-zero `TJ` adjustment sits between two of the match's operands. */
+  /**
+   * The `TJ` adjustments between two of the match's operands do not sum to zero, so the
+   * second is displaced from the first. Counted wherever the numbers are written --
+   * inside one array, at the end of one, or at the start of the next -- since all three
+   * displace the following string by the same amount.
+   */
   | "non-zero-tj-adjustment"
   /** A `Tc`/`Tw`/`Tz`/`Tr`, colour, or marked-content operator sits between them. */
   | "text-state-boundary"

@@ -137,10 +137,15 @@ function refusal(code, reason, unsafeReason) {
  * advances nothing -- so the page depends only on the concatenation of the operands, not
  * on how the characters are distributed among them. Moving them all into the first
  * operand is then exactly the single-operand replacement v0.2.1 already does, with no
- * glyph width, text matrix, or spacing arithmetic anywhere. (Verified against pdf.js as
- * an independent implementation: redistributing characters across such a group leaves
- * every glyph's drawn position identical -- including under a uniform `Tc`/`Tw`/`Tz` set
- * before the group -- while each structure refused below genuinely moves the page.)
+ * glyph width, text matrix, or spacing arithmetic anywhere.
+ *
+ * "Separated only by zero-valued adjustments" is about the NET displacement between two
+ * strings, not about where the numbers are written: a `TJ` number moves the next string
+ * whether it sits at the end of one array, at the start of the next, or between two
+ * operands of a single one, so `[(A) 120] TJ [(B)] TJ` is no more an adjacency than
+ * `[(A) 120 (B)] TJ` is. scanTextRuns() sums across the operator boundary for exactly
+ * this reason; reading only the numbers inside an array would let a kern be silently
+ * relocated to after the replacement.
  *
  * Everything else is refused. A non-zero adjustment is real spacing between two specific
  * glyphs, and honouring it after moving characters would mean re-deciding what it should
@@ -155,9 +160,14 @@ function variableLengthObstacle(span, current) {
     // A null join means this run starts its own continuity group, which a match should
     // never span. Refuse rather than assume the scanner and the match agree.
     if (!join) return "unsupported-topology";
-    if (join.kind === "adjacent-operator") continue;
-    if (join.kind !== "tj-array") return "text-state-boundary";
-    // Compared as a number, so `0`, `0.0`, `+0`, `-0` and `-0.0` are all the same zero.
+    if (join.kind === "state-change") return "text-state-boundary";
+    // The two operands are adjacent only if nothing displaces the second relative to the
+    // first. That holds for a `TJ` adjustment between two operands of one array and,
+    // equally, for one spanning the operator boundary -- `[(A) 120] TJ [(B)] TJ` moves B
+    // exactly as `[(A) 120 (B)] TJ` does, and a scanner that only looked inside arrays
+    // would read it as a plain adjacency and quietly relocate the 120. Compared as a
+    // number, so `0`, `0.0`, `+0`, `-0` and `-0.0` are all the same zero, and a pair
+    // that cancels out (`[(A) 120] TJ [-120 (B)] TJ`) is genuinely adjacent.
     if (join.adjustment !== 0) return "non-zero-tj-adjustment";
   }
   return null;
