@@ -63,7 +63,13 @@ const ERROR_CATEGORIES = [
   { pattern: /Circular \/(Kids|Prev)/i, label: "PDF構造が循環している（破損の可能性）" },
   { pattern: /Maximum call stack size exceeded/i, label: "構造が深すぎる、または循環している" },
   { pattern: /saved PDF contains no editable text runs/i, label: "再読込失敗（保存結果から本文runを取り出せない）" },
-  { pattern: /separate text runs, so a replacement of/, label: "複数runにまたがる一致で置換前後の文字数が異なるため置換不可（MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED）" },
+  {
+    pattern: /separate text runs, so a replacement of/,
+    label: "複数runにまたがる一致で、字間調整・書式境界のため文字数を変える置換ができない構造（MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED）",
+    // engineが付ける内部診断（non-zero-tj-adjustment / text-state-boundary /
+    // unsupported-topology）。PDFの中身そのものではなく構造の種別だけを示す。
+    detail: (text) => text.match(/\(((?:non-zero-tj-adjustment|text-state-boundary|unsupported-topology))\)/)?.[1] ?? null
+  },
   { pattern: /spans \d+ fonts/, label: "複数fontにまたがる一致のため置換不可（MULTI_RUN_FONT_CHANGE_UNSUPPORTED）" },
   { pattern: /match is stale|This match is stale/, label: "検索結果が古くなっている（対象の文字列が変化したため置換を中止）" },
   { pattern: /Unknown search match/, label: "match IDが無効（検索をやり直してください）" },

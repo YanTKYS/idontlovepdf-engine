@@ -501,18 +501,22 @@ function matchLabel(match) {
 }
 
 /**
- * 置換前に分かる範囲での置換可否表示。`runCount`はengineが返す「その一致がPDF上いくつの
- * 描画命令へ分かれているか」で、PDF内部構造の判断はengine側で完結している。CMap逆引きの
- * 可否など実行してみないと分からないものは含めない（その場合は実行時エラーとして表示する）。
+ * 置換可否は engine の `checkTextMatchReplacement()` に判断させる。PoC側は`runCount`や
+ * `TJ`・operator構造を見て可否を決めない（v0.2.1では`runCount > 1`なら異文字数を一律に
+ * 止めていたが、v0.3.0では構造によっては安全に置換できるため、その判断はengineの責務）。
  */
-function matchFeasibility(match) {
-  // "構造上" is deliberate: a single run can still fail at replace time (no ToUnicode,
-  // no reverse CMap entry, a glyph missing from the existing font).
-  if (match.runCount === 1) return { level: "ok", label: "○ 単一run（構造上置換可能）" };
-  return {
-    level: "conditional",
-    label: `△ ${match.runCount}runに分割されています（置換後の文字数が元の一致と同じ場合、または削除の場合に対応）`
-  };
+const REPLACEMENT_MODE_LABELS = {
+  "single-run": "○ 単一runのため置換できます",
+  "same-length": "○ 同じ文字数のため、元のrun境界を保ったまま置換できます",
+  "delete": "○ 一致範囲を削除できます",
+  "variable-length-safe": "○ 構造上安全に文字数を変えて置換できます"
+};
+
+async function describeReplacement(match, replacementText) {
+  const check = await single.editor.checkTextMatchReplacement(match.id, replacementText);
+  if (check.allowed) return { level: "ok", label: REPLACEMENT_MODE_LABELS[check.mode] ?? `○ 置換できます（${check.mode}）` };
+  const classified = classifyError(check.reason);
+  return { level: "ng", label: `× 置換できません: ${classified ?? check.code}` };
 }
 
 function renderSearchResults() {
@@ -531,7 +535,6 @@ function renderSearchResults() {
   summary.textContent = `検索結果: ${search.matches.length} 件`;
 
   search.matches.forEach((match, index) => {
-    const feasibility = matchFeasibility(match);
     const row = element("div", { className: "match-row" });
     const label = element("label", { attributes: { for: `match-${index}` } });
 
@@ -542,8 +545,9 @@ function renderSearchResults() {
     label.append(radio);
 
     const body = element("div", { className: "match-body" });
-    body.append(element("span", { className: `chip chip-${feasibility.level === "ok" ? "ok" : "warn"}`, text: feasibility.label }));
     body.append(element("span", { className: "match-context", text: `${index + 1}. ${matchLabel(match)}` }));
+    // 置換可否はここでは判定しない。置換後の文字列が決まってからengineの
+    // checkTextMatchReplacement() に問い合わせる（refreshReplacementVerdict()）。
     body.append(element("span", { className: "sub", text: `${match.runCount}run構成` }));
     label.append(body);
     row.append(label);
@@ -578,14 +582,7 @@ function selectMatch(index) {
   clear(detail);
   detail.hidden = false;
   detail.append(element("p", { text: `選択中の一致: ${displayText(match.text)}` }));
-  const feasibility = matchFeasibility(match);
-  detail.append(element("p", { text: feasibility.label }));
-  if (match.runCount > 1) {
-    detail.append(element("p", {
-      className: "sub",
-      text: `複数runにまたがる一致です。置換後の文字数が元の一致（${[...match.text].length}文字）と同じ場合、または空文字（削除）の場合に置換できます。それ以外はengineが明確に拒否します。`
-    }));
-  }
+  detail.append(element("p", { className: "sub", text: `${match.runCount}runに分割されています。` }));
 
   if (single.modifyBlocked) {
     detail.append(element("p", { className: "warn", text: "このPDFでは文書変更が許可されていません（/P permission）。置換は実行できません。" }));
@@ -596,11 +593,36 @@ function selectMatch(index) {
   $("replace-input").disabled = false;
   $("replace-input").value = match.text;
   $("replace-run").disabled = false;
+  void refreshReplacementVerdict();
+}
+
+/**
+ * 置換後テキスト欄の内容について、engineに可否を問い合わせて表示する。実際の
+ * `replaceTextMatch()` と同じ内部planを使うため、ここで「可」と出たものが実行時に
+ * 「構造上非対応」になることはない。
+ */
+async function refreshReplacementVerdict() {
+  const match = search.selectedIndex === null ? null : search.matches[search.selectedIndex];
+  const line = $("replace-verdict");
+  if (!match || !single.editor || single.modifyBlocked) {
+    line.hidden = true;
+    return;
+  }
+  let verdict;
+  try {
+    verdict = await describeReplacement(match, $("replace-input").value);
+  } catch (error) {
+    verdict = { level: "ng", label: `× 置換可否を判定できませんでした: ${messageOf(error)}` };
+  }
+  line.hidden = false;
+  line.className = `sub ${verdict.level === "ok" ? "ok-title" : "warn"}`;
+  line.textContent = verdict.label;
 }
 
 function resetMatchReplaceUi() {
   search.selectedIndex = null;
   hide($("match-detail"));
+  hide($("replace-verdict"));
   $("replace-input").value = "";
   $("replace-input").disabled = true;
   $("replace-run").disabled = true;
@@ -942,6 +964,9 @@ function main() {
     void handleCorpusFiles(files);
   }, { multiple: true });
 
+  $("replace-input").addEventListener("input", () => {
+    void refreshReplacementVerdict();
+  });
   $("search-input").addEventListener("input", (event) => {
     void runSearch(event.target.value);
   });

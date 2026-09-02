@@ -2,6 +2,19 @@
 
 各versionのリリース内容を新しい順に記載します。H2見出しには、`v`付きversionとGitHub Releaseのtitleを記載します。
 
+## v0.3.0 - Safe variable-length multi-run replacement
+
+- **複数runにまたがる一致について、安全性をengineが証明できる構造に限り、置換前後の文字数が異なる置換へ対応**しました。v0.2.1では一律に拒否していたケースの一部が置換できます
+- 対応した構造は次の2つだけです
+  - 対象run間の`TJ` numeric adjustmentがすべて0（`[(実) 0 (績) 0 (報) 0 (告) 0 (書)] TJ`。隣接operand、`0.0`・`+0`・`-0`等の数値表現も0として扱います）
+  - 対象run間に他のoperatorが一切ない連続した text-showing operator（`(実) Tj (績) Tj ...`）
+- この2つでは、0調整は文字送りを0だけ動かし、空のstring operandは何も描画せず何も進めないため、描画結果はoperandの連結だけで決まります。したがってreplacement全体を先頭operandへ入れ残りを空にする書き換えは、既存の単一run置換と同一の結果になります（Mozilla pdf.jsを独立実装として用い、この書き換えで全glyphの描画位置が変わらないこと、および下記の拒否対象では実際に描画が変わることを確認しています）
+- 事前判定API `await editor.checkTextMatchReplacement(matchId, replacement)` を追加。`{ allowed, mode }` または `{ allowed: false, code, reason, unsafeReason? }` を返します。`mode` は `single-run` / `same-length` / `delete` / `variable-length-safe`。利用側が`runCount`や`TJ`構造を見て可否を判断する必要はありません
+- 事前判定と `replaceTextMatch()` は同一の内部replacement planを使うため、「事前判定はallowedだったが実行時に非対応」は発生しません。font encode不能（既存fontに該当glyphがない）も事前判定で検出します
+- 非0の`TJ` adjustment、`Tc`/`Tw`/`Tz`/`Tr`・色指定・marked content等をまたぐ場合は、引き続き `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として明示的に拒否します。numeric adjustmentの削除・合算・再配置・再計算、glyph幅からの文字送り計算、text matrix再構成は一切行いません。構造の種別は `unsafeReason`（`non-zero-tj-adjustment` / `text-state-boundary` / `unsupported-topology`）で区別できます
+- 置換はatomicです。全runのencodeに成功してから一括で反映するため、途中のencode失敗で一部runだけ書き換わった状態にはなりません
+- v0.2.1の挙動を維持: `searchText()` の continuity rule と一致件数、複数run同文字数置換（元のrun境界へ配分する方式）、複数run削除、単一runの異文字数置換、opaque match ID・`MATCH_STALE`・`UNKNOWN_MATCH`、既存の暗号化PDF対応
+
 ## v0.2.1 - Multi-run text search and replace
 
 - **複数text runへ分割された語句の検索へ対応。** PDFは1つの語を複数のtext-showing operandとして描画することがあり（例: `令和6年度` が `[(令) 120 (和) -20 (6) 0 (年) 0 (度)] TJ` の5 operand）、v0.2.0のrun単位検索では1文字しか一致しませんでした

@@ -241,6 +241,28 @@ const CONTINUITY_SAFE_OPERATORS = new Set([
 const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
 
 /**
+ * How a string operand joins the one before it *within the same text-showing operator*
+ * -- i.e. an earlier element of the same `TJ` array. `adjustment` is the total of the
+ * numbers between them, so two adjacent strings (`[(a)(b)]`) report 0, exactly like an
+ * explicit `[(a) 0 (b)]`. null when this is the operator's first operand: what it joins
+ * is then decided across operators, by joinAcrossOperators() below.
+ */
+function joinWithinOperator(strings, adjustment) {
+  return strings.length ? { kind: "tj-array", adjustment } : null;
+}
+
+/**
+ * How an operator's first string operand joins the last run of the previous operator:
+ * "adjacent-operator" when literally nothing ran in between, "state-change" when
+ * something did, and null when there is no previous run in this continuity group at all.
+ */
+function joinAcrossOperators(runs, continuityId, boundaryClean) {
+  const previous = runs.at(-1);
+  if (!previous || previous.continuityId !== continuityId) return null;
+  return { kind: boundaryClean ? "adjacent-operator" : "state-change" };
+}
+
+/**
  * Extracts text-showing operands (Tj/TJ/'/" strings, inside BT...ET) from a content
  * stream, as a lightweight scanner -- not a full PDF content-stream parser or AST.
  * `context`, when given, is threaded into any parse-failure message via
@@ -255,6 +277,23 @@ const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
  * scanner sees anything that could move the text cursor or swap the font, so runs on
  * either side of such an operator are never joined; the full list is above and in the
  * operator dispatch below.
+ *
+ * Each run additionally carries `joinBefore`, describing how it is attached to the run
+ * before it. Search does not use it -- continuityId already answers "may these be read
+ * as one string". It answers the stricter, separate question a variable-length
+ * replacement has to ask: "may characters be moved BETWEEN these operands without
+ * moving anything on the page" (see planTextMatchReplacement() in pdf-document.js).
+ *
+ *   null                                    first run of its continuity group
+ *   { kind: "tj-array", adjustment }        previous run is an earlier operand of the
+ *                                           same TJ array; `adjustment` is the sum of
+ *                                           the numbers between them (0 when adjacent)
+ *   { kind: "adjacent-operator" }           previous run belongs to an earlier
+ *                                           text-showing operator with nothing at all
+ *                                           in between
+ *   { kind: "state-change" }                something ran in between -- one of the
+ *                                           CONTINUITY_SAFE_OPERATORS above, since
+ *                                           anything else would have ended the group
  */
 export function scanTextRuns(bytes, context = "") {
   const strings = [];
@@ -270,12 +309,20 @@ export function scanTextRuns(bytes, context = "") {
   let textObjectId = -1;
   // Incremented by every boundary below. Runs are joinable only while it holds still.
   let continuityId = 0;
+  // True while nothing at all has run since the last text-showing operator, which is
+  // what separates joinBefore's "adjacent-operator" from its "state-change".
+  let boundaryClean = false;
+  // Numbers seen since the last string operand was collected: a TJ array's inter-string
+  // adjustment. Summed rather than kept singly, since `[(a) 5 -5 (b)]` is two of them
+  // and it is their total displacement that decides whether (a) and (b) are adjacent.
+  let adjustment = 0;
   while (cursor < bytes.length) {
     cursor = skipWhite(bytes, cursor);
     if (cursor >= bytes.length) break;
     if (bytes[cursor] === 0x28) {
       const token = withStreamContext(() => readLiteral(bytes, cursor), bytes, cursor, context);
-      strings.push({ ...token, start: cursor });
+      strings.push({ ...token, start: cursor, joinBefore: joinWithinOperator(strings, adjustment) });
+      adjustment = 0;
       cursor = token.end;
       continue;
     }
@@ -291,7 +338,8 @@ export function scanTextRuns(bytes, context = "") {
     }
     if (bytes[cursor] === 0x3c) {
       const token = withStreamContext(() => readHex(bytes, cursor), bytes, cursor, context);
-      strings.push({ ...token, start: cursor });
+      strings.push({ ...token, start: cursor, joinBefore: joinWithinOperator(strings, adjustment) });
+      adjustment = 0;
       cursor = token.end;
       continue;
     }
@@ -310,12 +358,18 @@ export function scanTextRuns(bytes, context = "") {
     const operator = latin1.decode(bytes.subarray(start, cursor));
     // A number is an operand (`12` in `/F1 12 Tf`, an adjustment in a TJ array), not an
     // operator: it must not clear the pending strings, the pending /Name, or continuity.
-    if (NUMBER.test(operator)) continue;
+    // Between two string operands it is a TJ spacing adjustment, and is accumulated for
+    // the next one's joinBefore; anywhere else it belongs to an operator, not to a gap.
+    if (NUMBER.test(operator)) {
+      if (strings.length) adjustment += Number(operator);
+      continue;
+    }
     if (operator === "BI") {
       cursor = skipInlineImage(bytes, cursor);
       strings.length = 0;
       lastName = null;
       continuityId += 1;
+      boundaryClean = false;
     } else if (operator === "BT") {
       inText = true;
       currentFont = null;
@@ -324,10 +378,12 @@ export function scanTextRuns(bytes, context = "") {
       // A new text object starts wherever its own Td/Tm puts it, so text before this
       // `BT` and text after it are unrelated positions on the page.
       continuityId += 1;
+      boundaryClean = false;
     } else if (operator === "ET") {
       inText = false;
       strings.length = 0;
       continuityId += 1;
+      boundaryClean = false;
     } else if (inText && operator === "Tf") {
       // A replacement spanning two fonts would have to encode its characters through
       // two different CMaps, so v0.2.1 does not join text across a font switch. Re-
@@ -335,17 +391,32 @@ export function scanTextRuns(bytes, context = "") {
       if (lastName !== currentFont) continuityId += 1;
       currentFont = lastName;
       strings.length = 0;
+      boundaryClean = false;
     } else if (inText && (operator === "Tj" || operator === "'" || operator === "\"" || operator === "TJ")) {
       // `'` and `"` move to the next line before showing their string, so what they
       // draw never continues the text that precedes them.
       if (operator === "'" || operator === "\"") continuityId += 1;
-      for (const string of strings) runs.push({ ...string, fontName: currentFont, textObjectId, continuityId });
+      strings.forEach((string, index) => {
+        // The first operand of this operator joins whatever the previous operator left
+        // behind; the rest join their neighbour inside this operator's own array.
+        const joinBefore = index === 0
+          ? joinAcrossOperators(runs, continuityId, boundaryClean)
+          : string.joinBefore;
+        runs.push({ ...string, fontName: currentFont, textObjectId, continuityId, joinBefore });
+      });
       strings.length = 0;
+      adjustment = 0;
+      boundaryClean = true;
     } else {
       strings.length = 0;
       lastName = null;
+      adjustment = 0;
       // Td/TD/Tm/T* land here, as does every operator not vouched for above.
       if (!CONTINUITY_SAFE_OPERATORS.has(operator)) continuityId += 1;
+      // Even an operator that keeps text searchable (a colour, `Tc`, marked content)
+      // makes this a state-change boundary: moving characters across one of those would
+      // draw them under different text state than the PDF put them under.
+      boundaryClean = false;
     }
   }
   return runs;

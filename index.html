@@ -270,16 +270,18 @@
               <input id="replace-input" type="text" placeholder="置換後の文字列" disabled>
             </label>
           </div>
+          <p class="sub" id="replace-verdict" hidden></p>
           <div class="actions">
             <button id="replace-run" type="button" disabled>置換してPDFを保存</button>
           </div>
           <div class="block error" id="replace-error" hidden></div>
           <div class="block" id="replace-result" hidden></div>
           <p class="sub">
-            置換は元PDFのバイト列の複製に対して行い、<span class="mono">replaceText()</span> → <span class="mono">save()</span> →
+            置換は元PDFのバイト列の複製に対して行い、<span class="mono">replaceTextMatch()</span> → <span class="mono">save()</span> →
             保存結果の再読込確認（reopen）を経て、成功した場合だけ<span class="mono">元ファイル名.edited.pdf</span>としてローカル保存します。
-            <strong>元のPDFファイルは変更しません。</strong>複数runにまたがる一致は、置換後の文字数が元の一致と同じ場合のみ自動対応します。
-            それ以外は「現在のPoCでは置換不可」と表示します。
+            <strong>元のPDFファイルは変更しません。</strong>置換できるかどうかは
+            <span class="mono">checkTextMatchReplacement()</span> がengine側で判定し、上に表示します。
+            複数runにまたがる一致で置換後の文字数が変わる場合は、字間調整や書式の境界をまたがない構造に限って対応します。
           </p>
         </div>
       </div>

@@ -2,7 +2,7 @@
 
 既存 PDF の content stream にあるテキスト表示オペランドを、ブラウザ内だけで置換する PDF 処理エンジンです。Apryse WebViewer や Foxit PDF SDK for Web が提供する「既存本文編集」のうち、最小限の置換処理を、サーバー送信・外部 API・実行時依存パッケージなしで実現します。
 
-> **スコープ:** PDF の文字列は、見た目の文章ではなく、フォント固有の文字コードと描画命令です。本エンジンはレイアウトを再構成せず、既存の `Tj`、`TJ`、`'`、`"` の文字列オペランドを置換します。行の折返し、字間調整、フォント埋込みは行いません。**任意の PDF を完全に編集できることを保証するものではありません。** 暗号化 PDF は認証・復号・検索まで対応しますが、**暗号化 PDF への変更の再保存（再暗号化）は未対応**です。複数の text run にまたがる一致については、**置換前後の文字数が異なる置換を拒否**します（削除と単一 run 内の置換は除く。理由は [`replaceTextMatch()`](#await-editorreplacetextmatchmatchid-replacement) を参照）。
+> **スコープ:** PDF の文字列は、見た目の文章ではなく、フォント固有の文字コードと描画命令です。本エンジンはレイアウトを再構成せず、既存の `Tj`、`TJ`、`'`、`"` の文字列オペランドを置換します。行の折返し、字間調整、フォント埋込みは行いません。**任意の PDF を完全に編集できることを保証するものではありません。** 暗号化 PDF は認証・復号・検索まで対応しますが、**暗号化 PDF への変更の再保存（再暗号化）は未対応**です。複数の text run にまたがる一致で置換前後の文字数が変わる場合は、**engine が安全性を証明できる構造に限って**対応し、それ以外は拒否します（理由と対応範囲は [`replaceTextMatch()`](#await-editorreplacetextmatchmatchid-replacement) を参照）。
 
 ## 目的・位置付け
 
@@ -34,7 +34,8 @@
 - 暗号化 PDF は `Standard` ハンドラの上記 2 組（R4/AESV2, R6/AESV3）のみ対応。`/R 2`・`/R 3`・`/R 5`・`/Adobe.PubSec` 等は診断のみで停止
 - **暗号化 PDF への変更の保存（再暗号化）は未対応**。変更がなければ元 bytes をそのまま返せます
 - ページ座標・フォントサイズは公開していません。置換後の文字幅に応じた再レイアウトはしません
-- 複数の text run にまたがる一致は、**同じ文字数への置換**と**削除**のみ対応します。文字数が変わる置換は `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として拒否します
+- 複数の text run にまたがる一致で文字数が変わる置換は、対象 run 間の `TJ` numeric adjustment がすべて 0 の場合、または対象 run 間に他の operator が一切ない連続した text-showing operator の場合のみ対応します。非 0 の字間調整や `Tc`/`Tw`/`Tz`/`Tr`・色指定・marked content をまたぐ場合は `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として拒否します（同じ文字数への置換と削除は構造によらず可能です）
+- 字間調整（`TJ` の numeric adjustment）の削除・合算・再計算、glyph 幅からの文字送り計算、text matrix の再構成は行いません
 - 検索は `Td` / `TD` / `Tm` / `T*`、別 `BT ... ET`、font 変更等をまたぎません。これらをまたいで 1 つの語が描画されている PDF では、その語は分断されたまま検索されます
 
 ## 正式公開API と 内部実装
@@ -48,6 +49,7 @@ import { PdfTextEditor, ENGINE_VERSION } from "@idontlovepdf/engine"; // また�
 **高レベル API（一般利用側はこちらを使ってください）**
 
 - `await editor.searchText(query, password?)` — 利用者が見える文字列として本文を検索する
+- `await editor.checkTextMatchReplacement(matchId, replacement)` — その置換が可能かを、何も変更せずに判定する
 - `await editor.replaceTextMatch(matchId, replacement)` — 検索結果をそのまま置換する
 
 **低レベル API（デバッグ・技術検証用途。互換のため維持）**
@@ -78,6 +80,10 @@ console.log(ENGINE_VERSION);
 // 検索。PDF 内部で "令"/"和"/"6"/"年"/"度" と 5 run に分かれていても 1 件の一致になる。
 const matches = await editor.searchText("令和6年度");
 console.log(matches.length, matches[0].text, matches[0].runCount);
+
+// 置換可否の事前判定。run 数や TJ 構造を利用側が見る必要はない。
+const check = await editor.checkTextMatchReplacement(matches[0].id, "令和7年度");
+console.log(check); // { allowed: true, mode: "same-length" }
 
 // 置換。run 単位へ分解して replaceText() を複数回呼ぶ必要はない。
 await editor.replaceTextMatch(matches[0].id, "令和7年度");
@@ -120,7 +126,7 @@ downloadLink.href = url;
 - 別の `BT ... ET`ブロック、および `ET` → `BT`
 - 明確な位置変更: `Td` / `TD` / `Tm` / `T*`
 - 改行動作を含む text-showing operator `'` / `"`（直前の文字列とは連結しません）
-- `Tf` による font 変更（複数 font にまたがる置換は安全なエンコード先を決められないため、v0.2.1 では検索の時点で切ります）
+- `Tf` による font 変更（複数 font にまたがる置換は安全なエンコード先を決められないため、検索の時点で切ります）
 - 上記以外でも、位置・font を変えないと確認できていない operator はすべて境界として扱います。位置も font も変えない operator（`Tc`・`Tw`・`Tz`・`Tr`・`TL`・色指定・marked content の `BDC`/`EMC` 等）だけが連続とみなされます
 
 **match ID は opaque** です。内部形式に依存しないでください。ID は**同じ editor インスタンスの、直近の `searchText()` 呼び出しの分だけが有効**で、次の `searchText()` を呼ぶと無効になります（無効な ID は `error.code = "UNKNOWN_MATCH"`）。
@@ -129,28 +135,79 @@ downloadLink.href = url;
 
 同じ文字列が複数ある場合は、それぞれ別の一致（別の ID）として返します。
 
+### `await editor.checkTextMatchReplacement(matchId, replacement)`
+
+その置換が可能かどうかを、**何も変更せずに**判定します。可否の判断に PDF 内部構造の知識が要るため、利用側が `runCount` や `TJ` 構造を見て判断する必要はありません（`runCount` は表示用の参考情報です）。
+
+```js
+await editor.checkTextMatchReplacement(id, "令和7年度");
+// → { allowed: true, mode: "same-length" }
+
+await editor.checkTextMatchReplacement(id, "今年度");
+// → { allowed: false, mode: null,
+//      code: "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED",
+//      reason: "...", unsafeReason: "non-zero-tj-adjustment" }
+```
+
+`mode` は置換が **どう書かれるか** を表します。
+
+| `mode` | 意味 |
+| --- | --- |
+| `single-run` | 一致が 1 つの run に収まる。run 全体を書き直すため文字数は自由 |
+| `same-length` | 複数 run・同じ文字数。元の run 境界へ配分する |
+| `delete` | 複数 run の削除。各 run が自分の担当部分だけを空にする |
+| `variable-length-safe` | 複数 run・異なる文字数。後述の安全な構造に限る |
+
+拒否の場合は `code`（後述の表）と `reason` を返し、**例外は投げません**。「可能か？」という問い合わせ自体は誤りではないためです。
+
+この判定は `replaceTextMatch()` と**同一の内部 replacement plan** を使います。したがって「事前判定では `allowed: true` だったのに実行時に構造上非対応で失敗する」ことはありません。既存 font にその文字の glyph がない場合（`FONT_ENCODING_UNSUPPORTED`）も、実際に encode を試すためここで検出できます。
+
 ### `await editor.replaceTextMatch(matchId, replacement)`
 
-`searchText()` の一致を、またがっている run すべてにわたって置換予約します。利用側が run 構造を理解する必要はありません。
+`searchText()` の一致を、またがっている run すべてにわたって置換予約します。利用側が run 構造を理解する必要はありません。判定内容は `checkTextMatchReplacement()` と同一です。
 
 - **一致が 1 つの run に収まる場合**は、`replaceText()` と同じ「run 全体の書き換え」になります。文字数が変わっても構いません
-- **複数 run にまたがる場合**は、各 run が元の一致へ提供していた文字数と同じ配分で置換文字列を割り当てます。`申請は令` + `和6年` + `度です` を `令和6年度` → `令和7年度` で置換すると `申請は令` + `和7年` + `度です` になります。string operand の数、`TJ` の numeric adjustment、operator 構造はそのまま維持します
-- 一致の前後にある文字（prefix / suffix）は失われません
+- **複数 run にまたがり、文字数が同じ場合**は、各 run が元の一致へ提供していた文字数と同じ配分で置換文字列を割り当てます。`申請は令` + `和6年` + `度です` を `令和6年度` → `令和7年度` で置換すると `申請は令` + `和7年` + `度です` になります。string operand の数、`TJ` の numeric adjustment、operator 構造はそのまま維持します
 - **`replacement` に空文字列を渡すと削除**になります。一致に完全に含まれる operand は空文字列の operand として残り、content stream を組み直すことはしません（incremental save 方針を維持するため）
+- 一致の前後にある文字（prefix / suffix）は、いずれの場合も失われません
 
-**安全に成立しない置換は、黙って実行せず明確に拒否します。** `error.code` で判別してください。
+#### 複数 run にまたがる、文字数が変わる置換（`variable-length-safe`）
+
+対象 run どうしが**次のいずれかで接している場合に限り**対応します。
+
+- 同じ `TJ` 配列内で、**対象 run 間の numeric adjustment がすべて 0**（`[(実) 0 (績) 0 (報) 0 (告) 0 (書)] TJ`）。operand が隣接しているだけの場合、および `0.0`・`+0`・`-0`・`-0.0` のような表記も 0 として扱います
+- **対象 run 間に他の operator が一切ない**、連続した text-showing operator（`(実) Tj (績) Tj (報) Tj ...`）
+
+このとき、0 の adjustment は文字送りを 0 だけ動かし、空の string operand は何も描画せず何も進めません。つまり描画結果は **operand の連結だけで決まり、文字がどの operand に入っているかには依存しません**。そこで置換文字列全体を先頭の対象 operand へ入れ、残りの対象 operand を空にします。operand 数・operator 構造・adjustment はすべて元のまま保たれ、結果は既存の単一 run 置換と同じものになります。glyph 幅の推測も、text matrix の再計算も行いません。
+
+```text
+置換前: [(申請は) 120 (実) 0 (績) 0 (報告書) -35 (です)] TJ
+置換後: [(申請は) 120 (報告書) 0 <> 0 <> -35 (です)] TJ      ← 実績報告書 → 報告書
+```
+
+対象 run 間に **非 0 の numeric adjustment**、または `Tc` / `Tw` / `Tz` / `Tr` / 色指定 / marked content（`BDC`・`EMC` 等）がある場合は**拒否**します。前者は特定の 2 文字の間隔として指定されたものであり、文字を動かした後に何であるべきかを決め直すことになるため。後者は 2 つの operand が異なる text state で描画されているため、文字をまたいで動かすと PDF が指定した見た目と変わってしまうためです。いずれも推測で埋めることはしません。
+
+なお `Td` / `TD` / `Tm` / `T*`、別 `BT ... ET`、font 変更は `searchText()` の時点で連結しないため、そもそもそれらをまたぐ一致は存在しません。
+
+#### エラー
+
+`checkTextMatchReplacement()` は下表を `code` として返し、`replaceTextMatch()` は同じ `code` を持つ `Error` を投げます。
 
 | `error.code` | 意味 |
 | --- | --- |
-| `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED` | 複数 run にまたがる一致で、置換前後の文字数が異なる（削除を除く）。元の operand 境界へ文字を割り当て直すと `TJ` の字間調整に対して文字がずれ、見た目の文字位置が壊れるため拒否します。単一 run 内の置換、または削除であれば文字数が異なっても可能です |
+| `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED` | 複数 run にまたがる一致で、上記の安全な構造ではないため文字数を変えられない。`unsafeReason` に `non-zero-tj-adjustment` / `text-state-boundary` / `unsupported-topology` のいずれかが入ります |
 | `MULTI_RUN_FONT_CHANGE_UNSUPPORTED` | 一致が複数 font にまたがる（検索側で font 変更を境界にしているため通常は発生しません） |
+| `FONT_ENCODING_UNSUPPORTED` | 既存 font にその文字の glyph がない。新規 font 埋め込みや subset 再生成は行いません |
 | `MATCH_STALE` | 検索時点の文字列が現在の文書内容と食い違う。古い match ID で別の場所を書き換えないための保護です |
 | `UNKNOWN_MATCH` | この editor が発行していない、または次の `searchText()` で無効になった match ID |
+| `MODIFICATION_NOT_PERMITTED` | 暗号化 PDF の `/P` が文書変更を許可していない |
 | `EMPTY_QUERY` | `searchText()` に空文字列が渡された |
+
+置換は **atomic** です。対象 run すべての encode に成功してから一括で反映するため、途中で encode に失敗して「一部の run だけ書き換わった」状態にはなりません。
 
 文字数は UTF-16 code unit ではなく **Unicode code point**（`[...text]` 相当）で数えます。サロゲートペアは 1 文字です。grapheme cluster 単位の結合は行いません。
 
-置換文字の書き込みには、その run が使っている**既存 font の CMap** を使います。新しい font の埋め込みや subset の再生成は行わないため、既存 font にその文字が存在しない場合は従来どおり明確なエラーになります。
+置換文字の書き込みには、その run が使っている**既存 font の CMap** を使います。
 
 ### `await editor.listTextRuns(password?)`
 
@@ -254,11 +311,11 @@ GitHub Releaseのtitleと本文のsource of truthは[`docs/release-notes.md`](do
 1. 「単一PDF検証」タブでPDFを1件選ぶ（ドラッグ＆ドロップ可）
 2. 選択した元PDFを、ブラウザ標準のPDF表示で`<iframe>`にプレビューする（Blob URL、送信なし）
 3. `PdfTextEditor`初期化と`listTextRuns()`を実行し、検索欄を有効化する
-4. 検索文字列を入力すると、engine の `searchText()` を呼び、一致箇所を一覧表示する（一致件数・前後の文脈・置換可否バッジ・構成run数）
-5. 一致を1件選ぶと置換後テキスト欄にその一致テキストが入り、置換後の文字列を編集できる
+4. 検索文字列を入力すると、engine の `searchText()` を呼び、一致箇所を一覧表示する（一致件数・前後の文脈・構成run数）
+5. 一致を1件選ぶと置換後テキスト欄にその一致テキストが入り、置換後の文字列を編集できる。入力するたびに `checkTextMatchReplacement()` を呼び、その置換が可能かどうかをその場に表示する
 6. 「置換してPDFを保存」を押すと、`replaceTextMatch()` → `save()` → 保存結果の再読込確認（reopen）の順に検証し、成功した場合だけ`元ファイル名.edited.pdf`としてローカル保存する
 
-検索・置換はすべて engine の高レベル API 経由です。PoC 側は run をどう連結してよいかを一切判断しません（複数 run にまたがる 2 文字以上の検索がブラウザでも成立することの確認を兼ねています）。
+検索・置換可否判定・置換はすべて engine の高レベル API 経由です。PoC 側は run をどう連結してよいか、どの置換が安全かを一切判断しません。
 
 暗号化PDF（対応範囲: `Standard`/`V4`/`R4`/`AESV2`、および`Standard`/`V5`/`R6`/`AESV3`〈AES-256〉。いずれも`Identity`との併用可）は、空passwordでの自動認証 → 失敗時はパスワード入力欄を表示、という流れです。入力したパスワードは送信・保存されません。対応範囲外（`/R 2`・`/R 3`・`/R 5`・`/Adobe.PubSec`など）は診断専用の画面になります。
 
@@ -301,8 +358,8 @@ npx playwright install chromium   # 初回のみ（ローカルにChromiumがな
 npm run test:browser              # node --test（test/browser/*.test.js）。pretest:browserでdist/を自動ビルド
 ```
 
-`test/browser/smoke.test.js`は実際のheadless Chromium（Playwright）で`dist/idontlovepdf-engine.js`をbrowserへ`import`し、`PdfTextEditor`・`ENGINE_VERSION`のexportと、最小PDFの`listTextRuns()`成功、および複数runへ分割された日本語（`令和6年度`）の`searchText()` → `replaceTextMatch()` → `save()` → reopenまでを確認します。Playwrightのbrowser本体は`npm ci`だけでは用意されないため、`npm test`（Node専用）とは別の`npm run test:browser`に分離しています。CIでは`npm test` → `npx playwright install --with-deps chromium` → `npm run test:browser`の順で両方とも実行します（`.github/workflows/ci.yml`）。
+`test/browser/smoke.test.js`は実際のheadless Chromium（Playwright）で`dist/idontlovepdf-engine.js`をbrowserへ`import`し、`PdfTextEditor`・`ENGINE_VERSION`のexportと、最小PDFの`listTextRuns()`成功、複数runへ分割された日本語（`令和6年度`）の`searchText()` → `replaceTextMatch()` → `save()` → reopen、および複数runにまたがる異文字数置換（`実績報告書` → `報告書`）を確認します。後者では保存したPDFをBlob URLとしてChromium自身のPDF viewerへ読み込ませ、engineとは無関係な実装が受け付けることも確認しています。Playwrightのbrowser本体は`npm ci`だけでは用意されないため、`npm test`（Node専用）とは別の`npm run test:browser`に分離しています。CIでは`npm test` → `npx playwright install --with-deps chromium` → `npm run test:browser`の順で両方とも実行します（`.github/workflows/ci.yml`）。
 
-`test/dist-bundle.test.js`は通常PDF・xref stream・Object Stream・ToUnicode日本語・複数runにまたがる`searchText()`/`replaceTextMatch()`という代表的な組み合わせを、`src/index.js`ではなく`dist/idontlovepdf-engine.js`からimportした`PdfTextEditor`で処理し、bundle化によって主要機能が壊れていないことを確認します（Node専用APIのみで完結するため`npm test`に含まれます）。
+`test/dist-bundle.test.js`は通常PDF・xref stream・Object Stream・ToUnicode日本語・複数runにまたがる`searchText()`/`checkTextMatchReplacement()`/`replaceTextMatch()`という代表的な組み合わせを、`src/index.js`ではなく`dist/idontlovepdf-engine.js`からimportした`PdfTextEditor`で処理し、bundle化によって主要機能が壊れていないことを確認します（Node専用APIのみで完結するため`npm test`に含まれます）。
 
-`web/poc-core.js`はDOMに依存しないため、ブラウザPoCの純粋関数は`test/browser-poc.test.js`でNodeから直接検証しています。DOMテスト環境は追加していません。検索・置換のモデルはengine側（`src/pdf-document.js`）へ移したため、`test/search-text.test.js`が`searchText()`/`replaceTextMatch()`の仕様（continuity境界・誤一致防止・複数run置換・stale match等）を担当します。
+`web/poc-core.js`はDOMに依存しないため、ブラウザPoCの純粋関数は`test/browser-poc.test.js`でNodeから直接検証しています。DOMテスト環境は追加していません。検索・置換のモデルはengine側（`src/pdf-document.js`）にあるため、`test/search-text.test.js`が`searchText()`/`replaceTextMatch()`の仕様（continuity境界・誤一致防止・複数run置換・stale match等）を、`test/variable-length-replacement.test.js`が異文字数multi-run置換の安全判定（安全構造の往復・非安全構造の拒否・事前判定と実置換の一致）を担当します。
