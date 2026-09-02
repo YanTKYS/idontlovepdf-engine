@@ -96,14 +96,43 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The fallback-font tests skip without the Japanese font they need. Without this a
+      # release could be cut having never exercised the fallback font at all -- the very
+      # feature v0.4.0 exists for. Fetched from a pinned release tag and checked against a
+      # recorded SHA-256; see scripts/fetch-test-font.js. The engine never fetches anything.
+      - name: Fetch the fallback-font tests' font
+        run: npm run test:font
+
       - name: Run tests (Node)
-        run: npm test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee tmp/node-tests.log
+
+      - name: Verify no test was skipped
+        run: |
+          if grep -qE '^# skipped [1-9]' tmp/node-tests.log; then
+            echo "::error::Tests were skipped -- this release has not been fully tested."
+            grep -E '^# (tests|pass|fail|skipped)' tmp/node-tests.log
+            exit 1
+          fi
+          grep -E '^# (tests|pass|skipped)' tmp/node-tests.log
 
       - name: Install Playwright's Chromium (used by the browser bundle smoke test)
         run: npx playwright install --with-deps chromium
 
       - name: Run browser smoke test
-        run: npm run test:browser
+        run: |
+          set -o pipefail
+          npm run test:browser 2>&1 | tee tmp/browser-tests.log
+
+      - name: Verify no browser test was skipped
+        run: |
+          if grep -qE '^# skipped [1-9]' tmp/browser-tests.log; then
+            echo "::error::Browser tests were skipped -- this release has not been fully tested."
+            grep -E '^# (tests|pass|fail|skipped)' tmp/browser-tests.log
+            exit 1
+          fi
+          grep -E '^# (tests|pass|skipped)' tmp/browser-tests.log
 
       - name: Type/syntax check
         run: npm run check

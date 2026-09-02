@@ -291,6 +291,17 @@ async function planFallbackReplacement(editor, match, replacement) {
       return refusal("FALLBACK_MULTI_RUN_UNSUPPORTED", `This match is drawn as ${match.span.length} text runs that are not simply adjacent (${obstacle}), so it cannot be redrawn in another font as one piece`, obstacle);
     }
   }
+  // Word spacing reaches single-byte code 32 only, and the fallback font is written
+  // through a 2-byte encoding -- measured against pdf.js: a `Tw` that visibly moves simple
+  // font text leaves an Identity-H string exactly where it was. So a replacement holding a
+  // space would not be spaced the way the rest of the document's spaces are.
+  if ([...replacement].includes(" ") && pieces.some(({ run }) => run.wordSpacing !== 0)) {
+    return refusal(
+      "FALLBACK_WORD_SPACING_UNSUPPORTED",
+      "This text is drawn with word spacing (Tw) in force, which does not reach text written through the fallback font, so a replacement containing a space would be spaced differently from the rest of the document. Replace without a space, or edit text drawn without word spacing."
+    );
+  }
+
   const last = pieces.at(-1).run;
   if (!POSITION_SAFE_AFTER.has(last.followedBy)) {
     return refusal(
@@ -304,17 +315,18 @@ async function planFallbackReplacement(editor, match, replacement) {
     return { ...refusal("FALLBACK_FONT_MISSING_GLYPH", `The fallback font has no glyph for ${missing.map((character) => JSON.stringify(character)).join(", ")}`), characters: missing };
   }
 
-  // Object numbers are allocated once per editor and reused, so replacing ten runs
-  // embeds one font.
-  let embedded = editor.fallbackEmbedding;
-  if (!embedded) {
-    const start = Math.max(editor.document.size, ...[...editor.pendingObjects.keys()].map((number) => number + 1));
-    embedded = {
-      numbers: { type0: start, cidFont: start + 1, descriptor: start + 2, fontFile: start + 3, toUnicode: start + 4 },
-      resources: new Map(),
-      glyphs: new Map()
-    };
-  }
+  // A working copy of what has been embedded so far. Planning must not touch the
+  // editor's own record: checkTextMatchReplacement() runs this too, and if it marked a
+  // page as already carrying the font, the replaceTextMatch() that followed would skip
+  // adding it -- writing a content stream that names a font the page's /Resources never
+  // got. Object numbers are carried over, so replacing ten runs still embeds one font.
+  const base = editor.fallbackEmbedding;
+  const start = Math.max(editor.document.size, ...[...editor.pendingObjects.keys()].map((number) => number + 1));
+  const embedded = {
+    numbers: base?.numbers ?? { type0: start, cidFont: start + 1, descriptor: start + 2, fontFile: start + 3, toUnicode: start + 4 },
+    resources: new Map(base?.resources),
+    glyphs: new Map(base?.glyphs)
+  };
 
   const objects = new Map();
   const resourceNames = new Map();
@@ -325,8 +337,7 @@ async function planFallbackReplacement(editor, match, replacement) {
     if (registered.object) objects.set(registered.object.number, registered.object);
   }
 
-  const glyphMap = new Map(embedded.glyphs);
-  for (const glyph of glyphs) glyphMap.set(glyph.glyphId, glyph);
+  for (const glyph of glyphs) embedded.glyphs.set(glyph.glyphId, glyph);
 
   // Encode every piece before anything is staged, so a prefix or suffix the original font
   // cannot write fails here rather than half-way through.
@@ -364,15 +375,10 @@ async function planFallbackReplacement(editor, match, replacement) {
       ? REPLACEMENT_MODE.fallbackFont
       : REPLACEMENT_MODE.fallbackFontPartial);
 
-  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, glyphMap)) {
+  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, embedded.glyphs)) {
     objects.set(number, object);
   }
-  return {
-    allowed: true,
-    mode,
-    updates: [],
-    fallback: { embedding: { ...embedded, glyphs: glyphMap }, objects, edits }
-  };
+  return { allowed: true, mode, updates: [], fallback: { embedding: embedded, objects, edits } };
 }
 
 /**
@@ -813,9 +819,17 @@ export class PdfTextEditor {
    * the saved file -- a few megabytes for a CJK font. It is embedded once per document
    * however many replacements use it.
    *
-   * Throws `code: "FALLBACK_FONT_INVALID"` if the bytes are not a TrueType font.
+   * Throws `code: "FALLBACK_FONT_INVALID"` if the bytes are not a TrueType font, and
+   * `code: "FALLBACK_FONT_ALREADY_IN_USE"` if this editor has already written something
+   * with a fallback font. Text already replaced holds glyph ids of *that* font, and
+   * another font's ids mean different glyphs, so swapping it would silently turn text
+   * already written into the wrong characters. Setting a different font before the first
+   * replacement is fine.
    */
   async setFallbackFont(fontBytes) {
+    if (this.fallbackEmbedding) {
+      throw searchError("FALLBACK_FONT_ALREADY_IN_USE", "This editor has already written text with a fallback font; that text holds glyph ids of that font, so it cannot be exchanged for another. Save and reopen to start again with a different font.");
+    }
     this.fallbackFont = parseFallbackFont(fontBytes);
     return this;
   }

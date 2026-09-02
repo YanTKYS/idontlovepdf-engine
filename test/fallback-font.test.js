@@ -315,6 +315,92 @@ test("embeds one font however many replacements use it, across pages", { skip },
   assert.equal(latin1.decode(saved).match(/\/FontFile2/g).length, 1, "the font program must be written once");
 });
 
+/**
+ * Two pages, each with its own /Resources object, so each needs the fallback font
+ * registered separately even though they share the embedded font itself.
+ */
+function makeTwoPagePdf() {
+  return buildPdf([
+    encode("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+    encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>\nendobj\n"),
+    encode("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 4 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n"),
+    streamObject(4, REIWA),
+    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n"),
+    streamObject(6, CMAP),
+    encode("7 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 8 0 R /Resources 9 0 R >>\nendobj\n"),
+    streamObject(8, REIWA),
+    encode("9 0 obj\n<< /Font << /FJP 5 0 R >> >>\nendobj\n")
+  ]);
+}
+
+test("checking a replacement changes nothing, so a later replace still registers the font", { skip }, async () => {
+  // check() and replace() run one planner. If checking a second page recorded that page as
+  // already carrying the font, the replace that followed would skip adding it -- writing a
+  // content stream naming a font the page's /Resources never got. The caller's natural
+  // order is check-then-replace, so this has to hold.
+  const editor = new PdfTextEditor(makeTwoPagePdf());
+  await editor.setFallbackFont(fontBytes);
+  const matches = await editor.searchText("令和");
+  assert.equal(matches.length, 2);
+
+  await editor.replaceTextMatch(matches[0].id, "しょうわ");
+  const snapshot = JSON.stringify([...editor.fallbackEmbedding.resources]);
+  const pendingObjects = new Set(editor.pendingObjects.keys());
+
+  await editor.checkTextMatchReplacement(matches[1].id, "しょうわ");
+  assert.equal(JSON.stringify([...editor.fallbackEmbedding.resources]), snapshot, "checking must not record the second page as done");
+  assert.deepEqual(new Set(editor.pendingObjects.keys()), pendingObjects, "checking must stage nothing");
+
+  await editor.replaceTextMatch(matches[1].id, "しょうわ");
+  const saved = await editor.save();
+  const reopened = new PdfTextEditor(saved);
+  // Both pages read back as text, not as raw glyph ids -- which is what happens when a
+  // page names a font its /Resources do not have.
+  assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), ["しょうわ", "しょうわ"]);
+  await reopened.listTextRuns();
+  assert.match(reopened.document.object(9).dictionary, /\/ILPFallback \d+ 0 R/, "the second page's /Resources must carry the font");
+  assert.equal(latin1.decode(saved).match(/\/FontFile2/g).length, 1, "and the font itself is still embedded once");
+});
+
+test("refuses a different fallback font once one has been used", { skip }, async () => {
+  // Text already written holds glyph ids of the font it was written with; another font's
+  // ids are other glyphs, so swapping would turn text already written into gibberish.
+  const editor = await editorFor(REIWA);
+  // Before anything is written, changing it is fine.
+  await editor.setFallbackFont(fontBytes);
+
+  const [match] = await editor.searchText("令和");
+  await editor.replaceTextMatch(match.id, "しょうわ");
+  await assert.rejects(editor.setFallbackFont(fontBytes), (error) => {
+    assert.equal(error.code, "FALLBACK_FONT_ALREADY_IN_USE");
+    return true;
+  });
+  // And the replacement already made is untouched.
+  assert.deepEqual((await new PdfTextEditor(await editor.save()).listTextRuns()).map((run) => run.text), ["しょうわ"]);
+});
+
+test("refuses a replacement containing a space where word spacing is in force", { skip }, async () => {
+  // Tw reaches single-byte code 32 only, and the fallback font is written through a 2-byte
+  // encoding, so a space in the replacement would not be spaced as the document's other
+  // spaces are. Measured against pdf.js before this rule was written.
+  const spaced = await editorFor(body(`20 Tw ${glyphs("令和")} Tj`));
+  const [match] = await spaced.searchText("令和");
+  const refused = await spaced.checkTextMatchReplacement(match.id, "しょう わ");
+  assert.equal(refused.allowed, false);
+  assert.equal(refused.code, "FALLBACK_WORD_SPACING_UNSUPPORTED");
+  assert.equal(spaced.pendingObjects.size, 0);
+
+  // A replacement without a space is unaffected by it.
+  assert.deepEqual(await spaced.checkTextMatchReplacement(match.id, "しょうわ"), { allowed: true, mode: "fallback-font" });
+
+  // And with word spacing off -- the default, and what `0 Tw` restores -- a space is fine.
+  for (const operators of [`${glyphs("令和")} Tj`, `20 Tw 0 Tw ${glyphs("令和")} Tj`]) {
+    const editor = await editorFor(body(operators));
+    const [plain] = await editor.searchText("令和");
+    assert.deepEqual(await editor.checkTextMatchReplacement(plain.id, "しょう わ"), { allowed: true, mode: "fallback-font" });
+  }
+});
+
 test("picks a resource name the page is not already using", { skip }, async () => {
   const editor = await editorFor(REIWA, { resources: "<< /Font << /FJP 5 0 R /ILPFallback 5 0 R >> >>" });
   await replaceAndReopen(editor, "令和", "しょうわ", "fallback-font");

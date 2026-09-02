@@ -63,7 +63,18 @@ export type PdfTextEditorErrorCode =
   /** The match's runs are not simply adjacent, so they cannot be redrawn as one piece. */
   | "FALLBACK_MULTI_RUN_UNSUPPORTED"
   /** The page's structure leaves nowhere safe to put, or to reach, the fallback font. */
-  | "FALLBACK_LAYOUT_UNSUPPORTED";
+  | "FALLBACK_LAYOUT_UNSUPPORTED"
+  /**
+   * Word spacing (`Tw`) is in force and the replacement contains a space. `Tw` reaches
+   * single-byte code 32 only, so text written through the fallback font would not be
+   * spaced the way the document's other spaces are.
+   */
+  | "FALLBACK_WORD_SPACING_UNSUPPORTED"
+  /**
+   * setFallbackFont() was called again after a fallback font had already been used. Text
+   * already written holds glyph ids of that font, which another font's ids would not mean.
+   */
+  | "FALLBACK_FONT_ALREADY_IN_USE";
 
 /** How replaceTextMatch() would write a replacement that is allowed. */
 export type TextMatchReplacementMode =
@@ -145,6 +156,11 @@ export class PdfTextEditor {
    * The engine makes no network request: `fontBytes` is a font the caller has loaded
    * however it likes. Using it embeds the whole font in the saved file, once per document
    * however many replacements need it.
+   *
+   * Rejects with `FALLBACK_FONT_INVALID` for anything that is not a TrueType font, and
+   * with `FALLBACK_FONT_ALREADY_IN_USE` if this editor has already written text with a
+   * fallback font -- that text holds glyph ids of that font, so it cannot be exchanged.
+   * Setting a different font before the first replacement is fine.
    */
   setFallbackFont(fontBytes: ArrayBuffer | Uint8Array): Promise<this>;
 

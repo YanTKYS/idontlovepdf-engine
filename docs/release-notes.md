@@ -12,7 +12,8 @@
   - `fallback-font`: run全体の置換。**置換前後の文字数が異なっていても可**
   - `fallback-font-partial`: runの一部だけを置換し、前後は元fontのまま維持（`申請は令和です → 申請はしょうわです`）
   - `fallback-font-multi-run`: 複数runにまたがるmatchを1つとして描画。v0.3.0の隣接判定をそのまま再利用します
-- 安全に置換できない構造は明示的に拒否します: `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE`（matchの終端から後続テキストが描画される）、`FALLBACK_OPERATOR_UNSUPPORTED`（`TJ` / `'` / `"`）、`FALLBACK_MULTI_RUN_UNSUPPORTED`、`FALLBACK_FONT_MISSING_GLYPH`、`FALLBACK_LAYOUT_UNSUPPORTED`、`FALLBACK_FONT_INVALID`
+- 安全に置換できない構造は明示的に拒否します: `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE`（matchの終端から後続テキストが描画される）、`FALLBACK_OPERATOR_UNSUPPORTED`（`TJ` / `'` / `"`）、`FALLBACK_MULTI_RUN_UNSUPPORTED`、`FALLBACK_FONT_MISSING_GLYPH`、`FALLBACK_WORD_SPACING_UNSUPPORTED`（`Tw` 有効時に置換文字列が半角スペースを含む。`Tw` は1バイトコード32にしか効かないため、2バイト符号化のfallback fontでは同じ字間にならない）、`FALLBACK_LAYOUT_UNSUPPORTED`、`FALLBACK_FONT_INVALID`
+- fallback fontを一度使用した後の `setFallbackFont()` は `FALLBACK_FONT_ALREADY_IN_USE` で拒否します。置換済みテキストはそのfontのglyph IDを保持しているため、別fontへ差し替えると別の文字になってしまうためです
 - 置換不能な文字を `error.characters` / `check.characters` として構造化して返します。利用側がCMapやglyphを解釈せずに「この文字は使用できません」と表示できます
 - テストと動作確認には **BIZ UDGothic Regular 1.05**（SIL Open Font License 1.1）を使用しています。fontはengineに同梱せず、**呼び出し側がbytesを渡す**方式です。**engineは実行時に一切ネットワークアクセスしません**
 - fallbackを使用した保存では、埋め込んだfont全体ぶんファイルサイズが増えます（BIZ UDGothicで約3MB）。subset化は未実施で、1文書内では何回置換してもfontは1つだけ埋め込まれます

@@ -158,6 +158,7 @@ await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font �
 - **設定するだけで自動的に使い分けます。** `checkTextMatchReplacement()` / `replaceTextMatch()` は常に元 PDF の font を先に試し、書けない文字があるときだけ fallback font を使います。利用側が二重のロジックを持つ必要はありません
 - **未設定なら従来どおり**の挙動です（書けない文字は `FONT_ENCODING_UNSUPPORTED`）
 - font は **TrueType**（`glyf` outline）である必要があります。それ以外は `FALLBACK_FONT_INVALID` で拒否します
+- **一度 fallback font で置換した後は、別の font へ変更できません**（`FALLBACK_FONT_ALREADY_IN_USE`）。置換済みテキストはその font の glyph ID を保持しているためです。まだ使用していなければ変更できます
 - **engine は実行時に外部通信しません。** font は呼び出し側がローカル asset 等から読み込んで渡してください
 - 使用すると **font 全体が PDF へ埋め込まれ、ファイルサイズが増えます**（日本語 font で数 MB）。subset 化は行っていません。1 つの文書内では何回置換しても font は 1 つだけ埋め込まれます
 
@@ -172,6 +173,8 @@ await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font �
 | `fallback-font` | run 全体の置換。**文字数が変わっても可** |
 | `fallback-font-partial` | run の一部だけを置換し、前後は元 font のまま維持（`申請は令和です → 申請はしょうわです`） |
 | `fallback-font-multi-run` | 複数 run にまたがる match を 1 つとして描画。隣接判定は `variable-length-safe` と同じ規則です |
+
+word spacing（`Tw`）が有効な箇所では、置換文字列に**半角スペースを含められません**。`Tw` は 1 バイトの文字コード 32 にのみ効き、fallback font は 2 バイト符号化で描画されるため、文書内の他のスペースと同じ字間になりません。
 
 部分置換では、置換後の文字列の幅に応じて**後続文字が自然に前後します**（`申請は令和です → 申請はしょうわです` なら `です` が後ろへ移動します）。これは通常のテキスト編集として期待される挙動です。
 
@@ -257,7 +260,9 @@ adjustment の合計は、その数値が**どこに書かれているかによ�
 | `FALLBACK_OPERATOR_UNSUPPORTED` | 対象が `TJ` / `'` / `"` で描画されている |
 | `FALLBACK_MULTI_RUN_UNSUPPORTED` | 複数 run の match が単純に隣接していない |
 | `FALLBACK_LAYOUT_UNSUPPORTED` | ページ構造上、fallback font を安全に配置できない |
+| `FALLBACK_WORD_SPACING_UNSUPPORTED` | word spacing（`Tw`）が有効な箇所で、置換文字列に半角スペースが含まれる |
 | `FALLBACK_FONT_INVALID` | `setFallbackFont()` に TrueType font 以外が渡された |
+| `FALLBACK_FONT_ALREADY_IN_USE` | fallback font を使用した後に別の font を設定しようとした |
 | `MATCH_STALE` | 検索時点の文字列が現在の文書内容と食い違う。古い match ID で別の場所を書き換えないための保護です |
 | `UNKNOWN_MATCH` | この editor が発行していない、または次の `searchText()` で無効になった match ID |
 | `MODIFICATION_NOT_PERMITTED` | 暗号化 PDF の `/P` が文書変更を許可していない |
