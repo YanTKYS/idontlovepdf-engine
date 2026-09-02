@@ -323,6 +323,13 @@ export function scanTextRuns(bytes, context = "") {
   // is read as an operator's own operand -- specifically `Tf`'s size -- rather than as
   // spacing. Cleared by every operator, so it is only ever that operator's operand.
   let lastNumber = null;
+  // The text state's word spacing, which `Tw` sets and `q`/`Q` save and restore along with
+  // the rest of the graphics state. Tracked because it applies only to single-byte code
+  // 32: text redrawn through a 2-byte encoding would silently ignore a `Tw` the document's
+  // own font obeys (see the fallback-font rules in pdf-document.js). null means "cannot be
+  // sure" -- a `Q` with nothing saved, or a `"`, whose own operand sets it.
+  let wordSpacing = 0;
+  const graphicsStack = [];
   // Two `BT ... ET` blocks in the same content stream are usually positioned
   // independently (a new `Td`/`Tm` moves the text cursor elsewhere on the page), so
   // their runs must never be treated as adjacent text. Each `BT` gets its own id;
@@ -442,6 +449,8 @@ export function scanTextRuns(bytes, context = "") {
       // `'` and `"` reposition before drawing, so whatever came before them is not
       // followed by text drawn from its own end position; `Tj`/`TJ` draw exactly there.
       resolveFollowedBy(operator === "'" || operator === "\"" ? "repositioned" : "text-continues");
+      // `"` takes its word spacing as an operand, which is not tracked here.
+      if (operator === "\"") wordSpacing = null;
       if (operator === "'" || operator === "\"") continuityId += 1;
       strings.forEach((string, index) => {
         // Each string carries the net displacement accumulated since the previous string
@@ -458,6 +467,8 @@ export function scanTextRuns(bytes, context = "") {
           // can re-state it at the size the PDF was already drawing at. null when no
           // `Tf` has run in this text object.
           fontSize: currentFontSize,
+          // The word spacing in force where this run is drawn; null when unknown.
+          wordSpacing,
           operator,
           // Byte offset just past the text-showing operator that drew this run, so the
           // whole `<operand> Tj` can be rewritten as a unit rather than the operand alone.
@@ -477,6 +488,9 @@ export function scanTextRuns(bytes, context = "") {
       // string belongs to the gap before the NEXT one.
       boundaryClean = true;
     } else {
+      if (operator === "Tw") wordSpacing = lastNumber;
+      else if (operator === "q") graphicsStack.push(wordSpacing);
+      else if (operator === "Q") wordSpacing = graphicsStack.length ? graphicsStack.pop() : null;
       strings.length = 0;
       lastName = null;
       lastNumber = null;

@@ -24,16 +24,12 @@
  */
 
 import { aesCbcNoPaddingDecrypt, aesCbcNoPaddingEncrypt, aesEcbBlockDecrypt } from "./aes-primitives.js";
+import { sha2 } from "../sha2.js";
 
-function subtle() {
-  const value = globalThis.crypto?.subtle;
-  if (!value) throw new Error("Web Crypto API (crypto.subtle) is not available in this environment");
-  return value;
-}
-
-async function digest(algorithm, bytes) {
-  return new Uint8Array(await subtle().digest(algorithm, bytes));
-}
+// Algorithm 2.B's three hashes, via src/sha2.js: Web Crypto where the page has it, and
+// JavaScript where it does not -- a page served over plain HTTP has no `crypto.subtle`,
+// and an encrypted PDF has to open there too. See the note in that module.
+const digest = sha2;
 
 function concatBytes(chunks) {
   const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);

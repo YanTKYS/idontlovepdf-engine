@@ -2,6 +2,31 @@
 
 各versionのリリース内容を新しい順に記載します。H2見出しには、`v`付きversionとGitHub Releaseのtitleを記載します。
 
+## v0.4.0 - Fallback Japanese font
+
+- **元PDFの既存fontに存在しない文字へ置換できるようになりました。** PDFの埋め込みfontは通常subset化されており、`/ToUnicode` にはその文書が実際に使った文字しか載りません。そのため v0.3.0 までは `令和 → しょうわ` のような置換が `FONT_ENCODING_UNSUPPORTED` で失敗していました
+- 正式API `await editor.setFallbackFont(fontBytes)` を追加。TrueType fontのbytesを渡すと、**既存fontで書けない文字に限って**そのfontをPDFへ埋め込んで描画します
+- 設定すると `checkTextMatchReplacement()` / `replaceTextMatch()` が自動的に判断します。利用側が「通常置換を試して失敗したらfallback API」という二重ロジックを持つ必要はありません。**既存fontで書ける置換は従来どおり**で、fontは埋め込まれません
+- **fallback font未設定時の挙動は v0.3.0 と同一**です
+- 対応範囲（いずれも `Tj` で描画され、matchの終端位置から他のテキストが描画されない場合）
+  - `fallback-font`: run全体の置換。**置換前後の文字数が異なっていても可**
+  - `fallback-font-partial`: runの一部だけを置換し、前後は元fontのまま維持（`申請は令和です → 申請はしょうわです`）
+  - `fallback-font-multi-run`: 複数runにまたがるmatchを1つとして描画。v0.3.0の隣接判定をそのまま再利用します
+- 安全に置換できない構造は明示的に拒否します: `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE`（matchの終端から後続テキストが描画される）、`FALLBACK_OPERATOR_UNSUPPORTED`（`TJ` / `'` / `"`）、`FALLBACK_MULTI_RUN_UNSUPPORTED`、`FALLBACK_FONT_MISSING_GLYPH`、`FALLBACK_WORD_SPACING_UNSUPPORTED`（`Tw` 有効時に置換文字列が半角スペースを含む。`Tw` は1バイトコード32にしか効かないため、2バイト符号化のfallback fontでは同じ字間にならない）、`FALLBACK_LAYOUT_UNSUPPORTED`、`FALLBACK_FONT_INVALID`
+- 縦書きfont（`/Identity-V`・`/WMode 1` 等）、および writing mode を判定できないfontで描画されたテキストは `FALLBACK_WRITING_MODE_UNSUPPORTED` で拒否します。fallback fontは横書きで埋め込むためです。判定はfont自身のwriting modeによるもので、text matrixによる回転は拒否しません
+- 同じeditorでfallback置換した箇所の再編集は `FALLBACK_EDIT_REQUIRES_SAVE` で拒否します（1つの描画命令を複数へ組み替えるため、その箇所のbyte位置が古くなります）。`save()` して開き直せば編集できます。同一editor内でも未置換の箇所は続けて置換できます。`searchText()` は置換後の内容を返すため、古い文字列を検索結果として返すことはありません。なお保存前の同一editorでは置換箇所が1つのrunとして扱われるため前後と連結して検索されますが、保存して開き直すとfont境界で分かれます
+- fallback fontを一度使用した後の `setFallbackFont()` は `FALLBACK_FONT_ALREADY_IN_USE` で拒否します。置換済みテキストはそのfontのglyph IDを保持しているため、別fontへ差し替えると別の文字になってしまうためです
+- 置換不能な文字を `error.characters` / `check.characters` として構造化して返します。利用側がCMapやglyphを解釈せずに「この文字は使用できません」と表示できます
+- テストと動作確認には **BIZ UDGothic Regular 1.05**（SIL Open Font License 1.1）を使用しています。fontはengineに同梱せず、**呼び出し側がbytesを渡す**方式です。**engineは実行時に一切ネットワークアクセスしません**
+- fallbackを使用した保存では、埋め込んだfont全体ぶんファイルサイズが増えます（BIZ UDGothicで約3MB）。subset化は未実施です
+- **fontの埋め込みは1文書につき1回だけ**です。同一editor内はもちろん、`save()` → 開き直して置換を続けた場合も、engineが以前埋め込んだfontを検出して再利用します（widthsとToUnicode CMapだけを更新するため、2回目以降の保存の増分は数KBです）。1置換ごとにsave/reopenする利用でもファイルが膨らみません
+- 埋め込み済みfontの同一判定は **font programのSHA-256** で行います。既存fontへ書き足すということは、そのfontのglyph IDで新しい文字を書くことなので、同一familyの別ビルド（名前もサイズも同じでglyph番号が異なり得る）を取り違えると、後から追加した文字だけが別の字形になり得るためです。digestが一致しない場合は別fontとして追加で埋め込みます
+- ToUnicode CMapの `beginbfchar` を仕様どおり100件ずつに分割します（101件以上の1グループは不正）。1文書で100種類を超える文字をfallbackで使っても正しいCMapを生成します
+- **HTTP運用（HTTPS化なし）を正式な動作要件としました。** `crypto.subtle`（Web Crypto API）は secure context 限定のため、庁内IISがHTTPで配信するページには存在しません（`localhost` / `127.0.0.1` は例外扱いのため、Node testもPlaywright testもこの状態を再現できていませんでした）。hash計算とAES-CBC復号は、Web Cryptoが使える環境ではWeb Cryptoを、使えない環境ではJavaScript実装を使うようになり、**fallback fontを含む全機能がHTTP配信下で動作します**。hashのJavaScript実装は自前実装ではなく [@noble/hashes](https://github.com/paulmillr/noble-hashes)（MIT、監査済、依存0）です
+- CIは全testを2回実行します（通常、およびprocessからWeb Cryptoを取り除いた状態）。`npm run test:no-subtle` としてローカルでも実行できます
+- browser bundle（`dist/idontlovepdf-engine.js`）から利用できます。font parserとhash実装を含むため bundle は約116KB → 約488KBになりました
+- v0.3.0の挙動を維持: 検索、同文字数multi-run置換、削除、単一run異文字数置換、`variable-length-safe`、opaque match ID・`MATCH_STALE`・`UNKNOWN_MATCH`、`/P` permission、暗号化PDFの保存制限、incremental update
+
 ## v0.3.0 - Safe variable-length multi-run replacement
 
 - **複数runにまたがる一致について、安全性をengineが証明できる構造に限り、置換前後の文字数が異なる置換へ対応**しました。v0.2.1では一律に拒否していたケースの一部が置換できます

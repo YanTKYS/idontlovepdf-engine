@@ -25,6 +25,7 @@
 - 既存フォントの `/ToUnicode` CMap（`bfchar`・`bfrange`）による Unicode 復号と再エンコード。日本語本文の抽出・置換を含む
 - **Standard Security Handler R4 / AESV2**、および **R6 / AESV3（AES-256）** で暗号化された PDF の user/owner password 認証・復号（`/P` の文書変更 permission を尊重）。R6 の `/O`・`/U` zero-padding 互換形式にも対応
 - **複数の text run へ分割された語句の検索・置換。** PDF は 1 つの語を複数の text-showing operand として描画することがあり（`令和6年度` が `[(令) 120 (和) -20 (6) 0 (年) 0 (度)] TJ` の 5 operand など）、その場合でも `searchText()` が 1 件の一致として扱います
+- **元 PDF の font に無い文字への置換**（`setFallbackFont()` で渡した TrueType font を埋め込み、書けない文字だけそちらで描画）
 - 非暗号化 PDF での既存文字置換
 - 元ファイルを壊さず、PDF incremental update として変更を追記。保存後の再読込みに対応
 
@@ -34,6 +35,9 @@
 - 暗号化 PDF は `Standard` ハンドラの上記 2 組（R4/AESV2, R6/AESV3）のみ対応。`/R 2`・`/R 3`・`/R 5`・`/Adobe.PubSec` 等は診断のみで停止
 - **暗号化 PDF への変更の保存（再暗号化）は未対応**。変更がなければ元 bytes をそのまま返せます
 - ページ座標・フォントサイズは公開していません。置換後の文字幅に応じた再レイアウトはしません
+- 元 PDF の font に無い文字へ置換するには `setFallbackFont()` で font を渡す必要があります。渡さない場合は `FONT_ENCODING_UNSUPPORTED` になります
+- fallback font を使うと font 全体が埋め込まれ、ファイルサイズが数 MB 増えます（subset 化は未対応）
+- fallback font で置換した箇所は前後と font が変わるため、**保存して開き直した後**は `searchText()` で前後をまたいだ 1 つの文字列としては検索されません（置換した文字列自体は検索できます）。保存前の同じ editor では、その run はまだ 1 つの run として扱われるため前後と連結して検索されます。この差が問題になる場合は `save()` して開き直してください
 - 複数の text run にまたがる一致で文字数が変わる置換は、対象 run 間に他の operator がなく、かつ対象 run 間の `TJ` numeric adjustment の合計が 0 の場合のみ対応します。字間調整が残る場合や `Tc`/`Tw`/`Tz`/`Tr`・色指定・marked content をまたぐ場合は `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として拒否します（同じ文字数への置換と削除は構造によらず可能です）
 - 字間調整（`TJ` の numeric adjustment）の削除・合算・再計算、glyph 幅からの文字送り計算、text matrix の再構成は行いません
 - 検索は `Td` / `TD` / `Tm` / `T*`、別 `BT ... ET`、font 変更等をまたぎません。これらをまたいで 1 つの語が描画されている PDF では、その語は分断されたまま検索されます
@@ -48,6 +52,7 @@ import { PdfTextEditor, ENGINE_VERSION } from "@idontlovepdf/engine"; // また�
 
 **高レベル API（一般利用側はこちらを使ってください）**
 
+- `await editor.setFallbackFont(fontBytes)` — 既存 font で書けない文字用の font を渡す（任意）
 - `await editor.searchText(query, password?)` — 利用者が見える文字列として本文を検索する
 - `await editor.checkTextMatchReplacement(matchId, replacement)` — その置換が可能かを、何も変更せずに判定する
 - `await editor.replaceTextMatch(matchId, replacement)` — 検索結果をそのまま置換する
@@ -135,6 +140,49 @@ downloadLink.href = url;
 
 同じ文字列が複数ある場合は、それぞれ別の一致（別の ID）として返します。
 
+### `await editor.setFallbackFont(fontBytes)`
+
+**元 PDF の font で書けない文字を書くための font を渡します（任意）。**
+
+PDF の埋め込み font は通常 subset 化されており、`/ToUnicode` にはその文書が実際に使った文字しか載りません。つまり**元 PDF に一度も出てこない文字へは置換できない**のが既定の状態です（`令和 → 平成` は成功しても `令和 → しょうわ` は `FONT_ENCODING_UNSUPPORTED`）。fallback font を設定すると、engine がその font を PDF へ埋め込み、**書けない文字に限って**そちらで描画します。
+
+```js
+const editor = new PdfTextEditor(bytes);
+// font の bytes は呼び出し側が用意します（engine は一切ダウンロードしません）
+await editor.setFallbackFont(fontBytes);
+
+const matches = await editor.searchText("令和");
+await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font には無い文字
+```
+
+- **設定するだけで自動的に使い分けます。** `checkTextMatchReplacement()` / `replaceTextMatch()` は常に元 PDF の font を先に試し、書けない文字があるときだけ fallback font を使います。利用側が二重のロジックを持つ必要はありません
+- **未設定なら従来どおり**の挙動です（書けない文字は `FONT_ENCODING_UNSUPPORTED`）
+- font は **TrueType**（`glyf` outline）である必要があります。それ以外は `FALLBACK_FONT_INVALID` で拒否します
+- **一度 fallback font で置換した後は、別の font へ変更できません**（`FALLBACK_FONT_ALREADY_IN_USE`）。置換済みテキストはその font の glyph ID を保持しているためです。まだ使用していなければ変更できます
+- **engine は実行時に外部通信しません。** font は呼び出し側がローカル asset 等から読み込んで渡してください
+- 使用すると **font 全体が PDF へ埋め込まれ、ファイルサイズが増えます**（日本語 font で数 MB）。subset 化は行っていません
+- **font が埋め込まれるのは 1 文書につき 1 回だけ**です。同じ editor 内で何回置換しても、また `save()` して開き直してから置換を続けても、engine は以前埋め込んだ同じ font を見つけて再利用します（2 回目以降の保存で増えるのは数 KB です）。同一判定は **font program の SHA-256** で行うため、名前やサイズが同じでも中身の異なる font を取り違えることはありません（その場合は別 font として追加で埋め込まれます）
+
+動作確認には [BIZ UDGothic](https://github.com/googlefonts/morisawa-biz-ud-gothic)（SIL Open Font License 1.1）を使用しています。engine には同梱していません。
+
+#### fallback font で置換できる構造
+
+いずれも対象が `Tj` で描画されており、かつ **match の終端位置から他のテキストが描画されない**（直後が `ET` / `BT`、または `Td` / `TD` / `Tm` / `T*` で位置が設定し直される）場合に限ります。fallback font の文字幅は元 font と同じではないため、そこから続けて描画されるテキストがあると動いてしまうためです。
+
+| `mode` | 内容 |
+| --- | --- |
+| `fallback-font` | run 全体の置換。**文字数が変わっても可** |
+| `fallback-font-partial` | run の一部だけを置換し、前後は元 font のまま維持（`申請は令和です → 申請はしょうわです`） |
+| `fallback-font-multi-run` | 複数 run にまたがる match を 1 つとして描画。隣接判定は `variable-length-safe` と同じ規則です |
+
+**縦書き font** で描画されたテキストは置換できません（`FALLBACK_WRITING_MODE_UNSUPPORTED`）。fallback font は横書き（`/Identity-H`）で埋め込むためです。判定に使うのは font 自身の writing mode で、text matrix による回転は対象外です（回転した横書き font は置換できます）。
+
+**同じ editor で fallback 置換した箇所を再度編集することはできません**（`FALLBACK_EDIT_REQUIRES_SAVE`）。fallback 置換は 1 つの描画命令を複数へ組み替えるため、engine が保持している byte 位置がその箇所については古くなります。`save()` して開き直せば通常どおり編集できます。同じ editor でも、**まだ置換していない箇所**は続けて置換できます。なお `searchText()` は置換後の内容を返すため、古い文字列が検索結果に残ることはありません。
+
+word spacing（`Tw`）が有効な箇所では、置換文字列に**半角スペースを含められません**。`Tw` は 1 バイトの文字コード 32 にのみ効き、fallback font は 2 バイト符号化で描画されるため、文書内の他のスペースと同じ字間になりません。
+
+部分置換では、置換後の文字列の幅に応じて**後続文字が自然に前後します**（`申請は令和です → 申請はしょうわです` なら `です` が後ろへ移動します）。これは通常のテキスト編集として期待される挙動です。
+
 ### `await editor.checkTextMatchReplacement(matchId, replacement)`
 
 その置換が可能かどうかを、**何も変更せずに**判定します。可否の判断に PDF 内部構造の知識が要るため、利用側が `runCount` や `TJ` 構造を見て判断する必要はありません（`runCount` は表示用の参考情報です）。
@@ -211,7 +259,17 @@ adjustment の合計は、その数値が**どこに書かれているかによ�
 | --- | --- |
 | `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED` | 複数 run にまたがる一致で、上記の条件を満たさないため文字数を変えられない。`unsafeReason` に `non-zero-tj-adjustment` / `text-state-boundary` / `unsupported-topology` のいずれかが入ります |
 | `MULTI_RUN_FONT_CHANGE_UNSUPPORTED` | 一致が複数 font にまたがる（検索側で font 変更を境界にしているため通常は発生しません） |
-| `FONT_ENCODING_UNSUPPORTED` | 既存 font にその文字の glyph がない。新規 font 埋め込みや subset 再生成は行いません |
+| `FONT_ENCODING_UNSUPPORTED` | 既存 font にその文字の glyph がなく、fallback font も設定されていない。`characters` に該当文字が入ります |
+| `FALLBACK_FONT_MISSING_GLYPH` | fallback font にもその文字の glyph がない。`characters` に該当文字が入ります |
+| `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE` | match の終端位置から他のテキストが描画されるため、font を変えると位置が動く |
+| `FALLBACK_OPERATOR_UNSUPPORTED` | 対象が `TJ` / `'` / `"` で描画されている |
+| `FALLBACK_MULTI_RUN_UNSUPPORTED` | 複数 run の match が単純に隣接していない |
+| `FALLBACK_LAYOUT_UNSUPPORTED` | ページ構造上、fallback font を安全に配置できない |
+| `FALLBACK_WORD_SPACING_UNSUPPORTED` | word spacing（`Tw`）が有効な箇所で、置換文字列に半角スペースが含まれる |
+| `FALLBACK_FONT_INVALID` | `setFallbackFont()` に TrueType font 以外が渡された |
+| `FALLBACK_WRITING_MODE_UNSUPPORTED` | 縦書き font（`/Identity-V`、`/WMode 1` 等）、または writing mode が判定できない font で描画されている |
+| `FALLBACK_EDIT_REQUIRES_SAVE` | 同じ editor で fallback 置換済みの箇所を再度編集しようとした。`save()` して開き直してください |
+| `FALLBACK_FONT_ALREADY_IN_USE` | fallback font を使用した後に別の font を設定しようとした |
 | `MATCH_STALE` | 検索時点の文字列が現在の文書内容と食い違う。古い match ID で別の場所を書き換えないための保護です |
 | `UNKNOWN_MATCH` | この editor が発行していない、または次の `searchText()` で無効になった match ID |
 | `MODIFICATION_NOT_PERMITTED` | 暗号化 PDF の `/P` が文書変更を許可していない |
@@ -237,7 +295,7 @@ adjustment の合計は、その数値が**どこに書かれているかによ�
 
 ## Browserでの利用（bundle）
 
-`dist/idontlovepdf-engine.js` は、`src/index.js` を [esbuild](https://esbuild.github.io/) で bundle した、**1 ファイル・ES Module・runtime 外部依存なしの browser 向け成果物**です。static hosting から直接 `import` できます。
+`dist/idontlovepdf-engine.js` は、`src/index.js` を [esbuild](https://esbuild.github.io/) で bundle した、**1 ファイル・ES Module・runtime 外部依存なしの browser 向け成果物**です。static hosting から直接 `import` できます。`setFallbackFont()` が使う TrueType parser（[opentype.js](https://github.com/opentypejs/opentype.js)、MIT）は bundle へ取り込み済みで、実行時に別途読み込むものはありません。font 本体は bundle に含まれません（呼び出し側が渡します）。
 
 ```html
 <script type="module">
@@ -249,7 +307,8 @@ adjustment の合計は、その数値が**どこに書かれているかによ�
 - entry point: `src/index.js`
 - format: ESM（`bundle: true`, `platform: "browser"`）
 - target: `es2022`
-- 実行時に必要なのは browser 標準 API（`Uint8Array`、`TextEncoder`/`TextDecoder`、`CompressionStream`/`DecompressionStream`、`crypto.subtle` = Web Crypto API）のみで、これらの独自 polyfill は含みません。対応していない古いブラウザでは、呼び出し側で必要な polyfill を用意してください
+- 実行時に必要なのは browser 標準 API（`Uint8Array`、`TextEncoder`/`TextDecoder`、`CompressionStream`/`DecompressionStream`）のみで、これらの独自 polyfill は含みません。対応していない古いブラウザでは、呼び出し側で必要な polyfill を用意してください
+- **`crypto.subtle`（Web Crypto API）は必須ではありません。** HTTP配信（secure contextではない）でも全機能が動作します。詳細は[HTTP配信での動作](#http配信での動作)を参照してください
 - CDN 参照・外部 API・license server などへの runtime 通信は一切行いません。選択した PDF は従来どおり browser 内だけで処理します
 
 ### `npm run build`
@@ -259,7 +318,7 @@ npm ci
 npm run build
 ```
 
-`scripts/build.js` が esbuild を実行し、`dist/idontlovepdf-engine.js` を生成します。`esbuild` は devDependency としてのみ使用し、生成物には含まれません（production/runtime 依存ではありません）。`npm test` は `pretest` npm script 経由でビルドを自動実行するため、`npm test` を一度実行すれば `dist/` は常に最新の状態になります。
+`scripts/build.js` が esbuild を実行し、`dist/idontlovepdf-engine.js` を生成します。`esbuild` は devDependency としてのみ使用し、生成物には含まれません（production/runtime 依存ではありません）。`opentype.js` と `@noble/hashes` は dependency で、bundle へ取り込まれます（この分、bundle は約 116KB から約 488KB になりました）。`npm test` は `pretest` npm script 経由でビルドを自動実行するため、`npm test` を一度実行すれば `dist/` は常に最新の状態になります。
 
 ### version 確認方法
 
@@ -267,7 +326,7 @@ bundle が取り込んだ engine のバージョンは `ENGINE_VERSION`（文字
 
 ```js
 import { ENGINE_VERSION } from "./idontlovepdf-engine.js";
-console.log(ENGINE_VERSION); // 例: "0.2.0"
+console.log(ENGINE_VERSION); // 例: "0.4.0"
 ```
 
 `ENGINE_VERSION` は `package.json` の `"version"` を source of truth とし、`scripts/sync-version.js` が `src/version.js` へビルド時に同期して生成します（`package.json`・`src/index.js`・build script のいずれにも version 文字列を手作業で重複記載していません）。この engine はまだ一般向け stable API を保証する段階ではないため、`0.x` のまま運用しています。
@@ -276,7 +335,7 @@ console.log(ENGINE_VERSION); // 例: "0.2.0"
 
 `dist/idontlovepdf-engine.js` は Git 管理せず（`.gitignore` 対象）、GitHub Release のassetとして配布します。bundleは`src/`から機械的に再生成できるため、生成物の差分をリポジトリ履歴へ積み上げません。`idontlovepdf-engine.js.sha256`も同じReleaseに添付します。CI（`.github/workflows/ci.yml`）はpush・PRごとに`npm run build`が成功することと`dist/idontlovepdf-engine.js`が生成されることを確認します。
 
-ReleaseはGitHubの **Actions → Release → Run workflow** から実行し、`tag`（例: `v0.2.0`）を入力します。workflowは正式な`main`をcheckoutし、`package.json`とのversion整合性確認、release note抽出、test/buildの完了後にtagとGitHub Releaseを作成します。そのため、tagを事前に作成またはpushする必要はありません。
+ReleaseはGitHubの **Actions → Release → Run workflow** から実行し、`tag`（例: `v0.4.0`）を入力します。workflowは正式な`main`をcheckoutし、`package.json`とのversion整合性確認、release note抽出、test/buildの完了後にtagとGitHub Releaseを作成します。そのため、tagを事前に作成またはpushする必要はありません。
 
 GitHub Releaseのtitleと本文のsource of truthは[`docs/release-notes.md`](docs/release-notes.md)です。Release前に対象versionのH2 sectionを同ファイルの先頭側へ追加してください。workflowは対象H2の内容をtitle、その配下から次のH2直前までをbodyとして使用します。
 
@@ -287,9 +346,31 @@ GitHub Releaseのtitleと本文のsource of truthは[`docs/release-notes.md`](do
 - `Uint8Array`
 - `TextEncoder` / `TextDecoder`
 - `CompressionStream` / `DecompressionStream`（`/FlateDecode` の展開・生成）
-- Web Crypto API（`crypto.subtle`。AES-CBC 復号、R6 の hash 計算等）
 
 `node:crypto`・`node:zlib`・`Buffer` 等は `test/` 配下（fixture 構築用）と `scripts/assess-corpus.js`（Node CLI）でのみ使用し、`src/` および `dist/idontlovepdf-engine.js` には含まれません。
+
+Web Crypto API（`crypto.subtle`）は**あれば使う**位置づけで、必須ではありません（次節）。
+
+### HTTP配信での動作
+
+このengineは、庁内IISが**HTTPで**配信するページから利用されることを前提としています（HTTPS化は行いません）。
+
+`crypto.subtle` は [secure context](https://developer.mozilla.org/docs/Web/Security/Secure_Contexts) 限定のAPIで、HTTP配信のページには**存在しません**（`window.crypto` はあるが `window.crypto.subtle` が `undefined`）。そのため、hash計算とAES-CBC復号は次のように動作します。
+
+| 用途 | `crypto.subtle` あり | `crypto.subtle` なし（HTTP配信） |
+| --- | --- | --- |
+| fallback fontの同一判定（SHA-256） | Web Crypto | [@noble/hashes](https://github.com/paulmillr/noble-hashes)（`src/sha2.js`） |
+| 暗号化PDF R6 の Algorithm 2.B（SHA-256/384/512） | Web Crypto | 同上 |
+| 暗号化PDF AESV2/AESV3 の AES-CBC 復号 | Web Crypto | `src/security/aes-primitives.js`（FIPS 197 既知解ベクタで検証済）＋ PKCS#7 除去 |
+
+どちらの経路も同じ結果を返します。SHA-256のdigestが一致するため、HTTPS環境で埋め込んだfallback fontはHTTP環境からも同一と判定され、逆も同様です。
+
+`localhost` / `127.0.0.1` は secure context の例外扱いのため、Nodeのtestも Playwright（`127.0.0.1` 配信）のtestも、通常はWeb Cryptoが**使える**状態で動いてしまいます。これではHTTP配信を検証できないため、次を用意しています。
+
+- `npm run test:no-subtle` — process から Web Crypto を取り除いた状態で全testを実行します（CIでも通常実行と2回走ります）
+- `test/fallback-font-no-subtle.test.js` — `crypto.subtle` なしで `setFallbackFont()` → `令和 → しょうわ` → `save()` → 開き直しまでを検証します
+- `test/browser/fallback-font.test.js` — 同じ流れを、**配布bundleを読み込んだChromiumのページから `crypto.subtle` を取り除いた状態**で検証します
+- `test/sha2.test.js` / `test/aes.test.js` — 両経路の出力を `node:crypto`（OpenSSL）と、および相互に照合します
 
 ## モジュール構成（公開API / 内部実装）
 
@@ -303,6 +384,8 @@ GitHub Releaseのtitleと本文のsource of truthは[`docs/release-notes.md`](do
 | `src/predictor.js` | `/DecodeParms /Predictor`（TIFF・PNG）の解除 | 内部 |
 | `src/flate.js` | `/FlateDecode` の展開・`/Filter` 解釈 | 内部 |
 | `src/cmap.js` | `/ToUnicode` CMap の解析・エンコード/デコード | 内部 |
+| `src/sha2.js` | SHA-256/384/512（Web Cryptoがあればそれ、無ければ @noble/hashes） | 内部 |
+| `src/fallback-font.js` | fallback font の解析・PDF font object 生成（Type0/CIDFontType2/FontFile2/ToUnicode） | 内部 |
 | `src/content-stream.js` | content stream 内のテキスト表示オペランド・dictionary operand の走査 | 内部 |
 | `src/encryption.js` | `/Encrypt` 辞書の診断（復号は行わない） | 内部 |
 | `src/pdf-dictionary-text.js` | 辞書 text 内の名前・文字列・真偽値・入れ子辞書の抽出 | 内部 |
@@ -360,7 +443,9 @@ python3 -m http.server 8000
 
 ```sh
 npm ci
+npm run test:font     # fallback font testが使う日本語font（BIZ UDGothic 1.05、約4.5MB）をtmp/へ取得。未取得だと該当testはskip
 npm test              # node --test（test/*.test.js のみ）。pretestでdist/を自動ビルドし、dist経由のfixture testも実行
+npm run test:no-subtle # 同じtestを、processからWeb Cryptoを取り除いた状態で実行（HTTP配信の再現）
 npm run check         # src/・scripts/・web/・test/ の構文検査
 npm run build         # dist/idontlovepdf-engine.js を生成
 ```
@@ -372,7 +457,7 @@ npx playwright install chromium   # 初回のみ（ローカルにChromiumがな
 npm run test:browser              # node --test（test/browser/*.test.js）。pretest:browserでdist/を自動ビルド
 ```
 
-`test/browser/smoke.test.js`は実際のheadless Chromium（Playwright）で`dist/idontlovepdf-engine.js`をbrowserへ`import`し、`PdfTextEditor`・`ENGINE_VERSION`のexportと、最小PDFの`listTextRuns()`成功、複数runへ分割された日本語（`令和6年度`）の`searchText()` → `replaceTextMatch()` → `save()` → reopen、および複数runにまたがる異文字数置換（`実績報告書` → `報告書`）を確認します。後者では保存したPDFをBlob URLとしてChromium自身のPDF viewerへ読み込ませ、engineとは無関係な実装が受け付けることも確認しています。Playwrightのbrowser本体は`npm ci`だけでは用意されないため、`npm test`（Node専用）とは別の`npm run test:browser`に分離しています。CIでは`npm test` → `npx playwright install --with-deps chromium` → `npm run test:browser`の順で両方とも実行します（`.github/workflows/ci.yml`）。
+`test/browser/smoke.test.js`は実際のheadless Chromium（Playwright）で`dist/idontlovepdf-engine.js`をbrowserへ`import`し、`PdfTextEditor`・`ENGINE_VERSION`のexportと、最小PDFの`listTextRuns()`成功、複数runへ分割された日本語（`令和6年度`）の`searchText()` → `replaceTextMatch()` → `save()` → reopen、および複数runにまたがる異文字数置換（`実績報告書` → `報告書`）を確認します。後者では保存したPDFをBlob URLとしてChromium自身のPDF viewerへ読み込ませ、engineとは無関係な実装が受け付けることも確認しています。Playwrightのbrowser本体は`npm ci`だけでは用意されないため、`npm test`（Node専用）とは別の`npm run test:browser`に分離しています。CIでは`npm test` → `npm run test:no-subtle` → `npx playwright install --with-deps chromium` → `npm run test:browser`の順ですべて実行します（`.github/workflows/ci.yml`）。
 
 `test/dist-bundle.test.js`は通常PDF・xref stream・Object Stream・ToUnicode日本語・複数runにまたがる`searchText()`/`checkTextMatchReplacement()`/`replaceTextMatch()`という代表的な組み合わせを、`src/index.js`ではなく`dist/idontlovepdf-engine.js`からimportした`PdfTextEditor`で処理し、bundle化によって主要機能が壊れていないことを確認します（Node専用APIのみで完結するため`npm test`に含まれます）。
 

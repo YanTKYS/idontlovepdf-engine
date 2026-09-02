@@ -48,7 +48,45 @@ export type PdfTextEditorErrorCode =
   | "MODIFICATION_NOT_PERMITTED"
   | "FONT_ENCODING_UNSUPPORTED"
   | "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"
-  | "MULTI_RUN_FONT_CHANGE_UNSUPPORTED";
+  | "MULTI_RUN_FONT_CHANGE_UNSUPPORTED"
+  /** setFallbackFont() was given something that is not a TrueType font. */
+  | "FALLBACK_FONT_INVALID"
+  /** The fallback font has no glyph for some character of the replacement either. */
+  | "FALLBACK_FONT_MISSING_GLYPH"
+  /** The match is drawn by `TJ`, `'` or `"`, which the fallback font is not written with. */
+  | "FALLBACK_OPERATOR_UNSUPPORTED"
+  /**
+   * Text is drawn from where the match ends. The fallback font's characters are not the
+   * widths the document's own font used, so that text would move.
+   */
+  | "FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE"
+  /** The match's runs are not simply adjacent, so they cannot be redrawn as one piece. */
+  | "FALLBACK_MULTI_RUN_UNSUPPORTED"
+  /** The page's structure leaves nowhere safe to put, or to reach, the fallback font. */
+  | "FALLBACK_LAYOUT_UNSUPPORTED"
+  /**
+   * Word spacing (`Tw`) is in force and the replacement contains a space. `Tw` reaches
+   * single-byte code 32 only, so text written through the fallback font would not be
+   * spaced the way the document's other spaces are.
+   */
+  | "FALLBACK_WORD_SPACING_UNSUPPORTED"
+  /**
+   * setFallbackFont() was called again after a fallback font had already been used. Text
+   * already written holds glyph ids of that font, which another font's ids would not mean.
+   */
+  | "FALLBACK_FONT_ALREADY_IN_USE"
+  /**
+   * The match covers text a fallback replacement has already rewritten. That rewrite
+   * restructured the operators the text was drawn by, so it cannot be edited again in the
+   * same session: save the document and reopen it first.
+   */
+  | "FALLBACK_EDIT_REQUIRES_SAVE"
+  /**
+   * The text is drawn by a vertical-writing font, or by one that does not say which it
+   * is. The fallback font is embedded for horizontal writing and cannot stand in for it.
+   * Judged from the font's own writing mode, not from any rotation of the page.
+   */
+  | "FALLBACK_WRITING_MODE_UNSUPPORTED";
 
 /** How replaceTextMatch() would write a replacement that is allowed. */
 export type TextMatchReplacementMode =
@@ -63,7 +101,13 @@ export type TextMatchReplacementMode =
    * by zero `TJ` adjustments or by nothing at all: the whole replacement goes into the
    * first operand and the rest are emptied, which the PDF draws identically.
    */
-  | "variable-length-safe";
+  | "variable-length-safe"
+  /** A whole run, written in the fallback font because the document's own cannot express it. */
+  | "fallback-font"
+  /** Part of a run in the fallback font, with the rest of the run left in the document's own. */
+  | "fallback-font-partial"
+  /** A match spanning several runs, redrawn as one piece in the fallback font. */
+  | "fallback-font-multi-run";
 
 /**
  * Why a length-changing multi-run replacement could not be written safely. Secondary
@@ -92,6 +136,12 @@ export type TextMatchReplacementCheck =
       readonly code: PdfTextEditorErrorCode;
       readonly reason: string;
       readonly unsafeReason?: TextMatchReplacementObstacle;
+      /**
+       * The characters no available font can write, for a FONT_ENCODING_UNSUPPORTED or
+       * FALLBACK_FONT_MISSING_GLYPH refusal. Present so a caller can name them to a user
+       * without reading `reason` or knowing anything about a PDF's fonts.
+       */
+      readonly characters?: readonly string[];
     };
 
 export class PdfTextEditor {
@@ -105,6 +155,27 @@ export class PdfTextEditor {
    * a content stream, a `BT`/`ET`, a `Td`/`TD`/`Tm`/`T*`, a `'`/`"`, or a font switch.
    * Rejects an empty query with `code: "EMPTY_QUERY"`.
    */
+  /**
+   * Supplies a TrueType font to write replacement text with where the document's own
+   * fonts cannot -- which is whenever the text contains a character the document never
+   * used, since a PDF's embedded fonts are normally subsetted to just those.
+   *
+   * With one set, checkTextMatchReplacement() and replaceTextMatch() reach for it
+   * themselves: the document's own font is tried first and used wherever it can express
+   * the replacement, so nothing that already worked starts embedding a font. Without one,
+   * both behave exactly as they did before this existed.
+   *
+   * The engine makes no network request: `fontBytes` is a font the caller has loaded
+   * however it likes. Using it embeds the whole font in the saved file, once per document
+   * however many replacements need it.
+   *
+   * Rejects with `FALLBACK_FONT_INVALID` for anything that is not a TrueType font, and
+   * with `FALLBACK_FONT_ALREADY_IN_USE` if this editor has already written text with a
+   * fallback font -- that text holds glyph ids of that font, so it cannot be exchanged.
+   * Setting a different font before the first replacement is fine.
+   */
+  setFallbackFont(fontBytes: ArrayBuffer | Uint8Array): Promise<this>;
+
   searchText(query: string, password?: string): Promise<PdfTextMatch[]>;
 
   /**

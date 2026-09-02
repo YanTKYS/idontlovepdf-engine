@@ -4,9 +4,11 @@
 // esbuild is a devDependency only: it runs here, at build time, to produce the
 // bundle -- it is never imported by src/ and never ships inside the bundle itself.
 // The bundle's only runtime dependencies are browser-native APIs (Uint8Array,
-// TextEncoder/TextDecoder, CompressionStream/DecompressionStream, crypto.subtle);
-// nothing from Node (node:crypto, node:zlib, Buffer, ...) is reachable from
-// src/index.js, so none of it ends up in the bundle. See test/dist-bundle.test.js
+// TextEncoder/TextDecoder, CompressionStream/DecompressionStream); nothing from
+// Node (node:crypto, node:zlib, Buffer, ...) is reachable from src/index.js, so
+// none of it ends up in the bundle. crypto.subtle is used where it exists and done
+// without where it does not -- it is a Secure Context API, and this is served over
+// plain HTTP; see src/sha2.js. See test/dist-bundle.test.js
 // and test/browser/smoke.test.js for the checks that back this up.
 import { build } from "esbuild";
 import { mkdirSync } from "node:fs";
@@ -29,7 +31,7 @@ await build({
   format: "esm",
   // BigInt literals/logical-assignment (`??=`) are the newest syntax src/ relies on;
   // es2022 covers those and stays comfortably within what browsers implementing
-  // CompressionStream/DecompressionStream and crypto.subtle already support.
+  // CompressionStream/DecompressionStream already support.
   target: ["es2022"],
   legalComments: "none",
   sourcemap: false,
