@@ -230,3 +230,55 @@ test("decodes Japanese text through an existing font's ToUnicode CMap via the bu
   const [updated] = await new PdfTextEditor(await editor.save()).listTextRuns();
   assert.equal(updated.text, "語日");
 });
+
+/* ------------------------------------- multi-run search/replace through the bundle */
+
+/**
+ * "令和6年度" drawn the way the problem was reported: one `TJ` array holding five
+ * separate string operands with spacing adjustments between them, so the word exists
+ * in the PDF only as five text runs. Its font's /ToUnicode CMap also carries "7", so
+ * the year can be replaced without embedding anything.
+ */
+function splitRunJapanesePdf() {
+  const cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n" +
+    "6 beginbfchar\n<0001> <4EE4>\n<0002> <548C>\n<0003> <0036>\n<0004> <5E74>\n<0005> <5EA6>\n<0006> <0037>\nendbfchar\n" +
+    "endcmap\nend end";
+  return classicPdf([
+    encode("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+    encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"),
+    encode("3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n"),
+    streamObject(4, "BT /FJP 12 Tf 72 700 Td [<0001> 120 <0002> -20 <0003> 0 <0004> 0 <0005>] TJ ET"),
+    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n"),
+    streamObject(6, cmap)
+  ]);
+}
+
+test("searches and replaces text split across several runs through the bundle, then reopens it", async () => {
+  const editor = new PdfTextEditor(splitRunJapanesePdf());
+
+  // The word is five runs, so run-level search could only ever find one character of it.
+  assert.deepEqual((await editor.listTextRuns()).map((run) => run.text), ["令", "和", "6", "年", "度"]);
+
+  const matches = await editor.searchText("令和6年度");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].text, "令和6年度");
+  assert.equal(matches[0].runCount, 5);
+
+  await editor.replaceTextMatch(matches[0].id, "令和7年度");
+  const reopened = new PdfTextEditor(await editor.save());
+  assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), ["令", "和", "7", "年", "度"]);
+  assert.deepEqual(await reopened.searchText("令和6年度"), []);
+  assert.equal((await reopened.searchText("令和7年度")).length, 1);
+});
+
+test("keeps the bundle's search from joining text across a BT ... ET boundary", async () => {
+  const pdf = classicPdf([
+    encode("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+    encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"),
+    encode("3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n"),
+    streamObject(4, "BT 72 700 Td (Housing address) Tj ET BT 72 100 Td (John Smith) Tj ET")
+  ]);
+  const editor = new PdfTextEditor(pdf);
+  assert.deepEqual(await editor.searchText("address John"), []);
+  assert.equal((await editor.searchText("Housing address")).length, 1);
+});
