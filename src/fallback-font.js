@@ -18,6 +18,7 @@
 import opentypeModule from "opentype.js";
 
 import { deflate } from "./flate.js";
+import { sha256Hex } from "./sha2.js";
 
 const opentype = opentypeModule.default ?? opentypeModule;
 const encoder = new TextEncoder();
@@ -47,13 +48,14 @@ const MAX_BFCHAR_ENTRIES = 100;
 export const FALLBACK_FONT_MARKER = "ILPFallbackFont";
 
 /**
- * A SHA-256 of the font program, as lowercase hex. Uses Web Crypto, which the engine
- * already relies on for encrypted PDFs, so this adds no dependency and works unchanged
- * in a browser.
+ * A SHA-256 of the font program, as lowercase hex.
+ *
+ * Via src/sha2.js rather than `crypto.subtle` directly: Web Crypto is unavailable to a
+ * page served over plain HTTP, and embedding a fallback font must work there -- see the
+ * note in that module.
  */
 export async function fingerprintFont(bytes) {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return sha256Hex(bytes);
 }
 
 const hex4 = (value) => value.toString(16).toUpperCase().padStart(4, "0");
