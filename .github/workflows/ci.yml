@@ -19,14 +19,46 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The font-embedding experiment's tests skip without their fallback font, so
+      # without this step CI would report success having never run the experiment at all.
+      # The font is fetched from a pinned release tag and checked against a recorded
+      # SHA-256; see scripts/fetch-poc-font.js and docs/experiments/font-embedding-poc.md.
+      - name: Fetch the font-embedding experiment's fallback font
+        run: npm run poc:font
+
       - name: Run tests (Node)
-        run: npm test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee tmp/node-tests.log
+
+      # Guards the fetch step above. A test that needs the font skips without it, so if
+      # the fetch ever stops working CI would go back to reporting success having never
+      # run the experiment -- which is exactly what it did before that step existed.
+      - name: Verify no test was skipped
+        run: |
+          if grep -qE '^# skipped [1-9]' tmp/node-tests.log; then
+            echo "::error::Tests were skipped -- the font-embedding experiment did not run."
+            grep -E '^# (tests|pass|fail|skipped)' tmp/node-tests.log
+            exit 1
+          fi
+          grep -E '^# (tests|pass|skipped)' tmp/node-tests.log
 
       - name: Install Playwright's Chromium (used by the browser bundle smoke test)
         run: npx playwright install --with-deps chromium
 
       - name: Run browser smoke test
-        run: npm run test:browser
+        run: |
+          set -o pipefail
+          npm run test:browser 2>&1 | tee tmp/browser-tests.log
+
+      - name: Verify no browser test was skipped
+        run: |
+          if grep -qE '^# skipped [1-9]' tmp/browser-tests.log; then
+            echo "::error::Browser tests were skipped -- the font-embedding experiment did not run in a browser."
+            grep -E '^# (tests|pass|fail|skipped)' tmp/browser-tests.log
+            exit 1
+          fi
+          grep -E '^# (tests|pass|skipped)' tmp/browser-tests.log
 
       - name: Type/syntax check
         run: npm run check

@@ -352,6 +352,19 @@ export class PdfTextEditor {
     this.document = new PdfStructure(this.bytes);
     this.streams = null;
     this.pending = new Map();
+    // Whole objects to append in the next incremental update, keyed by object number:
+    // either a brand-new one or a new version of an existing one. `{ dictionary }` for a
+    // plain object, `{ dictionary, data }` for a stream (`data` written verbatim, so the
+    // dictionary must already describe it -- /Length, and any /Filter it is encoded
+    // with). Empty for every ordinary edit; used by the font-embedding experiment under
+    // src/experimental/, which has to add font objects and re-state a page's /Resources.
+    this.pendingObjects = new Map();
+    // Replacement *decoded* content-stream bytes, keyed by content stream object number.
+    // Takes precedence over the per-run replacements in `pending` for that stream, for a
+    // caller that must rewrite more of the stream than one operand (again: the font
+    // experiment, which wraps a run in its own `Tf` switches). save() re-encodes these
+    // exactly as it does a run-level edit.
+    this.pendingStreams = new Map();
     // Matches handed out by the most recent searchText() call, keyed by the opaque id
     // that call returned. Cleared by the next searchText() so a long-lived editor (the
     // browser PoC re-searches on every keystroke) cannot accumulate them without bound.
@@ -409,7 +422,7 @@ export class PdfTextEditor {
         seen.add(object.number);
         const decoded = await decodeStream(object, "content stream", this.security);
         const runs = scanTextRuns(decoded, `content stream object ${object.number}`);
-        if (runs.length) this.streams.push({ object, decoded, runs, fontMaps: await loadFontMaps(resources, this.document, this.security) });
+        if (runs.length) this.streams.push({ object, decoded, runs, resources, fontMaps: await loadFontMaps(resources, this.document, this.security) });
       }
     }
     return this.streams.flatMap((stream) => stream.runs.map((run, runIndex) => ({
@@ -579,9 +592,19 @@ export class PdfTextEditor {
     return this;
   }
 
+  /**
+   * The lowest object number no object in this document uses, so a caller adding objects
+   * can number them without colliding. Reads the trailer's /Size, which is defined as
+   * one past the highest object number in the file.
+   */
+  async nextObjectNumber() {
+    await this.listTextRuns();
+    return this.document.size;
+  }
+
   async save() {
     await this.listTextRuns();
-    if (!this.pending.size) return this.bytes.slice();
+    if (!this.pending.size && !this.pendingObjects.size && !this.pendingStreams.size) return this.bytes.slice();
     // Persisting any edit to an encrypted PDF would need to re-encrypt the new
     // content stream bytes (and, per spec, could touch /O, /U, or the trailer's
     // /ID) -- deliberately out of scope for this PR (see README). This is separate
@@ -593,27 +616,41 @@ export class PdfTextEditor {
     }
     const updates = [];
     for (const stream of this.streams) {
-      const replacements = stream.runs.flatMap((_, runIndex) => {
+      // A whole-stream replacement supersedes the per-run edits for that stream: it was
+      // produced from the same decoded bytes and already contains them.
+      const whole = this.pendingStreams.get(stream.object.number);
+      const replacements = whole ? [] : stream.runs.flatMap((_, runIndex) => {
         const bytes = this.pending.get(`${stream.object.number}:${runIndex}`);
         return bytes ? [{ runIndex, bytes }] : [];
       });
-      if (!replacements.length) continue;
-      let data = replaceTextRuns(stream.decoded, replacements);
+      if (!whole && !replacements.length) continue;
+      let data = whole ?? replaceTextRuns(stream.decoded, replacements);
       // stream.decoded is already predictor-reversed (see decodeStreamBytes()); the
       // edited bytes are re-deflated as plain FlateDecode without reapplying a
       // predictor. replacementDictionary() drops any /DecodeParms accordingly.
       if (filters(stream.object.dictionary)[0] === "FlateDecode") data = await deflate(data);
       updates.push({ ...stream.object, dictionary: replacementDictionary(stream.object.dictionary, data.length), data });
     }
+    // Objects staged whole (see this.pendingObjects). A stream object carries `data`; a
+    // plain one is written as just its dictionary between `obj` and `endobj`.
+    for (const [number, object] of this.pendingObjects) {
+      updates.push({ number, generation: object.generation ?? 0, dictionary: object.dictionary, data: object.data ?? null });
+    }
     const chunks = [this.bytes, encoder.encode(this.bytes.at(-1) === 10 ? "" : "\n")];
     const offsets = [];
     let offset = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
     for (const update of updates) {
-      const head = encoder.encode(`${update.number} ${update.generation} obj\n${update.dictionary}\nstream\n`);
-      const tail = encoder.encode("\nendstream\nendobj\n");
+      const head = update.data
+        ? encoder.encode(`${update.number} ${update.generation} obj\n${update.dictionary}\nstream\n`)
+        : encoder.encode(`${update.number} ${update.generation} obj\n${update.dictionary}\nendobj\n`);
+      const tail = update.data ? encoder.encode("\nendstream\nendobj\n") : null;
       offsets.push({ number: update.number, generation: update.generation, offset });
-      chunks.push(head, update.data, tail);
-      offset += head.length + update.data.length + tail.length;
+      chunks.push(head);
+      offset += head.length;
+      if (update.data) {
+        chunks.push(update.data, tail);
+        offset += update.data.length + tail.length;
+      }
     }
     const xrefOffset = offset;
     chunks.push(encoder.encode("xref\n"));
@@ -622,7 +659,9 @@ export class PdfTextEditor {
       chunks.push(encoder.encode(`${entry.number} 1\n${String(entry.offset).padStart(10, "0")} ${String(entry.generation).padStart(5, "0")} n \n`));
     }
     chunks.push(encoder.encode(
-      `trailer\n<< /Size ${this.document.size} /Root ${this.document.root.number} ${this.document.root.generation} R /Prev ${this.document.previousXref} >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+      // /Size is one past the highest object number in the file, so appending objects
+      // beyond the original count has to raise it or a reader will not resolve them.
+      `trailer\n<< /Size ${Math.max(this.document.size, ...offsets.map((entry) => entry.number + 1))} /Root ${this.document.root.number} ${this.document.root.generation} R /Prev ${this.document.previousXref} >>\nstartxref\n${xrefOffset}\n%%EOF\n`
     ));
     return concat(chunks);
   }
