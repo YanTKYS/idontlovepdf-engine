@@ -142,7 +142,12 @@ export function skipDictionary(bytes, start) {
   return cursor;
 }
 
-function encodeLiteral(value) {
+/**
+ * Writes a string operand back as a PDF literal / hexadecimal string. Exported for
+ * src/experimental/font-embedding.js, which rewrites a whole `<operand> Tj` region
+ * rather than the operand alone and so cannot go through replaceTextRuns().
+ */
+export function encodeLiteral(value) {
   const output = [0x28];
   for (const byte of value) {
     if (byte === 0x28 || byte === 0x29 || byte === 0x5c) output.push(0x5c, byte);
@@ -154,7 +159,7 @@ function encodeLiteral(value) {
   return Uint8Array.from(output);
 }
 
-function encodeHex(value) {
+export function encodeHex(value) {
   return new TextEncoder().encode(`<${[...value].map((byte) => byte.toString(16).padStart(2, "0")).join("")}>`);
 }
 
@@ -298,7 +303,12 @@ export function scanTextRuns(bytes, context = "") {
   let cursor = 0;
   let inText = false;
   let currentFont = null;
+  let currentFontSize = null;
   let lastName = null;
+  // The most recent numeric token, kept separately from `displacement` below because it
+  // is read as an operator's own operand -- specifically `Tf`'s size -- rather than as
+  // spacing. Cleared by every operator, so it is only ever that operator's operand.
+  let lastNumber = null;
   // Two `BT ... ET` blocks in the same content stream are usually positioned
   // independently (a new `Td`/`Tm` moves the text cursor elsewhere on the page), so
   // their runs must never be treated as adjacent text. Each `BT` gets its own id;
@@ -364,6 +374,7 @@ export function scanTextRuns(bytes, context = "") {
     // any other operator discards it as its own operand (see the branches below).
     if (NUMBER.test(operator)) {
       displacement += Number(operator);
+      lastNumber = Number(operator);
       continue;
     }
     if (operator === "BI") {
@@ -376,6 +387,7 @@ export function scanTextRuns(bytes, context = "") {
     } else if (operator === "BT") {
       inText = true;
       currentFont = null;
+      currentFontSize = null;
       textObjectId += 1;
       strings.length = 0;
       displacement = 0;
@@ -395,8 +407,10 @@ export function scanTextRuns(bytes, context = "") {
       // stating the *same* font (a size-only `Tf`) changes nothing and is not a break.
       if (lastName !== currentFont) continuityId += 1;
       currentFont = lastName;
+      currentFontSize = lastNumber;
       strings.length = 0;
       displacement = 0;
+      lastNumber = null;
       boundaryClean = false;
     } else if (inText && (operator === "Tj" || operator === "'" || operator === "\"" || operator === "TJ")) {
       // `'` and `"` move to the next line before showing their string, so what they
@@ -410,15 +424,31 @@ export function scanTextRuns(bytes, context = "") {
         const joinBefore = index === 0
           ? joinAcrossOperators(runs, continuityId, boundaryClean, string.displacement)
           : { kind: "tj-array", adjustment: string.displacement };
-        runs.push({ ...string, fontName: currentFont, textObjectId, continuityId, joinBefore });
+        runs.push({
+          ...string,
+          fontName: currentFont,
+          // The size the enclosing `Tf` set, so a caller that has to re-state the font
+          // can re-state it at the size the PDF was already drawing at. null when no
+          // `Tf` has run in this text object.
+          fontSize: currentFontSize,
+          operator,
+          // Byte offset just past the text-showing operator that drew this run, so the
+          // whole `<operand> Tj` can be rewritten as a unit rather than the operand alone.
+          operatorEnd: cursor,
+          textObjectId,
+          continuityId,
+          joinBefore
+        });
       });
       strings.length = 0;
+      lastNumber = null;
       // displacement is intentionally left alone: any number after this operator's last
       // string belongs to the gap before the NEXT one.
       boundaryClean = true;
     } else {
       strings.length = 0;
       lastName = null;
+      lastNumber = null;
       // Whatever numbers were pending were this operator's operands (`5 Tc`, `1 0 0 rg`,
       // `72 700 Td`), not spacing between two strings.
       displacement = 0;
