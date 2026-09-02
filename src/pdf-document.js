@@ -1,9 +1,9 @@
 import { encodeHex, encodeLiteral, replaceTextRuns, scanTextRuns } from "./content-stream.js";
-import { buildFallbackFontObjects, freeResourceName, glyphsFor, identityEncode, parseFallbackFont } from "./fallback-font.js";
+import { FALLBACK_FONT_MARKER, buildFallbackFontObjects, freeResourceName, glyphsFor, glyphsFromToUnicode, identityEncode, parseFallbackFont } from "./fallback-font.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
 import { summarizeEncryption } from "./encryption.js";
 import { deflate, decodeStreamBytes, filters } from "./flate.js";
-import { PdfStructure, reference } from "./pdf-structure.js";
+import { PdfStructure, parseReferenceArray, reference } from "./pdf-structure.js";
 import { authenticateEncryptedPdf, decryptStreamBytes } from "./security/decrypt.js";
 
 const encoder = new TextEncoder();
@@ -256,6 +256,91 @@ async function registerFallbackResource(editor, embedded, resources) {
 }
 
 /**
+ * Finds a copy of this fallback font that a previous session already embedded, so editing
+ * a document again adds to it rather than embedding a second copy of the same
+ * multi-megabyte program. Callers normally save and reopen between edits, so without this
+ * every round trip would grow the file by the whole font.
+ *
+ * A font is recognised by the marker buildFallbackFontObjects() writes into the Type0
+ * dictionary, which also records the program's byte length -- so a document carrying a
+ * *different* fallback font is not mistaken for this one. Its existing glyphs are read
+ * back from its ToUnicode CMap, and the pages already naming it are recorded, so neither
+ * is added twice.
+ *
+ * Returns null when the document carries no such font. Reads only; the caller decides
+ * what to do with it.
+ */
+async function adoptExistingFallbackFont(editor, fallback) {
+  const marker = new RegExp(`/${FALLBACK_FONT_MARKER}\\s+(\\d+)\\b`);
+  for (const stream of editor.streams) {
+    if (stream.resources?.number === undefined) continue;
+    let holder = stream.resources;
+    const indirect = reference(stream.resources.dictionary, "Font");
+    if (indirect) {
+      try {
+        holder = await editor.document.resolveObject(indirect, editor.security, decryptStreamBytes);
+      } catch {
+        continue;
+      }
+    }
+    const fonts = indirect ? holder.dictionary : (holder.dictionary.match(/\/Font\s*<<([\s\S]*?)>>/)?.[1] ?? "");
+    for (const entry of fonts.matchAll(/\/([^\s/<>{}[\]()]+)\s+(\d+)\s+(\d+)\s+R/g)) {
+      let type0;
+      try {
+        type0 = await editor.document.resolveObject({ number: Number(entry[2]), generation: Number(entry[3]) }, editor.security, decryptStreamBytes);
+      } catch {
+        continue;
+      }
+      const length1 = type0.dictionary.match(marker);
+      if (!length1 || Number(length1[1]) !== fallback.bytes.length) continue;
+      if (!new RegExp(`/BaseFont\\s*/${fallback.postScriptName}\\b`).test(type0.dictionary)) continue;
+
+      const [cidFontReference] = parseReferenceArray(type0.dictionary, "DescendantFonts");
+      const toUnicodeReference = reference(type0.dictionary, "ToUnicode");
+      if (!cidFontReference || !toUnicodeReference) continue;
+      const cidFont = await editor.document.resolveObject(cidFontReference, editor.security, decryptStreamBytes);
+      const descriptorReference = reference(cidFont.dictionary, "FontDescriptor");
+      if (!descriptorReference) continue;
+
+      const cmapObject = editor.document.object(toUnicodeReference);
+      const glyphs = glyphsFromToUnicode(fallback, parseToUnicodeCMap(await decodeStream(cmapObject, "ToUnicode stream", editor.security)));
+
+      // Every page whose /Font already names this object keeps the name it was given.
+      const resources = new Map();
+      for (const other of editor.streams) {
+        if (other.resources?.number === undefined) continue;
+        const otherIndirect = reference(other.resources.dictionary, "Font");
+        let otherHolder = other.resources;
+        if (otherIndirect) {
+          try {
+            otherHolder = await editor.document.resolveObject(otherIndirect, editor.security, decryptStreamBytes);
+          } catch {
+            continue;
+          }
+        }
+        const text = otherIndirect ? otherHolder.dictionary : (otherHolder.dictionary.match(/\/Font\s*<<([\s\S]*?)>>/)?.[1] ?? "");
+        const named = text.match(new RegExp(`/([^\\s/<>{}\\[\\]()]+)\\s+${type0.number}\\s+\\d+\\s+R`));
+        if (named) resources.set(other.resources.number, named[1]);
+      }
+
+      return {
+        numbers: {
+          type0: type0.number,
+          cidFont: cidFont.number,
+          descriptor: descriptorReference.number,
+          fontFile: null,
+          toUnicode: toUnicodeReference.number
+        },
+        resources,
+        glyphs,
+        programAlreadyEmbedded: true
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * Plans a replacement written through the fallback font, for a match the document's own
  * font cannot express.
  *
@@ -348,12 +433,15 @@ async function planFallbackReplacement(editor, match, replacement) {
   // page as already carrying the font, the replaceTextMatch() that followed would skip
   // adding it -- writing a content stream that names a font the page's /Resources never
   // got. Object numbers are carried over, so replacing ten runs still embeds one font.
-  const base = editor.fallbackEmbedding;
+  const base = editor.fallbackEmbedding ?? await adoptExistingFallbackFont(editor, fallback);
   const start = Math.max(editor.document.size, ...[...editor.pendingObjects.keys()].map((number) => number + 1));
   const embedded = {
     numbers: base?.numbers ?? { type0: start, cidFont: start + 1, descriptor: start + 2, fontFile: start + 3, toUnicode: start + 4 },
     resources: new Map(base?.resources),
-    glyphs: new Map(base?.glyphs)
+    glyphs: new Map(base?.glyphs),
+    // True once the font program is in the file, whether this session put it there or an
+    // earlier one did: from then on only the widths and the ToUnicode CMap are rewritten.
+    programAlreadyEmbedded: Boolean(base)
   };
 
   const objects = new Map();
@@ -410,7 +498,7 @@ async function planFallbackReplacement(editor, match, replacement) {
       ? REPLACEMENT_MODE.fallbackFont
       : REPLACEMENT_MODE.fallbackFontPartial);
 
-  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, embedded.glyphs)) {
+  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, embedded.glyphs, { programAlreadyEmbedded: embedded.programAlreadyEmbedded })) {
     objects.set(number, object);
   }
   return { allowed: true, mode, updates: [], fallback: { embedding: embedded, objects, edits } };

@@ -25,6 +25,21 @@ const encoder = new TextEncoder();
 /** PDF glyph space is 1000 units per em, whatever the font's own unitsPerEm is. */
 const PDF_UNITS_PER_EM = 1000;
 
+/**
+ * A `beginbfchar` group may hold at most 100 entries -- the CMap specification says so,
+ * and Adobe's ToUnicode note calls `101 beginbfchar` invalid outright. A document edited
+ * repeatedly accumulates glyphs, so this is reached by ordinary use, not only by extremes.
+ */
+const MAX_BFCHAR_ENTRIES = 100;
+
+/**
+ * Marks a Type0 font as one this engine embedded, and says which font it holds (by the
+ * byte length of the program). Readers ignore keys they do not know; this one lets a
+ * later session recognise its own work and add to it rather than embedding a second copy
+ * of the same multi-megabyte font. See adoptExistingFallbackFont() in pdf-document.js.
+ */
+export const FALLBACK_FONT_MARKER = "ILPFallbackFont";
+
 const hex4 = (value) => value.toString(16).toUpperCase().padStart(4, "0");
 
 /** A ToUnicode destination: the character as UTF-16BE, which is what a bfchar holds. */
@@ -115,7 +130,7 @@ export function identityEncode(glyphs) {
  * `glyphs` is every glyph drawn through this font so far, keyed by glyph id, so the
  * widths and the ToUnicode CMap grow to cover each new replacement.
  */
-export async function buildFallbackFontObjects(fallback, numbers, glyphs) {
+export async function buildFallbackFontObjects(fallback, numbers, glyphs, { programAlreadyEmbedded = false } = {}) {
   const { font } = fallback;
   const scale = (value) => Math.round((value * PDF_UNITS_PER_EM) / fallback.unitsPerEm);
   const head = font.tables.head ?? {};
@@ -123,6 +138,11 @@ export async function buildFallbackFontObjects(fallback, numbers, glyphs) {
   const drawn = [...glyphs.entries()].sort((a, b) => a[0] - b[0]);
 
   const widths = drawn.map(([glyphId, { advanceWidth }]) => `${glyphId} [${scale(advanceWidth)}]`).join(" ");
+  const bfchar = [];
+  for (let start = 0; start < drawn.length; start += MAX_BFCHAR_ENTRIES) {
+    const group = drawn.slice(start, start + MAX_BFCHAR_ENTRIES);
+    bfchar.push(`${group.length} beginbfchar\n${group.map(([glyphId, { character }]) => `<${hex4(glyphId)}> <${utf16beHex(character)}>`).join("\n")}\nendbfchar`);
+  }
   const toUnicode = `/CIDInit /ProcSet findresource begin
 12 dict begin
 begincmap
@@ -132,30 +152,40 @@ begincmap
 1 begincodespacerange
 <0000> <FFFF>
 endcodespacerange
-${drawn.length} beginbfchar
-${drawn.map(([glyphId, { character }]) => `<${hex4(glyphId)}> <${utf16beHex(character)}>`).join("\n")}
-endbfchar
+${bfchar.join("\n")}
 endcmap
 CMapName currentdict /CMap defineresource pop
 end
 end`;
 
-  fallback.compressed ??= await deflate(fallback.bytes);
-  const fontData = fallback.compressed;
   const toUnicodeData = encoder.encode(toUnicode);
   const name = fallback.postScriptName;
+
+  // Adding glyphs to a font this document already carries: only the widths and the
+  // ToUnicode CMap change. Rewriting the font program too would append another copy of it
+  // -- megabytes -- on every save.
+  const descendant = [numbers.cidFont, {
+    dictionary: `<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${name}`
+      + ` /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>`
+      + ` /FontDescriptor ${numbers.descriptor} 0 R /DW ${PDF_UNITS_PER_EM} /W [${widths}]`
+      + ` /CIDToGIDMap /Identity >>`
+  }];
+  const unicodeMap = [numbers.toUnicode, {
+    dictionary: `<< /Length ${toUnicodeData.length} >>`,
+    data: toUnicodeData
+  }];
+  if (programAlreadyEmbedded) return new Map([descendant, unicodeMap]);
+
+  fallback.compressed ??= await deflate(fallback.bytes);
+  const fontData = fallback.compressed;
 
   return new Map([
     [numbers.type0, {
       dictionary: `<< /Type /Font /Subtype /Type0 /BaseFont /${name} /Encoding /Identity-H`
-        + ` /DescendantFonts [${numbers.cidFont} 0 R] /ToUnicode ${numbers.toUnicode} 0 R >>`
+        + ` /DescendantFonts [${numbers.cidFont} 0 R] /ToUnicode ${numbers.toUnicode} 0 R`
+        + ` /${FALLBACK_FONT_MARKER} ${fallback.bytes.length} >>`
     }],
-    [numbers.cidFont, {
-      dictionary: `<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${name}`
-        + ` /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>`
-        + ` /FontDescriptor ${numbers.descriptor} 0 R /DW ${PDF_UNITS_PER_EM} /W [${widths}]`
-        + ` /CIDToGIDMap /Identity >>`
-    }],
+    descendant,
     [numbers.descriptor, {
       dictionary: `<< /Type /FontDescriptor /FontName /${name} /Flags 4`
         + ` /FontBBox [${scale(head.xMin ?? 0)} ${scale(head.yMin ?? 0)} ${scale(head.xMax ?? 0)} ${scale(head.yMax ?? 0)}]`
@@ -167,11 +197,25 @@ end`;
       dictionary: `<< /Length ${fontData.length} /Length1 ${fallback.bytes.length} /Filter /FlateDecode >>`,
       data: fontData
     }],
-    [numbers.toUnicode, {
-      dictionary: `<< /Length ${toUnicodeData.length} >>`,
-      data: toUnicodeData
-    }]
+    unicodeMap
   ]);
+}
+
+/**
+ * The glyphs a previously embedded copy of this font already carries, read back from its
+ * ToUnicode CMap so a later session's widths and CMap cover them as well as its own.
+ * `mappings` is what parseToUnicodeCMap() returns: a 4-hex-digit code -- which for
+ * Identity-H is the glyph id -- to the text it stands for.
+ */
+export function glyphsFromToUnicode(fallback, mappings) {
+  const glyphs = new Map();
+  for (const [code, character] of mappings) {
+    const glyphId = Number.parseInt(code, 16);
+    if (!Number.isInteger(glyphId) || !glyphId) continue;
+    const glyph = fallback.font.glyphs.get(glyphId);
+    glyphs.set(glyphId, { character, glyphId, advanceWidth: glyph?.advanceWidth ?? fallback.unitsPerEm });
+  }
+  return glyphs;
 }
 
 /** A /Font resource name the given font dictionary does not already use. */

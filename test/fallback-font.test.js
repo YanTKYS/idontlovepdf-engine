@@ -594,6 +594,94 @@ test("refuses a replacement containing a space where word spacing is in force", 
   }
 });
 
+test("embeds the font once across repeated save and reopen cycles", { skip }, async () => {
+  // A caller that saves and reopens between edits -- which is how this engine is meant to
+  // be driven -- would otherwise get another copy of a multi-megabyte font every round.
+  // A later session recognises the font an earlier one embedded and adds to it instead.
+  let pdf = makePdf(body(`${glyphs("令和令和令和")} Tj`));
+  const original = pdf.length;
+  const replacements = ["しょうわ", "たいしょう", "めいじ"];
+  const growth = [];
+
+  for (const replacement of replacements) {
+    const editor = new PdfTextEditor(pdf);
+    await editor.setFallbackFont(fontBytes);
+    const [match] = await editor.searchText("令和");
+    await editor.replaceTextMatch(match.id, replacement);
+    const previous = pdf.length;
+    pdf = await editor.save();
+    growth.push(pdf.length - previous);
+  }
+
+  assert.equal(latin1.decode(pdf).match(/\/FontFile2/g).length, 1, "the font program must be written exactly once");
+  assert.ok(growth[0] > 1_000_000, "the first save embeds the font");
+  assert.ok(growth[1] < 100_000 && growth[2] < 100_000, `later saves must not re-embed it, but grew by ${growth.slice(1)}`);
+  assert.ok(pdf.length < original + growth[0] + 100_000);
+
+  // All three replacements survived, and each is searchable as Unicode.
+  const reopened = new PdfTextEditor(pdf);
+  assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), replacements);
+  for (const replacement of replacements) assert.equal((await reopened.searchText(replacement)).length, 1);
+  assert.deepEqual(await reopened.searchText("令和"), []);
+});
+
+test("does not adopt a different font that another tool embedded", { skip }, async () => {
+  // The marker records which font program it stands for, so a document already carrying
+  // some other embedded font is not mistaken for one this engine wrote.
+  const editor = await editorFor(REIWA);
+  const [match] = await editor.searchText("令和");
+  await editor.replaceTextMatch(match.id, "しょうわ");
+  const saved = latin1.decode(await editor.save());
+  assert.match(saved, new RegExp(`/ILPFallbackFont ${fontBytes.length}\\b`), "the marker records the program's length");
+});
+
+/**
+ * As many distinct characters as asked for, all of which the fallback font can write.
+ * Candidates come from the CJK block; any the font lacks are reported by the engine
+ * itself (FALLBACK_FONT_MISSING_GLYPH names them), so this asks rather than assumes.
+ */
+async function distinctFallbackText(count) {
+  const editor = await editorFor(REIWA);
+  const [match] = await editor.searchText("令和");
+  const candidates = [];
+  for (let code = 0x4e00; candidates.length < count * 5; code += 1) candidates.push(String.fromCodePoint(code));
+
+  // One question, one answer: the refusal names every character the font lacks.
+  const verdict = await editor.checkTextMatchReplacement(match.id, candidates.join(""));
+  const missing = new Set(verdict.allowed ? [] : verdict.characters);
+  if (!verdict.allowed) assert.equal(verdict.code, "FALLBACK_FONT_MISSING_GLYPH", verdict.reason);
+  const usable = candidates.filter((character) => !missing.has(character));
+  assert.ok(usable.length >= count, `the fallback font covers only ${usable.length} of the candidates`);
+  return usable.slice(0, count).join("");
+}
+
+test("splits the ToUnicode CMap into groups a PDF reader will accept", { skip }, async () => {
+  // A beginbfchar group may hold at most 100 entries; 101 is invalid outright. Glyphs
+  // accumulate as a document is edited, so this is reached by ordinary use, not extremes.
+  for (const count of [100, 101, 250]) {
+    const replacement = await distinctFallbackText(count);
+    assert.equal([...replacement].length, count);
+
+    const editor = await editorFor(REIWA);
+    const [match] = await editor.searchText("令和");
+    assert.deepEqual(await editor.checkTextMatchReplacement(match.id, replacement), { allowed: true, mode: "fallback-font" });
+    await editor.replaceTextMatch(match.id, replacement);
+
+    const saved = await editor.save();
+    const reopened = new PdfTextEditor(saved);
+    // The engine's own CMap reader gets every character back, so no entry was lost.
+    assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), [replacement], `for ${count} glyphs`);
+    assert.equal((await reopened.searchText(replacement)).length, 1);
+
+    // And no group exceeds what the specification allows.
+    const cmap = latin1.decode(saved).match(/\/Ordering \(UCS\)[\s\S]*?endcmap/)[0];
+    const groups = [...cmap.matchAll(/(\d+) beginbfchar/g)].map((group) => Number(group[1]));
+    for (const size of groups) assert.ok(size > 0 && size <= 100, `a beginbfchar group of ${size} is invalid`);
+    assert.equal(groups.reduce((sum, size) => sum + size, 0), count, `all ${count} glyphs must be mapped`);
+    assert.equal(groups.length, Math.ceil(count / 100));
+  }
+});
+
 test("picks a resource name the page is not already using", { skip }, async () => {
   const editor = await editorFor(REIWA, { resources: "<< /Font << /FJP 5 0 R /ILPFallback 5 0 R >> >>" });
   await replaceAndReopen(editor, "令和", "しょうわ", "fallback-font");

@@ -160,7 +160,8 @@ await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font �
 - font は **TrueType**（`glyf` outline）である必要があります。それ以外は `FALLBACK_FONT_INVALID` で拒否します
 - **一度 fallback font で置換した後は、別の font へ変更できません**（`FALLBACK_FONT_ALREADY_IN_USE`）。置換済みテキストはその font の glyph ID を保持しているためです。まだ使用していなければ変更できます
 - **engine は実行時に外部通信しません。** font は呼び出し側がローカル asset 等から読み込んで渡してください
-- 使用すると **font 全体が PDF へ埋め込まれ、ファイルサイズが増えます**（日本語 font で数 MB）。subset 化は行っていません。1 つの文書内では何回置換しても font は 1 つだけ埋め込まれます
+- 使用すると **font 全体が PDF へ埋め込まれ、ファイルサイズが増えます**（日本語 font で数 MB）。subset 化は行っていません
+- **font が埋め込まれるのは 1 文書につき 1 回だけ**です。同じ editor 内で何回置換しても、また `save()` して開き直してから置換を続けても、engine は以前埋め込んだ同じ font を見つけて再利用します（2 回目以降の保存で増えるのは数 KB です）
 
 動作確認には [BIZ UDGothic](https://github.com/googlefonts/morisawa-biz-ud-gothic)（SIL Open Font License 1.1）を使用しています。engine には同梱していません。
 
