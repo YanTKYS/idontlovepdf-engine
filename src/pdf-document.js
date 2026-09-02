@@ -1,4 +1,5 @@
-import { replaceTextRuns, scanTextRuns } from "./content-stream.js";
+import { encodeHex, encodeLiteral, replaceTextRuns, scanTextRuns } from "./content-stream.js";
+import { buildFallbackFontObjects, freeResourceName, glyphsFor, identityEncode, parseFallbackFont } from "./fallback-font.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
 import { summarizeEncryption } from "./encryption.js";
 import { deflate, decodeStreamBytes, filters } from "./flate.js";
@@ -102,6 +103,18 @@ function indexOfPoints(haystack, needle, from) {
  * single-byte codes when it does not. No font is embedded and no subset is rebuilt, so
  * a character the existing font cannot express fails loudly here -- which is the point.
  */
+/**
+ * The characters of `text` the run's own font has no code for -- the reason the ordinary
+ * path cannot write them. Reported alongside the refusal so a caller can name them to a
+ * user without parsing an error message or knowing what a CMap is.
+ */
+function charactersOutsideFont(editor, run, text) {
+  const stream = editor.streams.find((candidate) => candidate.object.number === run.objectNumber);
+  const mappings = stream.fontMaps.get(run.fontName);
+  const known = mappings?.size ? new Set(mappings.values()) : null;
+  return [...text].filter((character) => (known ? !known.has(character) : character.codePointAt(0) > 0xff));
+}
+
 function encodeReplacement(editor, run, replacement) {
   if (typeof replacement !== "string") return Uint8Array.from(replacement);
   const stream = editor.streams.find((candidate) => candidate.object.number === run.objectNumber);
@@ -117,8 +130,21 @@ const REPLACEMENT_MODE = {
   singleRun: "single-run",
   sameLength: "same-length",
   delete: "delete",
-  variableLength: "variable-length-safe"
+  variableLength: "variable-length-safe",
+  // Written through a caller-supplied fallback font (see setFallbackFont), because the
+  // document's own font has no code for some of the replacement's characters.
+  fallbackFont: "fallback-font",
+  fallbackFontPartial: "fallback-font-partial",
+  fallbackFontMultiRun: "fallback-font-multi-run"
 };
+
+/**
+ * Where the text position after a run is set by something other than that run's own
+ * advance. Only there may a run be redrawn in a different font: restoring the font does
+ * not restore the position, and an embedded font's glyphs are not the widths the
+ * original's were, so anything drawn from that run's end would move.
+ */
+const POSITION_SAFE_AFTER = new Set(["end-of-text-object", "repositioned"]);
 
 function refusal(code, reason, unsafeReason) {
   return unsafeReason ? { allowed: false, code, reason, unsafeReason } : { allowed: false, code, reason };
@@ -173,6 +199,182 @@ function variableLengthObstacle(span, current) {
   return null;
 }
 
+/** Scanner runs behind a match's span entries, in span order. */
+function scannedRuns(editor, span) {
+  return span.map((entry) => {
+    const [objectNumber, runIndex] = entry.runId.split(":").map(Number);
+    const stream = editor.streams.find((candidate) => candidate.object.number === objectNumber);
+    return { stream, run: stream?.runs[runIndex], entry };
+  });
+}
+
+/**
+ * Registers the fallback font in one page's `/Resources /Font`, leaving every other
+ * resource as it was, and returns the resource name to use on that page. The font objects
+ * themselves are shared: a second page gets its own name and its own resources entry, but
+ * points at the same Type0 object, so the font file is never embedded twice.
+ */
+function registerFallbackResource(editor, embedded, resources) {
+  if (resources?.number === undefined) {
+    return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "This page's /Resources are not an addressable object, so the fallback font cannot be added to them");
+  }
+  const existing = embedded.resources.get(resources.number);
+  if (existing) return { name: existing };
+
+  const indirect = reference(resources.dictionary, "Font");
+  const holder = indirect ? editor.document.object(indirect) : resources;
+  const inline = indirect ? null : resources.dictionary.match(/\/Font\s*<<([\s\S]*?)>>/);
+  let name;
+  let dictionary;
+  if (indirect) {
+    name = freeResourceName(holder.dictionary);
+    dictionary = holder.dictionary.replace(/>>\s*$/, `/${name} ${embedded.numbers.type0} 0 R >>`);
+  } else if (inline) {
+    name = freeResourceName(inline[1]);
+    dictionary = resources.dictionary.replace(inline[0], `/Font << ${inline[1].trim()} /${name} ${embedded.numbers.type0} 0 R >>`);
+  } else {
+    // A page with no /Font at all: give it one rather than refusing.
+    name = "ILPFallback";
+    dictionary = resources.dictionary.replace(/>>\s*$/, `/Font << /${name} ${embedded.numbers.type0} 0 R >> >>`);
+  }
+  embedded.resources.set(resources.number, name);
+  return { name, object: { number: holder.number, generation: holder.generation, dictionary } };
+}
+
+/**
+ * Plans a replacement written through the fallback font, for a match the document's own
+ * font cannot express.
+ *
+ * The rewrite is the same shape whatever the match spans, because the pieces are simply
+ * drawn one after another and each `Tj` continues where the last left off (verified
+ * against pdf.js: splitting a `Tj` and re-stating the same font between the pieces draws
+ * the identical page, under `Tc`/`Tw`/`Tz`/`Ts` alike). The match's first run becomes
+ *
+ *     <prefix> Tj  /Fallback size Tf  <replacement> Tj  /Original size Tf
+ *
+ * any run wholly inside the match is emptied, and the last run keeps its suffix. So the
+ * replacement is drawn where the match began, the text after it flows on from the
+ * replacement's own width -- which is what editing text should do -- and no width, matrix
+ * or spacing arithmetic is involved anywhere.
+ *
+ * What has to hold, and is refused otherwise:
+ *
+ * - every run of the match is drawn by a plain `Tj`. A `TJ` operand lives inside an array
+ *   and `'`/`"` carry a line move, neither of which this rewrite accounts for.
+ * - the runs share one font and one size, so there is a single font to restore.
+ * - the runs are adjacent (the v0.3.0 rule: no state change and no net `TJ` displacement
+ *   between them), so emptying the ones inside the match moves nothing.
+ * - nothing is drawn from where the match's last run ends. The replacement's width is not
+ *   the original's, so anything continuing from there would move. An `ET`, a `BT`, or an
+ *   explicit `Td`/`TD`/`Tm`/`T*` all settle it; a following `Tj` does not.
+ */
+async function planFallbackReplacement(editor, match, replacement) {
+  const fallback = editor.fallbackFont;
+  const pieces = scannedRuns(editor, match.span);
+  if (pieces.some(({ run }) => !run)) return refusal("MATCH_STALE", "This match no longer describes the document");
+
+  const operator = pieces.find(({ run }) => run.operator !== "Tj");
+  if (operator) {
+    return refusal("FALLBACK_OPERATOR_UNSUPPORTED", `The fallback font is written with Tj; this match is drawn by ${operator.run.operator}`);
+  }
+  const sizes = new Set(pieces.map(({ run }) => run.fontSize));
+  if (sizes.size > 1 || sizes.has(null) || sizes.has(undefined)) {
+    return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "This match has no single /Tf font size to restore after the fallback font");
+  }
+  if (pieces.some(({ run }) => !run.fontName)) {
+    return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "This match has no /Tf font to restore after the fallback font");
+  }
+  if (match.span.length > 1) {
+    const current = new Map(internalRuns(editor).map((run) => [run.id, run]));
+    const obstacle = variableLengthObstacle(match.span, current);
+    if (obstacle) {
+      return refusal("FALLBACK_MULTI_RUN_UNSUPPORTED", `This match is drawn as ${match.span.length} text runs that are not simply adjacent (${obstacle}), so it cannot be redrawn in another font as one piece`, obstacle);
+    }
+  }
+  const last = pieces.at(-1).run;
+  if (!POSITION_SAFE_AFTER.has(last.followedBy)) {
+    return refusal(
+      "FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE",
+      `Text is drawn from where this match ends (${last.followedBy}), and the fallback font's characters are not the widths the document's own font used, so that text would move. Only a match followed by ET or an explicit Td/TD/Tm/T* is redrawn in another font.`
+    );
+  }
+
+  const { glyphs, missing } = glyphsFor(fallback, replacement);
+  if (missing) {
+    return { ...refusal("FALLBACK_FONT_MISSING_GLYPH", `The fallback font has no glyph for ${missing.map((character) => JSON.stringify(character)).join(", ")}`), characters: missing };
+  }
+
+  // Object numbers are allocated once per editor and reused, so replacing ten runs
+  // embeds one font.
+  let embedded = editor.fallbackEmbedding;
+  if (!embedded) {
+    const start = Math.max(editor.document.size, ...[...editor.pendingObjects.keys()].map((number) => number + 1));
+    embedded = {
+      numbers: { type0: start, cidFont: start + 1, descriptor: start + 2, fontFile: start + 3, toUnicode: start + 4 },
+      resources: new Map(),
+      glyphs: new Map()
+    };
+  }
+
+  const objects = new Map();
+  const resourceNames = new Map();
+  for (const { stream } of pieces) {
+    const registered = registerFallbackResource(editor, embedded, stream.resources);
+    if (registered.allowed === false) return registered;
+    resourceNames.set(stream.object.number, registered.name);
+    if (registered.object) objects.set(registered.object.number, registered.object);
+  }
+
+  const glyphMap = new Map(embedded.glyphs);
+  for (const glyph of glyphs) glyphMap.set(glyph.glyphId, glyph);
+
+  // Encode every piece before anything is staged, so a prefix or suffix the original font
+  // cannot write fails here rather than half-way through.
+  const edits = [];
+  try {
+    pieces.forEach(({ stream, run, entry }, index) => {
+      const points = [...entry.runText];
+      const prefix = points.slice(0, entry.charStart).join("");
+      const suffix = points.slice(entry.charEnd).join("");
+      const size = run.fontSize;
+      const name = resourceNames.get(stream.object.number);
+      const operand = (bytes) => latin1.decode(run.syntax === "hex" ? encodeHex(bytes) : encodeLiteral(bytes));
+      if (index === 0) {
+        const drawn = [];
+        if (prefix) drawn.push(`${operand(encodeReplacement(editor, entry, prefix))} Tj`);
+        drawn.push(`/${name} ${size} Tf ${latin1.decode(encodeHex(identityEncode(glyphs)))} Tj /${run.fontName} ${size} Tf`);
+        // The suffix of a single-run match follows the replacement in the same operator.
+        if (pieces.length === 1 && suffix) drawn.push(`${operand(encodeReplacement(editor, entry, suffix))} Tj`);
+        edits.push({ objectNumber: stream.object.number, start: run.start, end: run.operatorEnd, bytes: encoder.encode(drawn.join(" ")) });
+      } else if (index === pieces.length - 1) {
+        // The last run keeps only what lay outside the match; it is drawn where the
+        // replacement ended, which is where it was drawn before.
+        edits.push({ objectNumber: stream.object.number, start: run.start, end: run.end, bytes: encodeReplacement(editor, entry, suffix), operandOnly: true });
+      } else {
+        edits.push({ objectNumber: stream.object.number, start: run.start, end: run.end, bytes: new Uint8Array(), operandOnly: true });
+      }
+    });
+  } catch (error) {
+    return { ...refusal("FONT_ENCODING_UNSUPPORTED", error.message), cause: error };
+  }
+
+  const mode = match.span.length > 1
+    ? REPLACEMENT_MODE.fallbackFontMultiRun
+    : (pieces[0].entry.charStart === 0 && pieces[0].entry.charEnd === [...pieces[0].entry.runText].length
+      ? REPLACEMENT_MODE.fallbackFont
+      : REPLACEMENT_MODE.fallbackFontPartial);
+
+  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, glyphMap)) {
+    objects.set(number, object);
+  }
+  return {
+    allowed: true,
+    mode,
+    updates: [],
+    fallback: { embedding: { ...embedded, glyphs: glyphMap }, objects, edits }
+  };
+}
+
 /**
  * The single decision point for "may this match be replaced by this text, and with what
  * written where". Both checkTextMatchReplacement() and replaceTextMatch() go through it,
@@ -185,7 +387,7 @@ function variableLengthObstacle(span, current) {
  * here: the caller commits `updates` in one go, so a refusal -- or a character the font
  * cannot express -- leaves the document exactly as it was rather than half replaced.
  */
-function planTextMatchReplacement(editor, matchId, replacement) {
+async function planTextMatchReplacement(editor, matchId, replacement) {
   // /P's modify permission is a property of the PDF, checked on every attempt: finding
   // text is a reading capability, changing it is not. Reported rather than thrown so
   // checkTextMatchReplacement() can tell a caller up front that editing is not allowed.
@@ -263,17 +465,76 @@ function planTextMatchReplacement(editor, matchId, replacement) {
       updates.push({ id: entry.runId, bytes: encodeReplacement(editor, entry, text) });
     });
   } catch (error) {
-    // A character the existing font has no code for. Reported with the underlying
-    // message intact, so callers matching on it keep working.
-    return { ...refusal("FONT_ENCODING_UNSUPPORTED", error.message), cause: error };
+    // A character the document's own font has no code for. When the caller has supplied a
+    // fallback font, that is exactly what it is for; otherwise this stands as the refusal
+    // it has always been, so an editor with no fallback font behaves as it did in v0.3.0.
+    const characters = charactersOutsideFont(editor, match.span[0], replacement);
+    if (!editor.fallbackFont) {
+      return { ...refusal("FONT_ENCODING_UNSUPPORTED", error.message), characters, cause: error };
+    }
+    const viaFallback = await planFallbackReplacement(editor, match, replacement);
+    if (viaFallback.allowed) return viaFallback;
+    // The fallback font could not help either. Its reason is the useful one -- it says
+    // what about this position or this text stopped it -- so it is the one reported.
+    return { ...viaFallback, characters: viaFallback.characters ?? characters };
   }
   return { allowed: true, mode, updates };
+}
+
+/**
+ * Applies a plan's staging in one go. Called only once the whole plan is built and every
+ * byte of it encoded, so a refusal -- or a character no font can write -- leaves the
+ * editor exactly as it was.
+ */
+function commitPlan(editor, plan) {
+  for (const { id, bytes } of plan.updates) editor.pending.set(id, bytes);
+  if (!plan.fallback) return;
+  editor.fallbackEmbedding = plan.fallback.embedding;
+  for (const [number, object] of plan.fallback.objects) editor.pendingObjects.set(number, object);
+  for (const edit of plan.fallback.edits) {
+    const edits = editor.fallbackEdits.get(edit.objectNumber) ?? [];
+    edits.push(edit);
+    editor.fallbackEdits.set(edit.objectNumber, edits);
+  }
+  for (const objectNumber of new Set(plan.fallback.edits.map((edit) => edit.objectNumber))) {
+    rebuildContentStream(editor, objectNumber);
+  }
+}
+
+/**
+ * Rebuilds one content stream from its original decoded bytes, applying every fallback
+ * rewrite recorded for it plus any ordinary run-level edit staged on the same stream --
+ * so a whole-stream replacement never silently drops the latter. Rebuilding from the
+ * original each time keeps the recorded offsets valid however many edits accumulate.
+ */
+function rebuildContentStream(editor, objectNumber) {
+  const stream = editor.streams.find((candidate) => candidate.object.number === objectNumber);
+  const fallbackEdits = editor.fallbackEdits.get(objectNumber) ?? [];
+  const rewritten = new Set(fallbackEdits.map((edit) => `${edit.start}:${edit.end}`));
+  const runEdits = stream.runs.flatMap((run, index) => {
+    const bytes = editor.pending.get(`${objectNumber}:${index}`);
+    if (!bytes || rewritten.has(`${run.start}:${run.end}`)) return [];
+    return [{ start: run.start, end: run.end, bytes: run.syntax === "hex" ? encodeHex(bytes) : encodeLiteral(bytes) }];
+  });
+  const ordered = [...fallbackEdits, ...runEdits]
+    .map((edit) => ({ ...edit, bytes: edit.operandOnly ? (stream.runs.find((run) => run.start === edit.start)?.syntax === "hex" ? encodeHex(edit.bytes) : encodeLiteral(edit.bytes)) : edit.bytes }))
+    .sort((a, b) => a.start - b.start);
+  const chunks = [];
+  let cursor = 0;
+  for (const edit of ordered) {
+    if (edit.start < cursor) throw new Error("Two edits to one content stream overlap");
+    chunks.push(stream.decoded.subarray(cursor, edit.start), edit.bytes);
+    cursor = edit.end;
+  }
+  chunks.push(stream.decoded.subarray(cursor));
+  editor.pendingStreams.set(objectNumber, concat(chunks));
 }
 
 function planError(plan) {
   const error = new Error(plan.reason);
   error.code = plan.code;
   if (plan.unsafeReason) error.unsafeReason = plan.unsafeReason;
+  if (plan.characters?.length) error.characters = plan.characters;
   if (plan.cause) error.cause = plan.cause;
   return error;
 }
@@ -365,6 +626,15 @@ export class PdfTextEditor {
     // experiment, which wraps a run in its own `Tf` switches). save() re-encodes these
     // exactly as it does a run-level edit.
     this.pendingStreams = new Map();
+    // The fallback font set by setFallbackFont(), parsed once; null until then, which is
+    // what keeps an editor that never sets one behaving exactly as v0.3.0 did.
+    this.fallbackFont = null;
+    // The object numbers and per-page resource names of the embedded font, allocated on
+    // first use and reused, so one font is embedded however many runs are redrawn in it.
+    this.fallbackEmbedding = null;
+    // Content-stream rewrites made for the fallback font, kept per stream so several
+    // replacements in one stream compose (see rebuildContentStream()).
+    this.fallbackEdits = new Map();
     // Matches handed out by the most recent searchText() call, keyed by the opaque id
     // that call returned. Cleared by the next searchText() so a long-lived editor (the
     // browser PoC re-searches on every keystroke) cannot accumulate them without bound.
@@ -527,6 +797,30 @@ export class PdfTextEditor {
   }
 
   /**
+   * Supplies a font to fall back on when the document's own fonts cannot write a
+   * replacement -- which is whenever it contains a character the document never used,
+   * since a PDF's embedded fonts are normally subsetted to just the characters it needed.
+   *
+   * With one set, checkTextMatchReplacement() and replaceTextMatch() reach for it by
+   * themselves: the document's own font is always tried first, and the fallback is used
+   * only for text that font cannot express, so nothing that already worked starts
+   * embedding a multi-megabyte font. Without one, both behave exactly as they did before
+   * this existed. There is no default and nothing is downloaded: `fontBytes` is a
+   * TrueType font the caller has loaded however it likes, and the engine makes no network
+   * request of any kind.
+   *
+   * The font is embedded in full when it is first used, which adds its compressed size to
+   * the saved file -- a few megabytes for a CJK font. It is embedded once per document
+   * however many replacements use it.
+   *
+   * Throws `code: "FALLBACK_FONT_INVALID"` if the bytes are not a TrueType font.
+   */
+  async setFallbackFont(fontBytes) {
+    this.fallbackFont = parseFallbackFont(fontBytes);
+    return this;
+  }
+
+  /**
    * Whether replaceTextMatch() would accept `replacement` for this match, decided
    * without changing anything. Returns `{ allowed: true, mode }` or `{ allowed: false,
    * code, reason, unsafeReason? }` -- never throws for a refusal, since a caller asking
@@ -545,10 +839,14 @@ export class PdfTextEditor {
    */
   async checkTextMatchReplacement(matchId, replacement) {
     await this.listTextRuns();
-    const plan = planTextMatchReplacement(this, matchId, replacement);
+    const plan = await planTextMatchReplacement(this, matchId, replacement);
     if (!plan.allowed) {
       const result = { allowed: false, mode: null, code: plan.code, reason: plan.reason };
-      return plan.unsafeReason ? { ...result, unsafeReason: plan.unsafeReason } : result;
+      if (plan.unsafeReason) result.unsafeReason = plan.unsafeReason;
+      // The characters no available font can write, so a caller can name them to a user
+      // without reading the message or knowing anything about CMaps.
+      if (plan.characters?.length) result.characters = plan.characters;
+      return result;
     }
     return { allowed: true, mode: plan.mode };
   }
@@ -586,9 +884,9 @@ export class PdfTextEditor {
    */
   async replaceTextMatch(matchId, replacement) {
     await this.listTextRuns();
-    const plan = planTextMatchReplacement(this, matchId, replacement);
+    const plan = await planTextMatchReplacement(this, matchId, replacement);
     if (!plan.allowed) throw planError(plan);
-    for (const { id, bytes } of plan.updates) this.pending.set(id, bytes);
+    commitPlan(this, plan);
     return this;
   }
 

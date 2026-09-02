@@ -2,6 +2,23 @@
 
 各versionのリリース内容を新しい順に記載します。H2見出しには、`v`付きversionとGitHub Releaseのtitleを記載します。
 
+## v0.4.0 - Fallback Japanese font
+
+- **元PDFの既存fontに存在しない文字へ置換できるようになりました。** PDFの埋め込みfontは通常subset化されており、`/ToUnicode` にはその文書が実際に使った文字しか載りません。そのため v0.3.0 までは `令和 → しょうわ` のような置換が `FONT_ENCODING_UNSUPPORTED` で失敗していました
+- 正式API `await editor.setFallbackFont(fontBytes)` を追加。TrueType fontのbytesを渡すと、**既存fontで書けない文字に限って**そのfontをPDFへ埋め込んで描画します
+- 設定すると `checkTextMatchReplacement()` / `replaceTextMatch()` が自動的に判断します。利用側が「通常置換を試して失敗したらfallback API」という二重ロジックを持つ必要はありません。**既存fontで書ける置換は従来どおり**で、fontは埋め込まれません
+- **fallback font未設定時の挙動は v0.3.0 と同一**です
+- 対応範囲（いずれも `Tj` で描画され、matchの終端位置から他のテキストが描画されない場合）
+  - `fallback-font`: run全体の置換。**置換前後の文字数が異なっていても可**
+  - `fallback-font-partial`: runの一部だけを置換し、前後は元fontのまま維持（`申請は令和です → 申請はしょうわです`）
+  - `fallback-font-multi-run`: 複数runにまたがるmatchを1つとして描画。v0.3.0の隣接判定をそのまま再利用します
+- 安全に置換できない構造は明示的に拒否します: `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE`（matchの終端から後続テキストが描画される）、`FALLBACK_OPERATOR_UNSUPPORTED`（`TJ` / `'` / `"`）、`FALLBACK_MULTI_RUN_UNSUPPORTED`、`FALLBACK_FONT_MISSING_GLYPH`、`FALLBACK_LAYOUT_UNSUPPORTED`、`FALLBACK_FONT_INVALID`
+- 置換不能な文字を `error.characters` / `check.characters` として構造化して返します。利用側がCMapやglyphを解釈せずに「この文字は使用できません」と表示できます
+- テストと動作確認には **BIZ UDGothic Regular 1.05**（SIL Open Font License 1.1）を使用しています。fontはengineに同梱せず、**呼び出し側がbytesを渡す**方式です。**engineは実行時に一切ネットワークアクセスしません**
+- fallbackを使用した保存では、埋め込んだfont全体ぶんファイルサイズが増えます（BIZ UDGothicで約3MB）。subset化は未実施で、1文書内では何回置換してもfontは1つだけ埋め込まれます
+- browser bundle（`dist/idontlovepdf-engine.js`）から利用できます。font parserを含むため bundle は約116KB → 約472KBになりました
+- v0.3.0の挙動を維持: 検索、同文字数multi-run置換、削除、単一run異文字数置換、`variable-length-safe`、opaque match ID・`MATCH_STALE`・`UNKNOWN_MATCH`、`/P` permission、暗号化PDFの保存制限、incremental update
+
 ## v0.3.0 - Safe variable-length multi-run replacement
 
 - **複数runにまたがる一致について、安全性をengineが証明できる構造に限り、置換前後の文字数が異なる置換へ対応**しました。v0.2.1では一律に拒否していたケースの一部が置換できます

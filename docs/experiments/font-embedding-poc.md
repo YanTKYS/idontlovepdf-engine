@@ -2,9 +2,14 @@
 
 **判定: Go**（範囲を限定した上で成立）
 
-これは正式機能ではありません。engineのversionは上げておらず、公開APIも変更していません。
-実装は `src/experimental/font-embedding.js` にあり、`src/index.js` からexportしておらず、
-配布物 `dist/idontlovepdf-engine.js` にも含まれません。
+> **この実験は engine v0.4.0 で正式機能になりました。**
+> 実装は `src/fallback-font.js` と `src/pdf-document.js` へ移り、公開APIは
+> `await editor.setFallbackFont(fontBytes)` です。`checkTextMatchReplacement()` /
+> `replaceTextMatch()` が自動的に使い分けます。v0.4.0では本文書の制限のうち
+> 「同文字数のみ」「run全体のみ」「単一runのみ」が解消されています（`docs/release-notes.md`
+> および README を参照）。以下は判断の記録として当時のまま残しています。
+> `src/experimental/` と `npm run poc:*` は正式実装への移行にともない削除しました
+> （fontの取得は `npm run test:font`、`tmp/test-fonts/` へ）。
 
 ---
 
@@ -95,8 +100,8 @@ Google FontsからOFLで公開しているものです。用途が今回の想�
 Google Fonts配布分（`google/fonts` の `ofl/bizudgothic/BIZUDGothic-Regular.ttf`）と
 upstream tag `v1.05` の内容が**バイト単位で同一**であることを確認済みです。
 
-**取得方法**: `npm run poc:font` が上記の**tag固定URL**から取得し、SHA-256を照合して
-`tmp/poc-fonts/`（git管理外）へ置きます。OFL.txtも同時に取得します。
+**取得方法**: `npm run test:font` が上記の**tag固定URL**から取得し、SHA-256を照合して
+`tmp/test-fonts/`（git管理外）へ置きます。OFL.txtも同時に取得します。
 4.5MBのバイナリはリポジトリ履歴に入れていません。
 **engineは実行時に一切fetchしません**（fontのbytesは呼び出し側から渡します）。
 fontが無い場合、関連testは失敗ではなくskipします。
@@ -357,13 +362,13 @@ whole-run同文字数置換にlayout engineが必須、Reader互換性、license
 
 ```sh
 npm ci
-npm run poc:font      # tag固定URLから取得しSHA-256照合（開発時のみ・約4.5MB）
+npm run test:font     # tag固定URLから取得しSHA-256照合（開発時のみ・約4.5MB）
 npm test              # test/font-embedding-poc.test.js を含む
 npm run test:browser  # test/browser/font-embedding-poc.test.js を含む
 ```
 
-`npm run poc:font` を実行していない場合、PoC testは失敗ではなくskipします。
-**CI（`.github/workflows/ci.yml`）では `npm run poc:font` を実行し、
+`npm run test:font` を実行していない場合、PoC testは失敗ではなくskipします。
+**CI（`.github/workflows/ci.yml`）では `npm run test:font` を実行し、
 さらに「skipが1件でもあれば失敗させる」guardを入れています。**
 これがないと、font未取得のままCIが緑になり、本PoCの主目的を一度も実行しないまま
 成功と表示されてしまうためです。
