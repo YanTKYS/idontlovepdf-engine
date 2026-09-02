@@ -33,12 +33,28 @@ const PDF_UNITS_PER_EM = 1000;
 const MAX_BFCHAR_ENTRIES = 100;
 
 /**
- * Marks a Type0 font as one this engine embedded, and says which font it holds (by the
- * byte length of the program). Readers ignore keys they do not know; this one lets a
+ * Marks a Type0 font as one this engine embedded, and says exactly which font program it
+ * holds -- a SHA-256 of the bytes. Readers ignore keys they do not know; this one lets a
  * later session recognise its own work and add to it rather than embedding a second copy
- * of the same multi-megabyte font. See adoptExistingFallbackFont() in pdf-document.js.
+ * of the same multi-megabyte font (see adoptExistingFallbackFont() in pdf-document.js).
+ *
+ * A digest rather than a name and a size: reusing an embedded program means writing new
+ * text with glyph ids resolved against the font the caller supplied now, so the two must
+ * be the same program byte for byte. Two builds of one family share a name and can share
+ * a length while numbering their glyphs differently, and mistaking one for the other
+ * would draw the wrong characters -- silently, and only in the text added last.
  */
 export const FALLBACK_FONT_MARKER = "ILPFallbackFont";
+
+/**
+ * A SHA-256 of the font program, as lowercase hex. Uses Web Crypto, which the engine
+ * already relies on for encrypted PDFs, so this adds no dependency and works unchanged
+ * in a browser.
+ */
+export async function fingerprintFont(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 const hex4 = (value) => value.toString(16).toUpperCase().padStart(4, "0");
 
@@ -78,6 +94,8 @@ export function parseFallbackFont(bytes) {
   return {
     bytes: data,
     font,
+    // Set by setFallbackFont(), which is async and so can hash the program once.
+    digest: null,
     unitsPerEm: font.unitsPerEm,
     // A PDF name, so anything outside the printable ASCII a name may hold is dropped.
     postScriptName: (font.names.postScriptName?.en ?? "FallbackFont").replace(/[^\x21-\x7e]|[\s()<>[\]{}/%#]/g, "") || "FallbackFont",
@@ -183,7 +201,7 @@ end`;
     [numbers.type0, {
       dictionary: `<< /Type /Font /Subtype /Type0 /BaseFont /${name} /Encoding /Identity-H`
         + ` /DescendantFonts [${numbers.cidFont} 0 R] /ToUnicode ${numbers.toUnicode} 0 R`
-        + ` /${FALLBACK_FONT_MARKER} ${fallback.bytes.length} >>`
+        + ` /${FALLBACK_FONT_MARKER} <${fallback.digest}> >>`
     }],
     descendant,
     [numbers.descriptor, {

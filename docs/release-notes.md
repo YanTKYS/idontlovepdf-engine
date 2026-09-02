@@ -20,6 +20,7 @@
 - テストと動作確認には **BIZ UDGothic Regular 1.05**（SIL Open Font License 1.1）を使用しています。fontはengineに同梱せず、**呼び出し側がbytesを渡す**方式です。**engineは実行時に一切ネットワークアクセスしません**
 - fallbackを使用した保存では、埋め込んだfont全体ぶんファイルサイズが増えます（BIZ UDGothicで約3MB）。subset化は未実施です
 - **fontの埋め込みは1文書につき1回だけ**です。同一editor内はもちろん、`save()` → 開き直して置換を続けた場合も、engineが以前埋め込んだfontを検出して再利用します（widthsとToUnicode CMapだけを更新するため、2回目以降の保存の増分は数KBです）。1置換ごとにsave/reopenする利用でもファイルが膨らみません
+- 埋め込み済みfontの同一判定は **font programのSHA-256** で行います。既存fontへ書き足すということは、そのfontのglyph IDで新しい文字を書くことなので、同一familyの別ビルド（名前もサイズも同じでglyph番号が異なり得る）を取り違えると、後から追加した文字だけが別の字形になり得るためです。digestが一致しない場合は別fontとして追加で埋め込みます
 - ToUnicode CMapの `beginbfchar` を仕様どおり100件ずつに分割します（101件以上の1グループは不正）。1文書で100種類を超える文字をfallbackで使っても正しいCMapを生成します
 - browser bundle（`dist/idontlovepdf-engine.js`）から利用できます。font parserを含むため bundle は約116KB → 約472KBになりました
 - v0.3.0の挙動を維持: 検索、同文字数multi-run置換、削除、単一run異文字数置換、`variable-length-safe`、opaque match ID・`MATCH_STALE`・`UNKNOWN_MATCH`、`/P` permission、暗号化PDFの保存制限、incremental update

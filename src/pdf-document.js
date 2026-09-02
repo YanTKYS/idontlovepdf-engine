@@ -1,5 +1,5 @@
 import { encodeHex, encodeLiteral, replaceTextRuns, scanTextRuns } from "./content-stream.js";
-import { FALLBACK_FONT_MARKER, buildFallbackFontObjects, freeResourceName, glyphsFor, glyphsFromToUnicode, identityEncode, parseFallbackFont } from "./fallback-font.js";
+import { FALLBACK_FONT_MARKER, buildFallbackFontObjects, fingerprintFont, freeResourceName, glyphsFor, glyphsFromToUnicode, identityEncode, parseFallbackFont } from "./fallback-font.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
 import { summarizeEncryption } from "./encryption.js";
 import { deflate, decodeStreamBytes, filters } from "./flate.js";
@@ -262,16 +262,17 @@ async function registerFallbackResource(editor, embedded, resources) {
  * every round trip would grow the file by the whole font.
  *
  * A font is recognised by the marker buildFallbackFontObjects() writes into the Type0
- * dictionary, which also records the program's byte length -- so a document carrying a
- * *different* fallback font is not mistaken for this one. Its existing glyphs are read
- * back from its ToUnicode CMap, and the pages already naming it are recorded, so neither
- * is added twice.
+ * dictionary, which records a SHA-256 of the program it holds. Only an exact match is
+ * adopted: text written into an existing font carries glyph ids resolved against the font
+ * supplied now, so anything but the same program byte for byte could draw the wrong
+ * characters. Its existing glyphs are read back from its ToUnicode CMap, and the pages
+ * already naming it are recorded, so neither is added twice.
  *
  * Returns null when the document carries no such font. Reads only; the caller decides
  * what to do with it.
  */
 async function adoptExistingFallbackFont(editor, fallback) {
-  const marker = new RegExp(`/${FALLBACK_FONT_MARKER}\\s+(\\d+)\\b`);
+  const marker = new RegExp(`/${FALLBACK_FONT_MARKER}\\s*<\\s*([0-9a-fA-F]+)\\s*>`);
   for (const stream of editor.streams) {
     if (stream.resources?.number === undefined) continue;
     let holder = stream.resources;
@@ -291,8 +292,9 @@ async function adoptExistingFallbackFont(editor, fallback) {
       } catch {
         continue;
       }
-      const length1 = type0.dictionary.match(marker);
-      if (!length1 || Number(length1[1]) !== fallback.bytes.length) continue;
+      const marked = type0.dictionary.match(marker);
+      if (!marked || marked[1].toLowerCase() !== fallback.digest) continue;
+      // A secondary check only: the digest already settles which program this is.
       if (!new RegExp(`/BaseFont\\s*/${fallback.postScriptName}\\b`).test(type0.dictionary)) continue;
 
       const [cidFontReference] = parseReferenceArray(type0.dictionary, "DescendantFonts");
@@ -1021,7 +1023,11 @@ export class PdfTextEditor {
     if (this.fallbackEmbedding) {
       throw searchError("FALLBACK_FONT_ALREADY_IN_USE", "This editor has already written text with a fallback font; that text holds glyph ids of that font, so it cannot be exchanged for another. Save and reopen to start again with a different font.");
     }
-    this.fallbackFont = parseFallbackFont(fontBytes);
+    const fallback = parseFallbackFont(fontBytes);
+    // Hashed once, here, so a later session can tell whether a font already embedded in
+    // the document is this exact program rather than merely one of the same name and size.
+    fallback.digest = await fingerprintFont(fallback.bytes);
+    this.fallbackFont = fallback;
     return this;
   }
 

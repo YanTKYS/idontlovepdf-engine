@@ -625,14 +625,55 @@ test("embeds the font once across repeated save and reopen cycles", { skip }, as
   assert.deepEqual(await reopened.searchText("令和"), []);
 });
 
-test("does not adopt a different font that another tool embedded", { skip }, async () => {
-  // The marker records which font program it stands for, so a document already carrying
-  // some other embedded font is not mistaken for one this engine wrote.
-  const editor = await editorFor(REIWA);
-  const [match] = await editor.searchText("令和");
-  await editor.replaceTextMatch(match.id, "しょうわ");
-  const saved = latin1.decode(await editor.save());
-  assert.match(saved, new RegExp(`/ILPFallbackFont ${fontBytes.length}\\b`), "the marker records the program's length");
+test("adopts an embedded font only when it is the same program byte for byte", { skip }, async () => {
+  // Writing into a font already in the document means resolving new glyph ids against the
+  // font supplied now, so the two have to be the same program. A name and a size do not
+  // establish that: two builds of one family share a name, can share a length, and may
+  // number their glyphs differently -- in which case the text added last would draw the
+  // wrong characters, silently. The marker is therefore a digest of the program.
+  const first = await editorFor(REIWA);
+  const [firstMatch] = await first.searchText("令和");
+  await first.replaceTextMatch(firstMatch.id, "しょうわ");
+  const saved = await first.save();
+  assert.match(latin1.decode(saved), /\/ILPFallbackFont <[0-9a-f]{64}>/, "the marker must be a digest of the program");
+
+  // A different font program that is indistinguishable by name and size: one byte of the
+  // same file changed. It still parses, and still calls itself BIZUDGothic-Regular.
+  const impostor = Uint8Array.from(fontBytes);
+  impostor[impostor.length - 1] ^= 0xff;
+  assert.equal(impostor.length, fontBytes.length);
+  assert.notDeepEqual(impostor, fontBytes);
+
+  const reopened = new PdfTextEditor(saved);
+  await reopened.setFallbackFont(impostor);
+  const [again] = await reopened.searchText("しょうわ");
+  await reopened.replaceTextMatch(again.id, "たいしょう");
+  const twice = await reopened.save();
+
+  // The embedded font was not adopted: this one is embedded alongside it.
+  assert.equal(latin1.decode(twice).match(/\/FontFile2/g).length, 2, "a different program must be embedded separately");
+  const digests = new Set([...latin1.decode(twice).matchAll(/\/ILPFallbackFont <([0-9a-f]{64})>/g)].map((entry) => entry[1]));
+  assert.equal(digests.size, 2, "the two fonts must be marked with different digests");
+  assert.deepEqual((await new PdfTextEditor(twice).listTextRuns()).map((run) => run.text), ["たいしょう"]);
+});
+
+test("adopts the embedded font when the same program is supplied again", { skip }, async () => {
+  // The other half of the rule above: the identical program is recognised and reused.
+  const first = await editorFor(REIWA);
+  const [firstMatch] = await first.searchText("令和");
+  await first.replaceTextMatch(firstMatch.id, "しょうわ");
+  const saved = await first.save();
+
+  const reopened = new PdfTextEditor(saved);
+  // A separate copy of the same bytes, as a caller loading the file again would have.
+  await reopened.setFallbackFont(Uint8Array.from(fontBytes));
+  const [again] = await reopened.searchText("しょうわ");
+  await reopened.replaceTextMatch(again.id, "たいしょう");
+  const twice = await reopened.save();
+
+  assert.equal(latin1.decode(twice).match(/\/FontFile2/g).length, 1, "the same program must be embedded once");
+  assert.ok(twice.length - saved.length < 100_000, `the second save re-embedded the font: +${twice.length - saved.length} bytes`);
+  assert.deepEqual((await new PdfTextEditor(twice).listTextRuns()).map((run) => run.text), ["たいしょう"]);
 });
 
 /**
