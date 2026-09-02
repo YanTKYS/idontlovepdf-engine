@@ -51,6 +51,7 @@ function internalRuns(editor) {
       id,
       objectNumber: stream.object.number,
       continuityId: run.continuityId,
+      joinBefore: run.joinBefore,
       fontName: run.fontName,
       text: decodeWithCMap(editor.pending.get(id) ?? run.value, mappings)
     };
@@ -106,6 +107,175 @@ function encodeReplacement(editor, run, replacement) {
   const stream = editor.streams.find((candidate) => candidate.object.number === run.objectNumber);
   const mappings = stream.fontMaps.get(run.fontName);
   return mappings ? encodeWithCMap(replacement, mappings) : encodeSingleByte(replacement);
+}
+
+/**
+ * How replaceTextMatch() will write a given replacement. Reported by
+ * checkTextMatchReplacement() so a caller can decide before committing to anything.
+ */
+const REPLACEMENT_MODE = {
+  singleRun: "single-run",
+  sameLength: "same-length",
+  delete: "delete",
+  variableLength: "variable-length-safe"
+};
+
+function refusal(code, reason, unsafeReason) {
+  return unsafeReason ? { allowed: false, code, reason, unsafeReason } : { allowed: false, code, reason };
+}
+
+/**
+ * Whether the runs of a match may have characters moved BETWEEN them -- the question a
+ * variable-length replacement has to answer, and a stricter one than the search
+ * continuity that let the runs be read as one string in the first place.
+ *
+ * Returns null when the move is safe, or a short reason why it is not.
+ *
+ * What makes it safe is narrow and provable, not estimated. Inside a group of operands
+ * separated only by zero-valued `TJ` adjustments or by nothing at all, a zero adjustment
+ * translates the text matrix by zero and an empty string operand shows no glyphs and
+ * advances nothing -- so the page depends only on the concatenation of the operands, not
+ * on how the characters are distributed among them. Moving them all into the first
+ * operand is then exactly the single-operand replacement v0.2.1 already does, with no
+ * glyph width, text matrix, or spacing arithmetic anywhere.
+ *
+ * "Separated only by zero-valued adjustments" is about the NET displacement between two
+ * strings, not about where the numbers are written: a `TJ` number moves the next string
+ * whether it sits at the end of one array, at the start of the next, or between two
+ * operands of a single one, so `[(A) 120] TJ [(B)] TJ` is no more an adjacency than
+ * `[(A) 120 (B)] TJ` is. scanTextRuns() sums across the operator boundary for exactly
+ * this reason; reading only the numbers inside an array would let a kern be silently
+ * relocated to after the replacement.
+ *
+ * Everything else is refused. A non-zero adjustment is real spacing between two specific
+ * glyphs, and honouring it after moving characters would mean re-deciding what it should
+ * be; a `Tc`/`Tw`/`Tz`/`Tr`, colour, or marked-content operator between two operands
+ * means the two are drawn under different state, so a character moved across it would be
+ * drawn differently than the PDF asked. Both are out of scope by design -- see the
+ * README -- and neither is guessed at.
+ */
+function variableLengthObstacle(span, current) {
+  for (let index = 1; index < span.length; index += 1) {
+    const join = current.get(span[index].runId)?.joinBefore;
+    // A null join means this run starts its own continuity group, which a match should
+    // never span. Refuse rather than assume the scanner and the match agree.
+    if (!join) return "unsupported-topology";
+    if (join.kind === "state-change") return "text-state-boundary";
+    // The two operands are adjacent only if nothing displaces the second relative to the
+    // first. That holds for a `TJ` adjustment between two operands of one array and,
+    // equally, for one spanning the operator boundary -- `[(A) 120] TJ [(B)] TJ` moves B
+    // exactly as `[(A) 120 (B)] TJ` does, and a scanner that only looked inside arrays
+    // would read it as a plain adjacency and quietly relocate the 120. Compared as a
+    // number, so `0`, `0.0`, `+0`, `-0` and `-0.0` are all the same zero, and a pair
+    // that cancels out (`[(A) 120] TJ [-120 (B)] TJ`) is genuinely adjacent.
+    if (join.adjustment !== 0) return "non-zero-tj-adjustment";
+  }
+  return null;
+}
+
+/**
+ * The single decision point for "may this match be replaced by this text, and with what
+ * written where". Both checkTextMatchReplacement() and replaceTextMatch() go through it,
+ * so a caller can never be told a replacement is allowed and then have it refused --
+ * they are literally the same verdict, including the font encoding, which is attempted
+ * here rather than left to fail later.
+ *
+ * Returns `{ allowed: false, code, reason, unsafeReason? }`, or `{ allowed: true, mode,
+ * updates }` where `updates` is every run to rewrite, already encoded. Nothing is staged
+ * here: the caller commits `updates` in one go, so a refusal -- or a character the font
+ * cannot express -- leaves the document exactly as it was rather than half replaced.
+ */
+function planTextMatchReplacement(editor, matchId, replacement) {
+  // /P's modify permission is a property of the PDF, checked on every attempt: finding
+  // text is a reading capability, changing it is not. Reported rather than thrown so
+  // checkTextMatchReplacement() can tell a caller up front that editing is not allowed.
+  if (editor.security && editor.security.modifyAllowed === false) {
+    return refusal("MODIFICATION_NOT_PERMITTED", "Document modification is not permitted: this PDF's /P permissions disallow content changes (modify permission denied)");
+  }
+  if (typeof replacement !== "string") {
+    return refusal("REPLACEMENT_NOT_A_STRING", "replaceTextMatch() takes the replacement as a string; use replaceText() to write raw font-encoded bytes to a single run");
+  }
+  const match = editor.matches.get(matchId);
+  if (!match) {
+    return refusal("UNKNOWN_MATCH", `Unknown search match: ${matchId} (match ids come from this editor's most recent searchText() call and are superseded by the next one)`);
+  }
+
+  const current = new Map(internalRuns(editor).map((run) => [run.id, run]));
+  for (const entry of match.span) {
+    if (current.get(entry.runId)?.text !== entry.runText) {
+      return refusal("MATCH_STALE", `This match is stale: the text it was found in has changed since searchText() returned it (run ${entry.runId}). Search again and replace the new match.`);
+    }
+  }
+
+  const replacementPoints = [...replacement];
+  let mode;
+  let chunks;
+  if (match.span.length === 1) {
+    // One operand: rewritten whole, so its length was never constrained.
+    mode = REPLACEMENT_MODE.singleRun;
+    chunks = [replacementPoints];
+  } else {
+    const fonts = new Set(match.span.map((entry) => entry.fontName));
+    if (fonts.size > 1) {
+      return refusal("MULTI_RUN_FONT_CHANGE_UNSUPPORTED", `This match spans ${fonts.size} fonts; replacing it would have to encode its characters through more than one font, which is not supported`);
+    }
+    const matchLength = [...match.text].length;
+    if (!replacementPoints.length) {
+      // Deletion, unchanged from v0.2.1: every run keeps its own prefix and suffix and
+      // gives up only its share of the match, so no character moves between operands.
+      mode = REPLACEMENT_MODE.delete;
+      chunks = match.span.map(() => []);
+    } else if (replacementPoints.length === matchLength) {
+      // Equal length, unchanged from v0.2.1: each run gets back exactly as many
+      // characters as it contributed, so the original operand boundaries survive and
+      // nothing depends on what sits between them.
+      mode = REPLACEMENT_MODE.sameLength;
+      let cursor = 0;
+      chunks = match.span.map((entry) => {
+        const contributed = entry.charEnd - entry.charStart;
+        const chunk = replacementPoints.slice(cursor, cursor + contributed);
+        cursor += contributed;
+        return chunk;
+      });
+    } else {
+      const obstacle = variableLengthObstacle(match.span, current);
+      if (obstacle) {
+        return refusal(
+          "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED",
+          `This match is drawn as ${match.span.length} separate text runs, so a replacement of ${replacementPoints.length} characters cannot be written over ${matchLength} without moving text relative to the PDF's own spacing (${obstacle}). Use an equal-length replacement, or an empty one to delete.`,
+          obstacle
+        );
+      }
+      // Safe topology: the whole replacement goes into the first operand and the rest of
+      // the match's operands are emptied. Operand count, operator structure and every
+      // adjustment stay exactly as they were.
+      mode = REPLACEMENT_MODE.variableLength;
+      chunks = match.span.map((_, index) => (index === 0 ? replacementPoints : []));
+    }
+  }
+
+  const updates = [];
+  try {
+    match.span.forEach((entry, index) => {
+      const points = [...entry.runText];
+      const text = points.slice(0, entry.charStart).join("") + chunks[index].join("") + points.slice(entry.charEnd).join("");
+      if (text === entry.runText) return;
+      updates.push({ id: entry.runId, bytes: encodeReplacement(editor, entry, text) });
+    });
+  } catch (error) {
+    // A character the existing font has no code for. Reported with the underlying
+    // message intact, so callers matching on it keep working.
+    return { ...refusal("FONT_ENCODING_UNSUPPORTED", error.message), cause: error };
+  }
+  return { allowed: true, mode, updates };
+}
+
+function planError(plan) {
+  const error = new Error(plan.reason);
+  error.code = plan.code;
+  if (plan.unsafeReason) error.unsafeReason = plan.unsafeReason;
+  if (plan.cause) error.cause = plan.cause;
+  return error;
 }
 
 function concat(chunks) {
@@ -344,103 +514,68 @@ export class PdfTextEditor {
   }
 
   /**
+   * Whether replaceTextMatch() would accept `replacement` for this match, decided
+   * without changing anything. Returns `{ allowed: true, mode }` or `{ allowed: false,
+   * code, reason, unsafeReason? }` -- never throws for a refusal, since a caller asking
+   * "may I?" is not making a mistake by asking.
+   *
+   * `mode` names how the replacement would be written: "single-run" (the match sits in
+   * one operand, rewritten whole), "same-length" (each operand gets back the characters
+   * it contributed), "delete", or "variable-length-safe" (the length changes and the
+   * structure permits it -- see planTextMatchReplacement()).
+   *
+   * This exists so a caller never has to inspect run counts, `TJ` arrays or operators to
+   * decide whether an edit is possible: that judgement needs the content stream, and
+   * belongs here. It shares planTextMatchReplacement() with replaceTextMatch(), so its
+   * verdict is the same verdict -- including the font encoding, which is attempted here
+   * too rather than left to surface only at replacement time.
+   */
+  async checkTextMatchReplacement(matchId, replacement) {
+    await this.listTextRuns();
+    const plan = planTextMatchReplacement(this, matchId, replacement);
+    if (!plan.allowed) {
+      const result = { allowed: false, mode: null, code: plan.code, reason: plan.reason };
+      return plan.unsafeReason ? { ...result, unsafeReason: plan.unsafeReason } : result;
+    }
+    return { allowed: true, mode: plan.mode };
+  }
+
+  /**
    * Replaces one match from searchText(), across every run it spans, and stages the
    * result for save() -- so a caller never has to know that the match was split into
    * runs at all, nor call replaceText() once per piece.
    *
-   * The match is re-checked against the document first: each run it covers must still
-   * read exactly as it did when the match was found, or this throws `code:
-   * "MATCH_STALE"` and stages nothing. Rewriting the wrong place because an id outlived
-   * the text it described is the one failure worth refusing outright.
+   * The verdict and the exact bytes both come from planTextMatchReplacement(), the same
+   * decision checkTextMatchReplacement() reports; see it for what is allowed and why.
+   * In short:
    *
-   * What is replaced, and what is kept:
+   * - A match inside a single run is rewritten whole, at any length -- unchanged from
+   *   v0.2.1, and unaffected by the multi-run rules below.
+   * - A multi-run match of equal length is split back onto its original operands by how
+   *   many characters each contributed; a deletion empties each operand's share. Both
+   *   keep every operand boundary, so both work whatever sits between the operands.
+   * - A multi-run match whose length changes is written only when the operands are
+   *   joined by zero `TJ` adjustments or by nothing at all: then the whole replacement
+   *   goes into the first operand and the rest are emptied, which the PDF draws exactly
+   *   as the single-operand replacement above. Any other structure -- a non-zero
+   *   adjustment, a `Tc`/`Tw`/`Tz`/`Tr`, colour or marked-content operator in between --
+   *   is refused with `code: "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` rather than
+   *   re-spaced, re-flowed or estimated.
    *
-   * - A match inside a single run goes through the same whole-run rewrite that
-   *   replaceText() has always done, rebuilt as `prefix + replacement + suffix`, so the
-   *   parts of that run outside the match survive and single-run behaviour is unchanged.
-   * - A match spanning several runs is split back onto those runs by how many characters
-   *   each one contributed: run "申請は令" + "和6年" + "度です" replaced 令和6年度 →
-   *   令和7年度 becomes "申請は令" + "和7年" + "度です". Every string operand, every
-   *   `TJ` numeric adjustment, and the operator structure around them stay as they were
-   *   -- nothing is re-spaced, re-flowed, or re-computed.
-   * - An empty `replacement` deletes the matched text: each run keeps its prefix and
-   *   suffix, and a run lying wholly inside the match becomes an empty string operand.
-   *   The operand stays in place rather than the content stream being rebuilt around
-   *   its removal, which keeps this an ordinary incremental update.
+   * Prefix and suffix around the match are always preserved. A match whose text has
+   * changed since it was found is refused with `code: "MATCH_STALE"` rather than
+   * rewriting whatever now sits there. Characters are counted in Unicode code points
+   * (`[...text]`), so a surrogate pair counts once; grapheme clusters are not combined.
    *
-   * Refused, explicitly and with a stable `code`, rather than guessed at:
-   *
-   * - A multi-run replacement whose character count differs from the match's, other
-   *   than deletion: `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED`. There is no way to divide
-   *   the extra (or missing) characters over the original operands without moving text
-   *   relative to the `TJ` adjustments that space it, i.e. without changing where
-   *   characters land on the page. Replace inside a single run, or delete, instead.
-   * - A multi-run match spanning more than one font: `MULTI_RUN_FONT_CHANGE_UNSUPPORTED`.
-   *   Each piece would have to be encoded through a different CMap. Search already
-   *   breaks continuity at a font switch, so this is a backstop, not a common path.
-   *
-   * Characters are counted in Unicode code points (`[...text]`), so a surrogate pair
-   * counts once and never as two. Grapheme clusters are not combined.
+   * Nothing is staged unless the whole replacement encodes: the updates are built and
+   * encoded before any of them is committed, so a character the font cannot express
+   * leaves the document untouched instead of half replaced.
    */
   async replaceTextMatch(matchId, replacement) {
     await this.listTextRuns();
-    // Same permission rule as replaceText(): a /P that forbids modification forbids it
-    // here too, however the caller found the text.
-    if (this.security && this.security.modifyAllowed === false) {
-      throw new Error("Document modification is not permitted: this PDF's /P permissions disallow content changes (modify permission denied)");
-    }
-    if (typeof replacement !== "string") {
-      throw searchError("REPLACEMENT_NOT_A_STRING", "replaceTextMatch() takes the replacement as a string; use replaceText() to write raw font-encoded bytes to a single run");
-    }
-    const match = this.matches.get(matchId);
-    if (!match) {
-      throw searchError("UNKNOWN_MATCH", `Unknown search match: ${matchId} (match ids come from this editor's most recent searchText() call and are superseded by the next one)`);
-    }
-
-    const current = new Map(internalRuns(this).map((run) => [run.id, run]));
-    for (const entry of match.span) {
-      if (current.get(entry.runId)?.text !== entry.runText) {
-        throw searchError("MATCH_STALE", `This match is stale: the text it was found in has changed since searchText() returned it (run ${entry.runId}). Search again and replace the new match.`);
-      }
-    }
-
-    const replacementPoints = [...replacement];
-    let chunks;
-    if (match.span.length === 1) {
-      chunks = [replacementPoints];
-    } else {
-      const fonts = new Set(match.span.map((entry) => entry.fontName));
-      if (fonts.size > 1) {
-        throw searchError("MULTI_RUN_FONT_CHANGE_UNSUPPORTED", `This match spans ${fonts.size} fonts; replacing it would have to encode its characters through more than one font, which is not supported`);
-      }
-      const matchLength = [...match.text].length;
-      if (replacementPoints.length && replacementPoints.length !== matchLength) {
-        throw searchError(
-          "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED",
-          `This match is drawn as ${match.span.length} separate text runs, so a replacement of ${replacementPoints.length} characters cannot be written over ${matchLength} without moving text relative to the PDF's own spacing. Use an equal-length replacement, or an empty one to delete.`
-        );
-      }
-      let cursor = 0;
-      chunks = match.span.map((entry) => {
-        const contributed = entry.charEnd - entry.charStart;
-        // Deleting takes nothing from every run; otherwise each run gets back exactly as
-        // many characters as it put in, keeping the original operand boundaries.
-        const chunk = replacementPoints.length ? replacementPoints.slice(cursor, cursor + contributed) : [];
-        cursor += contributed;
-        return chunk;
-      });
-    }
-
-    // Encode every run's new text before staging any of it: a character the font cannot
-    // express must fail with nothing written, not with half the match replaced.
-    const staged = [];
-    match.span.forEach((entry, index) => {
-      const points = [...entry.runText];
-      const text = points.slice(0, entry.charStart).join("") + chunks[index].join("") + points.slice(entry.charEnd).join("");
-      if (text === entry.runText) return;
-      staged.push({ id: entry.runId, bytes: encodeReplacement(this, entry, text) });
-    });
-    for (const { id, bytes } of staged) this.pending.set(id, bytes);
+    const plan = planTextMatchReplacement(this, matchId, replacement);
+    if (!plan.allowed) throw planError(plan);
+    for (const { id, bytes } of plan.updates) this.pending.set(id, bytes);
     return this;
   }
 

@@ -100,6 +100,106 @@ test("dist/idontlovepdf-engine.js loads and runs in a real browser", async () =>
   }
 });
 
+test("performs a variable-length multi-run replacement in a real browser, and the saved PDF opens in the browser's own PDF viewer", async () => {
+  assert.ok(existsSync(distFile), "dist/idontlovepdf-engine.js is missing -- run `npm run build` first");
+
+  const server = await serveDist();
+  const { port } = server.address();
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    const pageErrors = [];
+    page.on("pageerror", (error) => pageErrors.push(error));
+
+    await page.goto(`http://127.0.0.1:${port}/`);
+    const result = await page.evaluate(async () => {
+      const { PdfTextEditor } = await import("/idontlovepdf-engine.js");
+      const encode = (value) => new TextEncoder().encode(value);
+
+      // "実績報告書" as five operands of one TJ array, every adjustment an explicit zero
+      // -- the structure a length-changing replacement may safely be written over.
+      const cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+        + "7 beginbfchar\n<0001> <5B9F>\n<0002> <7E3E>\n<0003> <5831>\n<0004> <544A>\n<0005> <66F8>\n<0006> <4E8B>\n<0007> <696D>\nendbfchar\n"
+        + "endcmap\nend end";
+      const content = "BT /FJP 12 Tf 72 700 Td [<0001> 0 <0002> 0 <0003> 0 <0004> 0 <0005>] TJ ET";
+      const stream = (number, bodyText) => `${number} 0 obj\n<< /Length ${encode(bodyText).length} >>\nstream\n${bodyText}\nendstream\nendobj\n`;
+      const objects = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n",
+        stream(4, content),
+        "5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n",
+        stream(6, cmap)
+      ];
+      let source = "%PDF-1.4\n";
+      const offsets = [];
+      for (const object of objects) {
+        offsets.push(encode(source).length);
+        source += object;
+      }
+      const xrefOffset = encode(source).length;
+      source += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("")}`
+        + `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+
+      const editor = new PdfTextEditor(encode(source));
+      const runTexts = (await editor.listTextRuns()).map((run) => run.text);
+      const [match] = await editor.searchText("実績報告書");
+      const check = await editor.checkTextMatchReplacement(match.id, "報告書");
+      await editor.replaceTextMatch(match.id, "報告書");
+      const saved = await editor.save();
+
+      const reopened = new PdfTextEditor(saved);
+      // The saved bytes are handed to the page as a Blob URL, exactly as a caller would
+      // offer them for download, so the browser's own PDF viewer can be pointed at them.
+      const blobUrl = URL.createObjectURL(new Blob([saved], { type: "application/pdf" }));
+      return {
+        runTexts,
+        check,
+        reopenedRunTexts: (await reopened.listTextRuns()).map((run) => run.text),
+        oldRemaining: (await reopened.searchText("実績報告書")).length,
+        newFound: (await reopened.searchText("報告書")).length,
+        blobUrl,
+        savedBytes: [...saved]
+      };
+    });
+
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(result.runTexts, ["実", "績", "報", "告", "書"]);
+    assert.deepEqual(result.check, { allowed: true, mode: "variable-length-safe" });
+    assert.deepEqual(result.reopenedRunTexts, ["報告書", "", "", "", ""]);
+    assert.equal(result.oldRemaining, 0);
+    assert.equal(result.newFound, 1);
+
+    // Chromium's PDF viewer is an implementation with nothing in common with this
+    // engine, so its accepting the saved bytes is independent evidence that the rewrite
+    // produced a real PDF -- not only one this engine can read back.
+    const viewer = await browser.newPage();
+    const viewerErrors = [];
+    viewer.on("pageerror", (error) => viewerErrors.push(error));
+    const saved = Buffer.from(result.savedBytes);
+    const pdfServer = await new Promise((resolve) => {
+      const created = http.createServer((request, response) => {
+        response.setHeader("Content-Type", request.url.endsWith(".pdf") ? "application/pdf" : "text/html");
+        response.end(request.url.endsWith(".pdf") ? saved : `<!doctype html><embed id="v" style="width:600px;height:400px" type="application/pdf" src="/saved.pdf">`);
+      });
+      created.listen(0, "127.0.0.1", () => resolve(created));
+    });
+    try {
+      await viewer.goto(`http://127.0.0.1:${pdfServer.address().port}/`);
+      await viewer.waitForSelector("embed#v");
+      // The viewer runs out-of-process, so what is asserted is that Chromium accepted
+      // the bytes as a PDF and raised no page error -- not a pixel comparison.
+      assert.deepEqual(viewerErrors, []);
+    } finally {
+      await viewer.close();
+      pdfServer.close();
+    }
+  } finally {
+    await browser.close();
+    server.close();
+  }
+});
+
 test("searches and replaces text split across several runs in a real browser", async () => {
   assert.ok(existsSync(distFile), "dist/idontlovepdf-engine.js is missing -- run `npm run build` first");
 

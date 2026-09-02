@@ -241,6 +241,21 @@ const CONTINUITY_SAFE_OPERATORS = new Set([
 const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
 
 /**
+ * How an operator's first string operand joins the last run of the previous operator.
+ * "adjacent-operator" when nothing ran in between -- carrying `displacement`, the net
+ * `TJ` spacing between the two strings, which spans the end of the previous array, the
+ * operator boundary itself, and the start of this one: `[(A) 120] TJ [(B)] TJ` and
+ * `(A) Tj [120 (B)] TJ` both move B by 120 just as `[(A) 120 (B)] TJ` does, and none of
+ * them may be read as a plain adjacency. "state-change" when something did run in
+ * between, and null when there is no previous run in this continuity group at all.
+ */
+function joinAcrossOperators(runs, continuityId, boundaryClean, displacement) {
+  const previous = runs.at(-1);
+  if (!previous || previous.continuityId !== continuityId) return null;
+  return boundaryClean ? { kind: "adjacent-operator", adjustment: displacement } : { kind: "state-change" };
+}
+
+/**
  * Extracts text-showing operands (Tj/TJ/'/" strings, inside BT...ET) from a content
  * stream, as a lightweight scanner -- not a full PDF content-stream parser or AST.
  * `context`, when given, is threaded into any parse-failure message via
@@ -255,6 +270,27 @@ const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
  * scanner sees anything that could move the text cursor or swap the font, so runs on
  * either side of such an operator are never joined; the full list is above and in the
  * operator dispatch below.
+ *
+ * Each run additionally carries `joinBefore`, describing how it is attached to the run
+ * before it. Search does not use it -- continuityId already answers "may these be read
+ * as one string". It answers the stricter, separate question a variable-length
+ * replacement has to ask: "may characters be moved BETWEEN these operands without
+ * moving anything on the page" (see planTextMatchReplacement() in pdf-document.js).
+ *
+ *   null                                    first run of its continuity group
+ *   { kind: "tj-array", adjustment }        previous run is an earlier operand of the
+ *                                           same TJ array
+ *   { kind: "adjacent-operator", adjustment }  previous run belongs to an earlier
+ *                                           text-showing operator with nothing at all
+ *                                           in between
+ *   { kind: "state-change" }                something ran in between -- one of the
+ *                                           CONTINUITY_SAFE_OPERATORS above, since
+ *                                           anything else would have ended the group
+ *
+ * `adjustment` is the net `TJ` displacement between the two strings, in either case:
+ * the sum of every number between them, wherever those numbers sit relative to the
+ * operator boundary. It is 0 for two genuinely adjacent operands, and only a 0 there
+ * makes them interchangeable.
  */
 export function scanTextRuns(bytes, context = "") {
   const strings = [];
@@ -270,12 +306,24 @@ export function scanTextRuns(bytes, context = "") {
   let textObjectId = -1;
   // Incremented by every boundary below. Runs are joinable only while it holds still.
   let continuityId = 0;
+  // True while nothing at all has run since the last text-showing operator, which is
+  // what separates joinBefore's "adjacent-operator" from its "state-change".
+  let boundaryClean = false;
+  // Numbers seen since the last string operand was collected. Summed, since `[(a) 5 -5
+  // (b)]` is two of them and only their total decides whether (a) and (b) are adjacent
+  // -- and deliberately NOT reset by a text-showing operator, so a number at the end of
+  // one TJ array or the start of the next (`[(A) 120] TJ [(B)] TJ`, `(A) Tj [120 (B)] TJ`)
+  // counts as the displacement between those two strings just as an in-array one does.
+  // Numbers consumed by any other operator are that operator's operands, not spacing,
+  // and are discarded with it below.
+  let displacement = 0;
   while (cursor < bytes.length) {
     cursor = skipWhite(bytes, cursor);
     if (cursor >= bytes.length) break;
     if (bytes[cursor] === 0x28) {
       const token = withStreamContext(() => readLiteral(bytes, cursor), bytes, cursor, context);
-      strings.push({ ...token, start: cursor });
+      strings.push({ ...token, start: cursor, displacement });
+      displacement = 0;
       cursor = token.end;
       continue;
     }
@@ -291,7 +339,8 @@ export function scanTextRuns(bytes, context = "") {
     }
     if (bytes[cursor] === 0x3c) {
       const token = withStreamContext(() => readHex(bytes, cursor), bytes, cursor, context);
-      strings.push({ ...token, start: cursor });
+      strings.push({ ...token, start: cursor, displacement });
+      displacement = 0;
       cursor = token.end;
       continue;
     }
@@ -310,24 +359,36 @@ export function scanTextRuns(bytes, context = "") {
     const operator = latin1.decode(bytes.subarray(start, cursor));
     // A number is an operand (`12` in `/F1 12 Tf`, an adjustment in a TJ array), not an
     // operator: it must not clear the pending strings, the pending /Name, or continuity.
-    if (NUMBER.test(operator)) continue;
+    // Accumulated as spacing towards the next string operand. Whether it really was
+    // spacing is settled by what runs next: a text-showing operator keeps the total,
+    // any other operator discards it as its own operand (see the branches below).
+    if (NUMBER.test(operator)) {
+      displacement += Number(operator);
+      continue;
+    }
     if (operator === "BI") {
       cursor = skipInlineImage(bytes, cursor);
       strings.length = 0;
       lastName = null;
+      displacement = 0;
       continuityId += 1;
+      boundaryClean = false;
     } else if (operator === "BT") {
       inText = true;
       currentFont = null;
       textObjectId += 1;
       strings.length = 0;
+      displacement = 0;
       // A new text object starts wherever its own Td/Tm puts it, so text before this
       // `BT` and text after it are unrelated positions on the page.
       continuityId += 1;
+      boundaryClean = false;
     } else if (operator === "ET") {
       inText = false;
       strings.length = 0;
+      displacement = 0;
       continuityId += 1;
+      boundaryClean = false;
     } else if (inText && operator === "Tf") {
       // A replacement spanning two fonts would have to encode its characters through
       // two different CMaps, so v0.2.1 does not join text across a font switch. Re-
@@ -335,17 +396,38 @@ export function scanTextRuns(bytes, context = "") {
       if (lastName !== currentFont) continuityId += 1;
       currentFont = lastName;
       strings.length = 0;
+      displacement = 0;
+      boundaryClean = false;
     } else if (inText && (operator === "Tj" || operator === "'" || operator === "\"" || operator === "TJ")) {
       // `'` and `"` move to the next line before showing their string, so what they
       // draw never continues the text that precedes them.
       if (operator === "'" || operator === "\"") continuityId += 1;
-      for (const string of strings) runs.push({ ...string, fontName: currentFont, textObjectId, continuityId });
+      strings.forEach((string, index) => {
+        // Each string carries the net displacement accumulated since the previous string
+        // was collected. For the operator's first operand that gap spans the operator
+        // boundary, so it is the previous operator's trailing numbers plus this one's
+        // leading ones; for the rest it is the gap inside this operator's own array.
+        const joinBefore = index === 0
+          ? joinAcrossOperators(runs, continuityId, boundaryClean, string.displacement)
+          : { kind: "tj-array", adjustment: string.displacement };
+        runs.push({ ...string, fontName: currentFont, textObjectId, continuityId, joinBefore });
+      });
       strings.length = 0;
+      // displacement is intentionally left alone: any number after this operator's last
+      // string belongs to the gap before the NEXT one.
+      boundaryClean = true;
     } else {
       strings.length = 0;
       lastName = null;
+      // Whatever numbers were pending were this operator's operands (`5 Tc`, `1 0 0 rg`,
+      // `72 700 Td`), not spacing between two strings.
+      displacement = 0;
       // Td/TD/Tm/T* land here, as does every operator not vouched for above.
       if (!CONTINUITY_SAFE_OPERATORS.has(operator)) continuityId += 1;
+      // Even an operator that keeps text searchable (a colour, `Tc`, marked content)
+      // makes this a state-change boundary: moving characters across one of those would
+      // draw them under different text state than the PDF put them under.
+      boundaryClean = false;
     }
   }
   return runs;

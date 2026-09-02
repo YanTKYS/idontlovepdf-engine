@@ -36,14 +36,63 @@ export interface PdfTextMatch {
   readonly fontName: string | null;
 }
 
-/** Stable `code` values carried by the errors searchText()/replaceTextMatch() throw. */
+/**
+ * Stable `code` values carried by the errors searchText()/replaceTextMatch() throw, and
+ * reported by checkTextMatchReplacement() without throwing.
+ */
 export type PdfTextEditorErrorCode =
   | "EMPTY_QUERY"
   | "UNKNOWN_MATCH"
   | "MATCH_STALE"
   | "REPLACEMENT_NOT_A_STRING"
+  | "MODIFICATION_NOT_PERMITTED"
+  | "FONT_ENCODING_UNSUPPORTED"
   | "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"
   | "MULTI_RUN_FONT_CHANGE_UNSUPPORTED";
+
+/** How replaceTextMatch() would write a replacement that is allowed. */
+export type TextMatchReplacementMode =
+  /** The match sits in one text run, which is rewritten whole -- any length. */
+  | "single-run"
+  /** Multi-run, same character count: each run gets back the characters it contributed. */
+  | "same-length"
+  /** Multi-run deletion: each run gives up only its own share of the match. */
+  | "delete"
+  /**
+   * Multi-run, different character count, written because the operands are joined only
+   * by zero `TJ` adjustments or by nothing at all: the whole replacement goes into the
+   * first operand and the rest are emptied, which the PDF draws identically.
+   */
+  | "variable-length-safe";
+
+/**
+ * Why a length-changing multi-run replacement could not be written safely. Secondary
+ * detail alongside `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED`; describes the structure only,
+ * never the document's content.
+ */
+export type TextMatchReplacementObstacle =
+  /**
+   * The `TJ` adjustments between two of the match's operands do not sum to zero, so the
+   * second is displaced from the first. Counted wherever the numbers are written --
+   * inside one array, at the end of one, or at the start of the next -- since all three
+   * displace the following string by the same amount.
+   */
+  | "non-zero-tj-adjustment"
+  /** A `Tc`/`Tw`/`Tz`/`Tr`, colour, or marked-content operator sits between them. */
+  | "text-state-boundary"
+  /** The match's runs are not attached to each other in a shape this version knows. */
+  | "unsupported-topology";
+
+/** What checkTextMatchReplacement() reports. */
+export type TextMatchReplacementCheck =
+  | { readonly allowed: true; readonly mode: TextMatchReplacementMode }
+  | {
+      readonly allowed: false;
+      readonly mode: null;
+      readonly code: PdfTextEditorErrorCode;
+      readonly reason: string;
+      readonly unsafeReason?: TextMatchReplacementObstacle;
+    };
 
 export class PdfTextEditor {
   constructor(input: ArrayBuffer | Uint8Array);
@@ -59,10 +108,22 @@ export class PdfTextEditor {
   searchText(query: string, password?: string): Promise<PdfTextMatch[]>;
 
   /**
+   * Whether replaceTextMatch() would accept `replacement` for this match, decided
+   * without changing anything and without throwing for a refusal. Shares its decision
+   * with replaceTextMatch(), so "allowed" here is never refused there.
+   *
+   * Use this instead of inspecting `runCount`: whether a length change is possible
+   * depends on the content stream, not on how many runs the match spans.
+   */
+  checkTextMatchReplacement(matchId: string, replacement: string): Promise<TextMatchReplacementCheck>;
+
+  /**
    * Replaces one match from searchText(), across every run it spans, and stages it for
    * save(). An empty `replacement` deletes the matched text. Throws with a stable
    * `code` (see PdfTextEditorErrorCode) when the match no longer describes the current
-   * document, or when a multi-run replacement cannot be written safely.
+   * document, or when a multi-run replacement cannot be written safely. A length change
+   * across several runs is written only where the structure makes it provably safe --
+   * see TextMatchReplacementMode and checkTextMatchReplacement().
    */
   replaceTextMatch(matchId: string, replacement: string): Promise<this>;
 

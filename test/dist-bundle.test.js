@@ -282,3 +282,61 @@ test("keeps the bundle's search from joining text across a BT ... ET boundary", 
   assert.deepEqual(await editor.searchText("address John"), []);
   assert.equal((await editor.searchText("Housing address")).length, 1);
 });
+
+/* ---------------------------- variable-length multi-run replacement via the bundle */
+
+/**
+ * "実績報告書" as five operands of one TJ array with every adjustment an explicit zero
+ * -- the structure v0.3.0 can safely replace with a different number of characters. The
+ * font's CMap also carries the characters the replacement needs.
+ */
+function zeroAdjustmentJapanesePdf() {
+  const cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n" +
+    "8 beginbfchar\n<0001> <5B9F>\n<0002> <7E3E>\n<0003> <5831>\n<0004> <544A>\n<0005> <66F8>\n" +
+    "<0006> <4E8B>\n<0007> <696D>\n<0008> <5EA6>\nendbfchar\nendcmap\nend end";
+  return classicPdf([
+    encode("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+    encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"),
+    encode("3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n"),
+    streamObject(4, "BT /FJP 12 Tf 72 700 Td [<0001> 0 <0002> 0 <0003> 0 <0004> 0 <0005>] TJ ET"),
+    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n"),
+    streamObject(6, cmap)
+  ]);
+}
+
+test("checks and performs a variable-length multi-run replacement through the bundle, then reopens it", async () => {
+  const editor = new PdfTextEditor(zeroAdjustmentJapanesePdf());
+  assert.deepEqual((await editor.listTextRuns()).map((run) => run.text), ["実", "績", "報", "告", "書"]);
+
+  const [match] = await editor.searchText("実績報告書");
+  assert.equal(match.runCount, 5);
+  // Shorter than the match, across five operands: refused by v0.2.1, allowed here.
+  assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "報告書"), { allowed: true, mode: "variable-length-safe" });
+
+  await editor.replaceTextMatch(match.id, "報告書");
+  const reopened = new PdfTextEditor(await editor.save());
+  assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), ["報告書", "", "", "", ""]);
+  assert.deepEqual(await reopened.searchText("実績報告書"), []);
+  assert.equal((await reopened.searchText("報告書")).length, 1);
+
+  // And it can be lengthened again from there, through the same API.
+  const [again] = await reopened.searchText("報告書");
+  await reopened.replaceTextMatch(again.id, "事業報告書");
+  assert.equal((await new PdfTextEditor(await reopened.save()).searchText("事業報告書")).length, 1);
+});
+
+test("refuses a variable-length replacement across a non-zero TJ adjustment through the bundle", async () => {
+  const pdf = classicPdf([
+    encode("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+    encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"),
+    encode("3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n"),
+    streamObject(4, "BT 72 700 Td [(RE) 120 (PORT)] TJ ET")
+  ]);
+  const editor = new PdfTextEditor(pdf);
+  const [match] = await editor.searchText("REPORT");
+  const check = await editor.checkTextMatchReplacement(match.id, "SUMMARY");
+  assert.equal(check.allowed, false);
+  assert.equal(check.code, "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED");
+  assert.equal(check.unsafeReason, "non-zero-tj-adjustment");
+  await assert.rejects(editor.replaceTextMatch(match.id, "SUMMARY"), /MULTI_RUN|cannot be written over/);
+});
