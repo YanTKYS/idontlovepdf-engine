@@ -37,7 +37,7 @@
 - ページ座標・フォントサイズは公開していません。置換後の文字幅に応じた再レイアウトはしません
 - 元 PDF の font に無い文字へ置換するには `setFallbackFont()` で font を渡す必要があります。渡さない場合は `FONT_ENCODING_UNSUPPORTED` になります
 - fallback font を使うと font 全体が埋め込まれ、ファイルサイズが数 MB 増えます（subset 化は未対応）
-- fallback font で置換した箇所は前後と font が変わるため、`searchText()` では前後をまたいだ 1 つの文字列としては検索されません（置換した文字列自体は検索できます）
+- fallback font で置換した箇所は前後と font が変わるため、**保存して開き直した後**は `searchText()` で前後をまたいだ 1 つの文字列としては検索されません（置換した文字列自体は検索できます）。保存前の同じ editor では、その run はまだ 1 つの run として扱われるため前後と連結して検索されます。この差が問題になる場合は `save()` して開き直してください
 - 複数の text run にまたがる一致で文字数が変わる置換は、対象 run 間に他の operator がなく、かつ対象 run 間の `TJ` numeric adjustment の合計が 0 の場合のみ対応します。字間調整が残る場合や `Tc`/`Tw`/`Tz`/`Tr`・色指定・marked content をまたぐ場合は `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として拒否します（同じ文字数への置換と削除は構造によらず可能です）
 - 字間調整（`TJ` の numeric adjustment）の削除・合算・再計算、glyph 幅からの文字送り計算、text matrix の再構成は行いません
 - 検索は `Td` / `TD` / `Tm` / `T*`、別 `BT ... ET`、font 変更等をまたぎません。これらをまたいで 1 つの語が描画されている PDF では、その語は分断されたまま検索されます

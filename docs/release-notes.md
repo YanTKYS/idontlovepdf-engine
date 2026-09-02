@@ -14,7 +14,7 @@
   - `fallback-font-multi-run`: 複数runにまたがるmatchを1つとして描画。v0.3.0の隣接判定をそのまま再利用します
 - 安全に置換できない構造は明示的に拒否します: `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE`（matchの終端から後続テキストが描画される）、`FALLBACK_OPERATOR_UNSUPPORTED`（`TJ` / `'` / `"`）、`FALLBACK_MULTI_RUN_UNSUPPORTED`、`FALLBACK_FONT_MISSING_GLYPH`、`FALLBACK_WORD_SPACING_UNSUPPORTED`（`Tw` 有効時に置換文字列が半角スペースを含む。`Tw` は1バイトコード32にしか効かないため、2バイト符号化のfallback fontでは同じ字間にならない）、`FALLBACK_LAYOUT_UNSUPPORTED`、`FALLBACK_FONT_INVALID`
 - 縦書きfont（`/Identity-V`・`/WMode 1` 等）、および writing mode を判定できないfontで描画されたテキストは `FALLBACK_WRITING_MODE_UNSUPPORTED` で拒否します。fallback fontは横書きで埋め込むためです。判定はfont自身のwriting modeによるもので、text matrixによる回転は拒否しません
-- 同じeditorでfallback置換した箇所の再編集は `FALLBACK_EDIT_REQUIRES_SAVE` で拒否します（1つの描画命令を複数へ組み替えるため、その箇所のbyte位置が古くなります）。`save()` して開き直せば編集できます。同一editor内でも未置換の箇所は続けて置換できます。`searchText()` は置換後の内容を返すため、古い文字列を検索結果として返すことはありません
+- 同じeditorでfallback置換した箇所の再編集は `FALLBACK_EDIT_REQUIRES_SAVE` で拒否します（1つの描画命令を複数へ組み替えるため、その箇所のbyte位置が古くなります）。`save()` して開き直せば編集できます。同一editor内でも未置換の箇所は続けて置換できます。`searchText()` は置換後の内容を返すため、古い文字列を検索結果として返すことはありません。なお保存前の同一editorでは置換箇所が1つのrunとして扱われるため前後と連結して検索されますが、保存して開き直すとfont境界で分かれます
 - fallback fontを一度使用した後の `setFallbackFont()` は `FALLBACK_FONT_ALREADY_IN_USE` で拒否します。置換済みテキストはそのfontのglyph IDを保持しているため、別fontへ差し替えると別の文字になってしまうためです
 - 置換不能な文字を `error.characters` / `check.characters` として構造化して返します。利用側がCMapやglyphを解釈せずに「この文字は使用できません」と表示できます
 - テストと動作確認には **BIZ UDGothic Regular 1.05**（SIL Open Font License 1.1）を使用しています。fontはengineに同梱せず、**呼び出し側がbytesを渡す**方式です。**engineは実行時に一切ネットワークアクセスしません**

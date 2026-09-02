@@ -301,7 +301,11 @@ test("reports the replaced text on a later search, not what the run used to hold
 
   assert.equal((await editor.searchText("しょうわ")).length, 1, "the replacement must be findable");
   assert.equal((await editor.searchText("令和")).length, 1, "only the untouched occurrence is left");
-  assert.equal((await editor.searchText("しょうわ令和")).length, 1, "the run now reads as the two together");
+  // Before saving, the rewritten run is still modelled as one run, so its text reads as
+  // one string. After save and reopen it is several operators with a font switch between
+  // them, and search does not join across that -- see the README. Saving and reopening,
+  // which is what a caller editing one match at a time does, settles the difference.
+  assert.equal((await editor.searchText("しょうわ令和")).length, 1, "the run still reads as one string until it is saved");
 });
 
 test("refuses to edit a run a fallback rewrite has already replaced", { skip }, async () => {
@@ -381,6 +385,98 @@ test("still replaces horizontal text whose page happens to be rotated", { skip }
   const editor = await editorFor(`BT /FJP 36 Tf 0 1 -1 0 60 20 Tm ${glyphs("令和")} Tj ET`);
   const [match] = await editor.searchText("令和");
   assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "しょうわ"), { allowed: true, mode: "fallback-font" });
+});
+
+test("folds an ordinary replacement already staged on the same run into the rewrite", { skip }, async () => {
+  // The first 令和 is written by the document's own font; the second needs the fallback.
+  // The fallback rewrite spans the whole operator while the ordinary edit spans only its
+  // operand, so both have to be recognised as edits to the same run or they collide.
+  const editor = await editorFor(body(`${glyphs("令和令和")} Tj`));
+  const [first] = await editor.searchText("令和");
+  await editor.replaceTextMatch(first.id, "平成");
+  assert.deepEqual(await editor.checkTextMatchReplacement(first.id, "平成"), { allowed: false, mode: null, code: "MATCH_STALE", reason: (await editor.checkTextMatchReplacement(first.id, "平成")).reason });
+
+  const [second] = await editor.searchText("令和");
+  assert.deepEqual(await editor.checkTextMatchReplacement(second.id, "しょうわ"), { allowed: true, mode: "fallback-font-partial" });
+  await editor.replaceTextMatch(second.id, "しょうわ");
+
+  const reopened = new PdfTextEditor(await editor.save());
+  assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), ["平成", "しょうわ"]);
+  assert.equal((await reopened.searchText("平成")).length, 1);
+  assert.equal((await reopened.searchText("しょうわ")).length, 1);
+  assert.deepEqual(await reopened.searchText("令和"), []);
+});
+
+/**
+ * A PDF whose /Resources /Font sub-dictionary is an indirect object compressed inside an
+ * Object Stream -- a shape ordinary text extraction already handles, so adding a fallback
+ * font to it must not be the one thing that cannot.
+ */
+function makeCompressedFontResourcePdf() {
+  const header = encode("%PDF-1.5\n");
+  const fontDictionary = "<< /FJP 5 0 R >>";
+  // An object stream is a table of "object-number offset" pairs, then the objects
+  // themselves starting at /First. This one holds object 9, the /Font dictionary.
+  const objStmHeader = "9 0\n";
+  const objStmData = encode(objStmHeader + fontDictionary);
+  const plain = [
+    { number: 1, dictionary: "<< /Type /Catalog /Pages 2 0 R >>" },
+    { number: 2, dictionary: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>" },
+    { number: 3, dictionary: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 4 0 R /Resources << /Font 9 0 R >> >>" },
+    { number: 4, streamBytes: encode(REIWA) },
+    { number: 5, dictionary: "<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 6 0 R >>" },
+    { number: 6, streamBytes: encode(CMAP) },
+    { number: 7, streamBytes: objStmData, dictionary: `<< /Type /ObjStm /N 1 /First ${objStmHeader.length} /Length ${objStmData.length} >>` }
+  ];
+  const chunks = [header];
+  const offsets = new Map();
+  let position = header.length;
+  for (const object of plain) {
+    offsets.set(object.number, position);
+    const head = object.streamBytes
+      ? encode(`${object.number} 0 obj\n${object.dictionary ?? `<< /Length ${object.streamBytes.length} >>`}\nstream\n`)
+      : encode(`${object.number} 0 obj\n${object.dictionary}\nendobj\n`);
+    chunks.push(head);
+    position += head.length;
+    if (object.streamBytes) {
+      chunks.push(object.streamBytes, encode("\nendstream\nendobj\n"));
+      position += object.streamBytes.length + "\nendstream\nendobj\n".length;
+    }
+  }
+
+  const widths = [1, 4, 2];
+  const bigEndian = (value, width) => Array.from({ length: width }, (_, index) => (value >>> ((width - 1 - index) * 8)) & 0xff);
+  const rows = [
+    { type: 0, a: 0, b: 65535 },
+    ...plain.map((object) => ({ type: 1, a: offsets.get(object.number), b: 0 })),
+    { type: 0, a: 0, b: 65535 },   // object 8 is unused
+    { type: 2, a: 7, b: 0 },       // object 9 lives in object stream 7, at index 0
+    { type: 1, a: position, b: 0 } // object 10, the xref stream itself
+  ];
+  const raw = rows.flatMap((row) => [...bigEndian(row.type, widths[0]), ...bigEndian(row.a, widths[1]), ...bigEndian(row.b, widths[2])]);
+  const data = Uint8Array.from(raw);
+  const xrefOffset = position;
+  chunks.push(encode(`10 0 obj\n<< /Type /XRef /Size ${rows.length} /W [${widths.join(" ")}] /Root 1 0 R /Length ${data.length} >>\nstream\n`), data, encode(`\nendstream\nendobj\nstartxref\n${xrefOffset}\n%%EOF\n`));
+  return new Uint8Array(chunks.flatMap((chunk) => [...chunk]));
+}
+
+test("adds the fallback font to a /Font resource compressed inside an Object Stream", { skip }, async () => {
+  const pdf = makeCompressedFontResourcePdf();
+  const editor = new PdfTextEditor(pdf);
+  // Reading it works, so replacing in it has to as well -- and must not throw out of the
+  // check API, which is supposed to answer rather than raise.
+  assert.deepEqual((await editor.listTextRuns()).map((run) => run.text), ["令和"]);
+
+  await editor.setFallbackFont(fontBytes);
+  const [match] = await editor.searchText("令和");
+  assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "しょうわ"), { allowed: true, mode: "fallback-font" });
+
+  await editor.replaceTextMatch(match.id, "しょうわ");
+  const reopened = new PdfTextEditor(await editor.save());
+  assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), ["しょうわ"]);
+  assert.equal((await reopened.searchText("しょうわ")).length, 1);
+  // The /Font dictionary was rewritten as a plain object carrying both fonts.
+  assert.match(latin1.decode(await editor.save()), /9 0 obj\n<< \/FJP 5 0 R \/ILPFallback \d+ 0 R >>/);
 });
 
 /* ------------------------------------------------------------------ what is embedded */

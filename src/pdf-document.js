@@ -217,7 +217,7 @@ function scannedRuns(editor, span) {
  * themselves are shared: a second page gets its own name and its own resources entry, but
  * points at the same Type0 object, so the font file is never embedded twice.
  */
-function registerFallbackResource(editor, embedded, resources) {
+async function registerFallbackResource(editor, embedded, resources) {
   if (resources?.number === undefined) {
     return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "This page's /Resources are not an addressable object, so the fallback font cannot be added to them");
   }
@@ -225,7 +225,18 @@ function registerFallbackResource(editor, embedded, resources) {
   if (existing) return { name: existing };
 
   const indirect = reference(resources.dictionary, "Font");
-  const holder = indirect ? editor.document.object(indirect) : resources;
+  let holder = resources;
+  if (indirect) {
+    try {
+      // Resolved rather than read directly: a /Font sub-dictionary may be compressed
+      // inside an Object Stream, which reading it already allows for (see
+      // fontReferences()). Writing it back as a plain object in the incremental update is
+      // fine -- a later definition supersedes the compressed one.
+      holder = await editor.document.resolveObject(indirect, editor.security, decryptStreamBytes);
+    } catch (error) {
+      return refusal("FALLBACK_LAYOUT_UNSUPPORTED", `This page's /Font resources could not be read in order to add the fallback font to them: ${error.message}`);
+    }
+  }
   const inline = indirect ? null : resources.dictionary.match(/\/Font\s*<<([\s\S]*?)>>/);
   let name;
   let dictionary;
@@ -348,7 +359,7 @@ async function planFallbackReplacement(editor, match, replacement) {
   const objects = new Map();
   const resourceNames = new Map();
   for (const { stream } of pieces) {
-    const registered = registerFallbackResource(editor, embedded, stream.resources);
+    const registered = await registerFallbackResource(editor, embedded, stream.resources);
     if (registered.allowed === false) return registered;
     resourceNames.set(stream.object.number, registered.name);
     if (registered.object) objects.set(registered.object.number, registered.object);
@@ -561,10 +572,17 @@ function commitPlan(editor, plan) {
  */
 function rebuildContentStream(editor, objectNumber, fallbackEdits) {
   const stream = editor.streams.find((candidate) => candidate.object.number === objectNumber);
-  const rewritten = new Set(fallbackEdits.map((edit) => `${edit.start}:${edit.end}`));
+  // A fallback rewrite of a run supersedes any ordinary edit staged on that same run: the
+  // rewrite was planned from the run's current text, so it already contains that edit.
+  // Matched by run id rather than by byte range, because a rewrite of the match's first
+  // run spans its whole operator (run.start..run.operatorEnd) while an ordinary edit spans
+  // only the operand (run.start..run.end) -- comparing ranges leaves both in place, and
+  // they then overlap.
+  const rewritten = new Set(fallbackEdits.map((edit) => edit.runId).filter((runId) => runId !== undefined));
   const runEdits = stream.runs.flatMap((run, index) => {
-    const bytes = editor.pending.get(`${objectNumber}:${index}`);
-    if (!bytes || rewritten.has(`${run.start}:${run.end}`)) return [];
+    const id = `${objectNumber}:${index}`;
+    const bytes = editor.pending.get(id);
+    if (!bytes || rewritten.has(id)) return [];
     return [{ start: run.start, end: run.end, bytes: run.syntax === "hex" ? encodeHex(bytes) : encodeLiteral(bytes) }];
   });
   const ordered = [...fallbackEdits, ...runEdits]
