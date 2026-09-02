@@ -67,7 +67,9 @@ function makePdf(content, { resources = "<< /Font << /FJP 5 0 R >> >>" } = {}) {
     encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"),
     encode(`3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 4 0 R /Resources ${resources} >>\nendobj\n`),
     streamObject(4, content),
-    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n"),
+    // A real Type0 font always declares its /Encoding: it is what says whether the font
+    // writes horizontally or vertically, which a fallback replacement depends on knowing.
+    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 6 0 R >>\nendobj\n"),
     streamObject(6, CMAP)
   ]);
 }
@@ -286,6 +288,101 @@ test("refuses every text-showing operator but Tj", { skip }, async () => {
   }
 });
 
+/* ------------------------------- what a fallback rewrite means for the rest of the session */
+
+test("reports the replaced text on a later search, not what the run used to hold", { skip }, async () => {
+  // A fallback rewrite turns one operator into several, so the run it came from no longer
+  // reads as its original operand. Search has to say so, or a second occurrence in the
+  // same run would be handed back as if nothing had happened.
+  const editor = await editorFor(body(`${glyphs("令和令和")} Tj`));
+  const matches = await editor.searchText("令和");
+  assert.equal(matches.length, 2);
+  await editor.replaceTextMatch(matches[0].id, "しょうわ");
+
+  assert.equal((await editor.searchText("しょうわ")).length, 1, "the replacement must be findable");
+  assert.equal((await editor.searchText("令和")).length, 1, "only the untouched occurrence is left");
+  assert.equal((await editor.searchText("しょうわ令和")).length, 1, "the run now reads as the two together");
+});
+
+test("refuses to edit a run a fallback rewrite has already replaced", { skip }, async () => {
+  const original = makePdf(body(`${glyphs("令和令和")} Tj`));
+  const editor = await editorFor(body(`${glyphs("令和令和")} Tj`));
+  const matches = await editor.searchText("令和");
+  await editor.replaceTextMatch(matches[0].id, "しょうわ");
+  const staged = new Map(editor.pendingStreams);
+
+  // The second match from the original search described the run as it was.
+  await assert.rejects(editor.replaceTextMatch(matches[1].id, "しょうわ"), (error) => {
+    assert.match(error.code, /MATCH_STALE|FALLBACK_EDIT_REQUIRES_SAVE/);
+    return true;
+  });
+  // A freshly found match into the same run is refused too, and says what to do about it.
+  const [fresh] = await editor.searchText("令和");
+  const refused = await editor.checkTextMatchReplacement(fresh.id, "しょうわ");
+  assert.equal(refused.code, "FALLBACK_EDIT_REQUIRES_SAVE");
+  assert.match(refused.reason, /Save this document and reopen/);
+
+  // Neither refusal disturbed the replacement already staged.
+  assert.deepEqual([...editor.pendingStreams], [...staged]);
+  assert.notDeepEqual(await editor.save(), original);
+});
+
+test("replaces the second occurrence after saving and reopening", { skip }, async () => {
+  // The documented way round the rule above, and the flow a caller that saves per edit
+  // already follows.
+  const editor = await editorFor(body(`${glyphs("令和令和")} Tj`));
+  const first = await editor.searchText("令和");
+  await editor.replaceTextMatch(first[0].id, "しょうわ");
+
+  const reopened = new PdfTextEditor(await editor.save());
+  await reopened.setFallbackFont(fontBytes);
+  assert.equal((await reopened.searchText("しょうわ")).length, 1);
+  const remaining = await reopened.searchText("令和");
+  assert.equal(remaining.length, 1);
+  await reopened.replaceTextMatch(remaining[0].id, "しょうわ");
+
+  const final = new PdfTextEditor(await reopened.save());
+  assert.deepEqual((await final.listTextRuns()).map((run) => run.text), ["しょうわ", "しょうわ"]);
+  assert.deepEqual(await final.searchText("令和"), []);
+  // Two matches rather than one string: each replacement sits in the fallback font with
+  // the document's own font re-stated between them, and search does not join text across
+  // a font change. The page reads しょうわしょうわ; searching for it as one does not.
+  assert.equal((await final.searchText("しょうわ")).length, 2);
+  assert.deepEqual(await final.searchText("しょうわしょうわ"), []);
+});
+
+test("refuses a run drawn by a vertical font, and one whose writing mode is not stated", { skip }, async () => {
+  // The fallback font is embedded for horizontal writing, so it cannot stand in for text
+  // laid out down the page. What decides it is the font's own writing mode -- a rotated
+  // text matrix over a horizontal font is still horizontal, and is not refused here.
+  for (const [encoding, expected] of [["/Identity-V", "vertical"], ["", "not say"]]) {
+    const pdf = buildPdf([
+      encode("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+      encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"),
+      encode("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 4 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n"),
+      streamObject(4, REIWA),
+      encode(`5 0 obj\n<< /Type /Font /Subtype /Type0 ${encoding ? `/Encoding ${encoding} ` : ""}/ToUnicode 6 0 R >>\nendobj\n`),
+      streamObject(6, CMAP)
+    ]);
+    const editor = new PdfTextEditor(pdf);
+    await editor.setFallbackFont(fontBytes);
+    const [match] = await editor.searchText("令和");
+    const refused = await editor.checkTextMatchReplacement(match.id, "しょうわ");
+    assert.equal(refused.allowed, false, `${encoding || "no /Encoding"} should have been refused`);
+    assert.equal(refused.code, "FALLBACK_WRITING_MODE_UNSUPPORTED");
+    assert.match(refused.reason, new RegExp(expected));
+    assert.equal(editor.pendingObjects.size, 0);
+  }
+});
+
+test("still replaces horizontal text whose page happens to be rotated", { skip }, async () => {
+  // A rotated text matrix is not a vertical font: nothing about the layout axis changes,
+  // so this is replaced like any other horizontal text.
+  const editor = await editorFor(`BT /FJP 36 Tf 0 1 -1 0 60 20 Tm ${glyphs("令和")} Tj ET`);
+  const [match] = await editor.searchText("令和");
+  assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "しょうわ"), { allowed: true, mode: "fallback-font" });
+});
+
 /* ------------------------------------------------------------------ what is embedded */
 
 test("embeds one font however many replacements use it, across pages", { skip }, async () => {
@@ -295,7 +392,7 @@ test("embeds one font however many replacements use it, across pages", { skip },
     encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>\nendobj\n"),
     encode("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 4 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n"),
     streamObject(4, REIWA),
-    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n"),
+    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 6 0 R >>\nendobj\n"),
     streamObject(6, CMAP),
     encode("7 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 8 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n"),
     streamObject(8, REIWA)
@@ -325,7 +422,7 @@ function makeTwoPagePdf() {
     encode("2 0 obj\n<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>\nendobj\n"),
     encode("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 4 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n"),
     streamObject(4, REIWA),
-    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n"),
+    encode("5 0 obj\n<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 6 0 R >>\nendobj\n"),
     streamObject(6, CMAP),
     encode("7 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 140] /Contents 8 0 R /Resources 9 0 R >>\nendobj\n"),
     streamObject(8, REIWA),

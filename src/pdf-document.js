@@ -54,7 +54,10 @@ function internalRuns(editor) {
       continuityId: run.continuityId,
       joinBefore: run.joinBefore,
       fontName: run.fontName,
-      text: decodeWithCMap(editor.pending.get(id) ?? run.value, mappings)
+      // A run a fallback rewrite has replaced reads as what that rewrite drew, not as
+      // what the original operand held -- otherwise search would keep reporting text the
+      // document no longer shows, and a match into it would look fresh when it is not.
+      text: editor.fallbackRunTexts.get(id) ?? decodeWithCMap(editor.pending.get(id) ?? run.value, mappings)
     };
   }));
 }
@@ -277,6 +280,20 @@ async function planFallbackReplacement(editor, match, replacement) {
   if (operator) {
     return refusal("FALLBACK_OPERATOR_UNSUPPORTED", `The fallback font is written with Tj; this match is drawn by ${operator.run.operator}`);
   }
+  // The fallback font is embedded with a horizontal encoding (/Identity-H). Putting it in
+  // place of text a vertical font drew would lay that text out along the wrong axis. What
+  // matters is the font's own writing mode, not how the page is rotated -- a horizontal
+  // font under a rotated text matrix is still horizontal (see writingModeOf()).
+  const sideways = pieces.find(({ stream, run }) => (stream.fontModes?.get(run.fontName) ?? "unknown") !== "horizontal");
+  if (sideways) {
+    const mode = sideways.stream.fontModes?.get(sideways.run.fontName) ?? "unknown";
+    return refusal(
+      "FALLBACK_WRITING_MODE_UNSUPPORTED",
+      mode === "vertical"
+        ? "This text is drawn with a vertical writing font, and the fallback font is embedded for horizontal writing, so it cannot stand in for it"
+        : "This text's font does not say whether it writes horizontally or vertically, and the fallback font is embedded for horizontal writing, so it cannot safely stand in for it"
+    );
+  }
   const sizes = new Set(pieces.map(({ run }) => run.fontSize));
   if (sizes.size > 1 || sizes.has(null) || sizes.has(undefined)) {
     return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "This match has no single /Tf font size to restore after the fallback font");
@@ -356,13 +373,20 @@ async function planFallbackReplacement(editor, match, replacement) {
         drawn.push(`/${name} ${size} Tf ${latin1.decode(encodeHex(identityEncode(glyphs)))} Tj /${run.fontName} ${size} Tf`);
         // The suffix of a single-run match follows the replacement in the same operator.
         if (pieces.length === 1 && suffix) drawn.push(`${operand(encodeReplacement(editor, entry, suffix))} Tj`);
-        edits.push({ objectNumber: stream.object.number, start: run.start, end: run.operatorEnd, bytes: encoder.encode(drawn.join(" ")) });
+        edits.push({
+          objectNumber: stream.object.number,
+          start: run.start,
+          end: run.operatorEnd,
+          bytes: encoder.encode(drawn.join(" ")),
+          runId: entry.runId,
+          runText: prefix + replacement + (pieces.length === 1 ? suffix : "")
+        });
       } else if (index === pieces.length - 1) {
         // The last run keeps only what lay outside the match; it is drawn where the
         // replacement ended, which is where it was drawn before.
-        edits.push({ objectNumber: stream.object.number, start: run.start, end: run.end, bytes: encodeReplacement(editor, entry, suffix), operandOnly: true });
+        edits.push({ objectNumber: stream.object.number, start: run.start, end: run.end, bytes: encodeReplacement(editor, entry, suffix), operandOnly: true, runId: entry.runId, runText: suffix });
       } else {
-        edits.push({ objectNumber: stream.object.number, start: run.start, end: run.end, bytes: new Uint8Array(), operandOnly: true });
+        edits.push({ objectNumber: stream.object.number, start: run.start, end: run.end, bytes: new Uint8Array(), operandOnly: true, runId: entry.runId, runText: "" });
       }
     });
   } catch (error) {
@@ -413,6 +437,16 @@ async function planTextMatchReplacement(editor, matchId, replacement) {
     if (current.get(entry.runId)?.text !== entry.runText) {
       return refusal("MATCH_STALE", `This match is stale: the text it was found in has changed since searchText() returned it (run ${entry.runId}). Search again and replace the new match.`);
     }
+  }
+  // A run a fallback rewrite has replaced is no longer described by the byte offsets
+  // every plan here works from: the operator it came from has been rewritten into
+  // several. Editing it again would write over the rewrite rather than after it.
+  const rewritten = match.span.find((entry) => editor.fallbackRunTexts.has(entry.runId));
+  if (rewritten) {
+    return refusal(
+      "FALLBACK_EDIT_REQUIRES_SAVE",
+      `Text run ${rewritten.runId} has already been rewritten with the fallback font, which restructured the operators it was drawn by. Save this document and reopen it to edit that text again.`
+    );
   }
 
   const replacementPoints = [...replacement];
@@ -493,17 +527,29 @@ async function planTextMatchReplacement(editor, matchId, replacement) {
  * editor exactly as it was.
  */
 function commitPlan(editor, plan) {
+  if (!plan.fallback) {
+    for (const { id, bytes } of plan.updates) editor.pending.set(id, bytes);
+    return;
+  }
+  // Every rewritten stream is built first, so a stream that cannot be rebuilt leaves the
+  // editor exactly as it was rather than half updated.
+  const edits = new Map();
+  for (const [objectNumber, existing] of editor.fallbackEdits) edits.set(objectNumber, [...existing]);
+  for (const edit of plan.fallback.edits) {
+    edits.set(edit.objectNumber, [...(edits.get(edit.objectNumber) ?? []), edit]);
+  }
+  const rebuilt = new Map();
+  for (const objectNumber of new Set(plan.fallback.edits.map((edit) => edit.objectNumber))) {
+    rebuilt.set(objectNumber, rebuildContentStream(editor, objectNumber, edits.get(objectNumber)));
+  }
+
   for (const { id, bytes } of plan.updates) editor.pending.set(id, bytes);
-  if (!plan.fallback) return;
   editor.fallbackEmbedding = plan.fallback.embedding;
   for (const [number, object] of plan.fallback.objects) editor.pendingObjects.set(number, object);
+  editor.fallbackEdits = edits;
+  for (const [objectNumber, bytes] of rebuilt) editor.pendingStreams.set(objectNumber, bytes);
   for (const edit of plan.fallback.edits) {
-    const edits = editor.fallbackEdits.get(edit.objectNumber) ?? [];
-    edits.push(edit);
-    editor.fallbackEdits.set(edit.objectNumber, edits);
-  }
-  for (const objectNumber of new Set(plan.fallback.edits.map((edit) => edit.objectNumber))) {
-    rebuildContentStream(editor, objectNumber);
+    if (edit.runId !== undefined) editor.fallbackRunTexts.set(edit.runId, edit.runText);
   }
 }
 
@@ -513,9 +559,8 @@ function commitPlan(editor, plan) {
  * so a whole-stream replacement never silently drops the latter. Rebuilding from the
  * original each time keeps the recorded offsets valid however many edits accumulate.
  */
-function rebuildContentStream(editor, objectNumber) {
+function rebuildContentStream(editor, objectNumber, fallbackEdits) {
   const stream = editor.streams.find((candidate) => candidate.object.number === objectNumber);
-  const fallbackEdits = editor.fallbackEdits.get(objectNumber) ?? [];
   const rewritten = new Set(fallbackEdits.map((edit) => `${edit.start}:${edit.end}`));
   const runEdits = stream.runs.flatMap((run, index) => {
     const bytes = editor.pending.get(`${objectNumber}:${index}`);
@@ -533,7 +578,7 @@ function rebuildContentStream(editor, objectNumber) {
     cursor = edit.end;
   }
   chunks.push(stream.decoded.subarray(cursor));
-  editor.pendingStreams.set(objectNumber, concat(chunks));
+  return concat(chunks);
 }
 
 function planError(plan) {
@@ -596,20 +641,52 @@ async function fontReferences(resources, structure, security) {
   ]));
 }
 
+/**
+ * Whether a font lays text out horizontally, vertically, or in a way this cannot tell.
+ *
+ * It is the font's own writing mode that matters, not how the page happens to be
+ * rotated: a horizontal font under a rotated text matrix is still horizontal. A simple
+ * (non-composite) font is always horizontal. A Type0 font's `/Encoding` decides it --
+ * a predefined CMap name ends in `-H` or `-V`, and an embedded CMap stream carries
+ * `/WMode`. Anything that does not say is reported as unknown rather than assumed,
+ * because the fallback font is written through a horizontal encoding and putting it in
+ * place of vertical text would lay that text out along the wrong axis.
+ */
+function writingModeOf(fontDictionary, structure) {
+  if (!/\/Subtype\s*\/Type0\b/.test(fontDictionary)) return "horizontal";
+  const named = fontDictionary.match(/\/Encoding\s*\/([^\s/<>[\]()]+)/);
+  if (named) {
+    if (/-V$/.test(named[1])) return "vertical";
+    return /-H$/.test(named[1]) ? "horizontal" : "unknown";
+  }
+  const indirect = reference(fontDictionary, "Encoding");
+  if (!indirect) return "unknown";
+  try {
+    // A CMap is always a stream, so it is never inside an Object Stream (PDF 7.5.7).
+    const wmode = structure.object(indirect).dictionary.match(/\/WMode\s+(\d+)/);
+    if (!wmode) return "unknown";
+    return wmode[1] === "1" ? "vertical" : "horizontal";
+  } catch {
+    return "unknown";
+  }
+}
+
 async function loadFontMaps(resources, structure, security) {
   const result = new Map();
+  const modes = new Map();
   // A font dictionary can itself be compressed (a common PDF-writer optimization);
   // its own /ToUnicode target, however, is always a stream, and streams are never
   // stored in an Object Stream (PDF spec 7.5.7), so that lookup stays on the
   // synchronous, unchanged structure.object().
   for (const [name, fontReference] of await fontReferences(resources, structure, security)) {
     const font = await structure.resolveObject(fontReference, security, decryptStreamBytes);
+    modes.set(name, writingModeOf(font.dictionary, structure));
     const toUnicode = reference(font.dictionary, "ToUnicode");
     if (!toUnicode) continue;
     const cmapObject = structure.object(toUnicode);
     result.set(name, parseToUnicodeCMap(await decodeStream(cmapObject, "ToUnicode stream", security)));
   }
-  return result;
+  return { maps: result, modes };
 }
 
 export class PdfTextEditor {
@@ -641,6 +718,11 @@ export class PdfTextEditor {
     // Content-stream rewrites made for the fallback font, kept per stream so several
     // replacements in one stream compose (see rebuildContentStream()).
     this.fallbackEdits = new Map();
+    // What each run reads as after a fallback rewrite, keyed by run id. Search reports
+    // these so it never hands back text the document no longer shows; the planner refuses
+    // to edit them again, because the byte offsets it works from describe the run as it
+    // was, not as it has been rewritten. Saving and reopening clears the whole question.
+    this.fallbackRunTexts = new Map();
     // Matches handed out by the most recent searchText() call, keyed by the opaque id
     // that call returned. Cleared by the next searchText() so a long-lived editor (the
     // browser PoC re-searches on every keystroke) cannot accumulate them without bound.
@@ -698,7 +780,10 @@ export class PdfTextEditor {
         seen.add(object.number);
         const decoded = await decodeStream(object, "content stream", this.security);
         const runs = scanTextRuns(decoded, `content stream object ${object.number}`);
-        if (runs.length) this.streams.push({ object, decoded, runs, resources, fontMaps: await loadFontMaps(resources, this.document, this.security) });
+        if (runs.length) {
+          const fonts = await loadFontMaps(resources, this.document, this.security);
+          this.streams.push({ object, decoded, runs, resources, fontMaps: fonts.maps, fontModes: fonts.modes });
+        }
       }
     }
     return this.streams.flatMap((stream) => stream.runs.map((run, runIndex) => ({

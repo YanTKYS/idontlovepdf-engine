@@ -74,7 +74,7 @@ test("writes text the document's font cannot express, in a browser, from the shi
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
         "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 120] /Contents 4 0 R /Resources << /Font << /FJP 5 0 R >> >> >>\nendobj\n",
         stream(4, content),
-        "5 0 obj\n<< /Type /Font /Subtype /Type0 /ToUnicode 6 0 R >>\nendobj\n",
+        "5 0 obj\n<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 6 0 R >>\nendobj\n",
         stream(6, cmap)
       ];
       let source = "%PDF-1.4\n";

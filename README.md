@@ -174,6 +174,10 @@ await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font �
 | `fallback-font-partial` | run の一部だけを置換し、前後は元 font のまま維持（`申請は令和です → 申請はしょうわです`） |
 | `fallback-font-multi-run` | 複数 run にまたがる match を 1 つとして描画。隣接判定は `variable-length-safe` と同じ規則です |
 
+**縦書き font** で描画されたテキストは置換できません（`FALLBACK_WRITING_MODE_UNSUPPORTED`）。fallback font は横書き（`/Identity-H`）で埋め込むためです。判定に使うのは font 自身の writing mode で、text matrix による回転は対象外です（回転した横書き font は置換できます）。
+
+**同じ editor で fallback 置換した箇所を再度編集することはできません**（`FALLBACK_EDIT_REQUIRES_SAVE`）。fallback 置換は 1 つの描画命令を複数へ組み替えるため、engine が保持している byte 位置がその箇所については古くなります。`save()` して開き直せば通常どおり編集できます。同じ editor でも、**まだ置換していない箇所**は続けて置換できます。なお `searchText()` は置換後の内容を返すため、古い文字列が検索結果に残ることはありません。
+
 word spacing（`Tw`）が有効な箇所では、置換文字列に**半角スペースを含められません**。`Tw` は 1 バイトの文字コード 32 にのみ効き、fallback font は 2 バイト符号化で描画されるため、文書内の他のスペースと同じ字間になりません。
 
 部分置換では、置換後の文字列の幅に応じて**後続文字が自然に前後します**（`申請は令和です → 申請はしょうわです` なら `です` が後ろへ移動します）。これは通常のテキスト編集として期待される挙動です。
@@ -262,6 +266,8 @@ adjustment の合計は、その数値が**どこに書かれているかによ�
 | `FALLBACK_LAYOUT_UNSUPPORTED` | ページ構造上、fallback font を安全に配置できない |
 | `FALLBACK_WORD_SPACING_UNSUPPORTED` | word spacing（`Tw`）が有効な箇所で、置換文字列に半角スペースが含まれる |
 | `FALLBACK_FONT_INVALID` | `setFallbackFont()` に TrueType font 以外が渡された |
+| `FALLBACK_WRITING_MODE_UNSUPPORTED` | 縦書き font（`/Identity-V`、`/WMode 1` 等）、または writing mode が判定できない font で描画されている |
+| `FALLBACK_EDIT_REQUIRES_SAVE` | 同じ editor で fallback 置換済みの箇所を再度編集しようとした。`save()` して開き直してください |
 | `FALLBACK_FONT_ALREADY_IN_USE` | fallback font を使用した後に別の font を設定しようとした |
 | `MATCH_STALE` | 検索時点の文字列が現在の文書内容と食い違う。古い match ID で別の場所を書き換えないための保護です |
 | `UNKNOWN_MATCH` | この editor が発行していない、または次の `searchText()` で無効になった match ID |

@@ -74,7 +74,19 @@ export type PdfTextEditorErrorCode =
    * setFallbackFont() was called again after a fallback font had already been used. Text
    * already written holds glyph ids of that font, which another font's ids would not mean.
    */
-  | "FALLBACK_FONT_ALREADY_IN_USE";
+  | "FALLBACK_FONT_ALREADY_IN_USE"
+  /**
+   * The match covers text a fallback replacement has already rewritten. That rewrite
+   * restructured the operators the text was drawn by, so it cannot be edited again in the
+   * same session: save the document and reopen it first.
+   */
+  | "FALLBACK_EDIT_REQUIRES_SAVE"
+  /**
+   * The text is drawn by a vertical-writing font, or by one that does not say which it
+   * is. The fallback font is embedded for horizontal writing and cannot stand in for it.
+   * Judged from the font's own writing mode, not from any rotation of the page.
+   */
+  | "FALLBACK_WRITING_MODE_UNSUPPORTED";
 
 /** How replaceTextMatch() would write a replacement that is allowed. */
 export type TextMatchReplacementMode =
