@@ -216,6 +216,113 @@ test("diagnoses the descendant font by the same path the measurement takes", { s
   assert.match(width.detail, /\[1 \[1000\] 2 \[950\]/);
 });
 
+/* --------------------------------------------------- the walk's own account of itself */
+
+// "descendant-font-unresolved" names a walk, not a hop: /DescendantFonts may be a direct
+// array or an object of its own, and either may fail at the reference, at the array's
+// contents, or at the CIDFont behind it. Told only the reason, a real document cannot be
+// told apart from any other -- which is what made 22550.pdf's /F3 undiagnosable from the
+// refusal alone. resolveDescendantFont() therefore records each hop it takes, and these
+// pin down that the record is the *measuring* walk's own: same function, same branches,
+// so a trace can never describe a path the widths did not take.
+
+test("records each hop of the descendant walk, direct and indirect alike", { skip }, async () => {
+  const direct = new PdfTextEditor(makeCidPdf());
+  const [plain] = await diagnoseFontMetrics(direct);
+  assert.deepEqual(plain.descendantTrace.map((step) => step.step), ["descendant-fonts-entry", "resolve-first-reference"]);
+  assert.equal(plain.descendantTrace[0].form, "direct-array", "a direct array must not be reported as a reference");
+  assert.deepEqual(plain.descendantTrace[0].references, ["7 0 R"]);
+  assert.equal(plain.descendantObjectNumber, 7, "the CIDFont's own object number must be reported");
+
+  const indirect = new PdfTextEditor(makeCidPdf({
+    descendantFonts: "/DescendantFonts 11 0 R",
+    extraObjects: ["11 0 obj\n[7 0 R]\nendobj\n"]
+  }));
+  const [followed] = await diagnoseFontMetrics(indirect);
+  assert.deepEqual(
+    followed.descendantTrace.map((step) => step.step),
+    ["descendant-fonts-entry", "resolve-first-reference", "nested-array-element", "resolve-nested-reference"]
+  );
+  assert.equal(followed.descendantTrace[0].form, "indirect-reference");
+  assert.equal(followed.descendantTrace[1].kind, "array", "the object between must be reported as the array it is");
+  assert.equal(followed.descendantTrace[2].matched, true);
+  assert.equal(followed.descendantTrace[3].kind, "dictionary");
+  assert.equal(followed.descendantObjectNumber, 7, "the CIDFont behind the array, not the array itself");
+  // Both walks reach the same widths, so the trace describes a path that really measures.
+  assert.equal(plain.codeBytes, 2);
+  assert.equal(followed.codeBytes, 2);
+});
+
+test("names the hop that failed, not just that one did", { skip }, async () => {
+  const cases = [
+    {
+      what: "a reference to an object the file does not contain",
+      pdf: makeCidPdf({ descendantFonts: "/DescendantFonts [99 0 R]" }),
+      lastStep: "resolve-first-reference",
+      check: (step) => {
+        assert.equal(step.kind, "unresolved");
+        assert.match(step.error, /missing from the xref table/);
+        assert.equal(step.location.storage, "missing-from-xref");
+      }
+    },
+    {
+      what: "an indirect /DescendantFonts that is not an array at all",
+      pdf: makeCidPdf({ descendantFonts: "/DescendantFonts 11 0 R", extraObjects: ["11 0 obj\n42\nendobj\n"] }),
+      lastStep: "nested-array-element",
+      check: (step) => assert.equal(step.matched, false)
+    },
+    {
+      what: "an array holding more than the one font the spec allows",
+      pdf: makeCidPdf({ descendantFonts: "/DescendantFonts 11 0 R", extraObjects: ["11 0 obj\n[7 0 R 7 0 R]\nendobj\n"] }),
+      lastStep: "nested-array-element",
+      check: (step) => {
+        assert.equal(step.matched, false);
+        assert.equal(step.inner.trim(), "7 0 R 7 0 R", "the contents that defeated it must be readable");
+      }
+    }
+  ];
+
+  for (const { what, pdf, lastStep, check } of cases) {
+    const [font] = await diagnoseFontMetrics(new PdfTextEditor(pdf));
+    assert.equal(font.reason, "descendant-font-unresolved", what);
+    assert.equal(font.metrics, null, `${what}: the refusal itself must not soften`);
+    assert.equal(font.descendantObjectNumber, null, `${what}: no CIDFont was reached, so none may be named`);
+    assert.equal(font.descendantTrace.at(-1).step, lastStep, what);
+    check(font.descendantTrace.at(-1));
+  }
+});
+
+test("reports where the cross-reference table puts each object of the walk", { skip }, async () => {
+  // Which objects are compressed is the first thing to establish about a real document,
+  // and it is not visible from the reason at all.
+  const [font] = await diagnoseFontMetrics(new PdfTextEditor(makeCidPdf({
+    descendantFonts: "/DescendantFonts 11 0 R",
+    extraObjects: ["11 0 obj\n[7 0 R]\nendobj\n"]
+  })));
+  assert.equal(font.location.storage, "regular");
+  assert.equal(font.location.generation, 0);
+  assert.equal(font.objectGeneration, 0, "the generation the /Resources reference stated");
+  for (const step of font.descendantTrace.filter((step) => step.reference)) {
+    assert.equal(step.location.storage, "regular", `${step.reference} is a normal indirect object in this fixture`);
+    assert.equal(typeof step.location.offset, "number");
+  }
+});
+
+test("tracing changes nothing about which structures resolve", { skip }, async () => {
+  // The trace is an output, never an input: passing one must not make a font measurable
+  // that is not, nor the other way round.
+  const { resolveDescendantFont } = await import("../src/font-metrics.js");
+  for (const descendantFonts of ["/DescendantFonts [7 0 R]", "/DescendantFonts 11 0 R", "/DescendantFonts [99 0 R]", ""]) {
+    const editor = new PdfTextEditor(makeCidPdf({ descendantFonts, extraObjects: ["11 0 obj\n[7 0 R]\nendobj\n"] }));
+    await editor.listTextRuns();
+    const resolve = (target) => editor.document.resolveObject(target, editor.security, undefined);
+    const fontObject = await resolve({ number: 5, generation: 0 });
+    const untraced = await resolveDescendantFont(fontObject.dictionary, resolve);
+    const traced = await resolveDescendantFont(fontObject.dictionary, resolve, []);
+    assert.deepEqual(traced, untraced, `${descendantFonts || "(no /DescendantFonts)"} must resolve identically either way`);
+  }
+});
+
 test("measures a simple font whose /Widths and /FirstChar are indirect objects", { skip }, async () => {
   const pdf = makeSimplePdf();
   assert.match(latin1.decode(pdf), /\/Widths 7 0 R/);

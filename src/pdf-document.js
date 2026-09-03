@@ -1182,6 +1182,29 @@ export async function diagnoseFontMetrics(editor) {
     const text = object.dictionary || (object.rawValue ?? String(object.value));
     return { reference: `${target.number} ${target.generation} R`, kind, detail: text.length > 400 ? `${text.slice(0, 400)}...` : text };
   };
+  /**
+   * Where the cross-reference table puts an object: a normal indirect object at a byte
+   * offset, an entry inside an Object Stream, or nothing at all. Read straight off the
+   * table the resolver itself uses, so it describes the same lookup that succeeded or
+   * failed -- not a second interpretation of the file.
+   */
+  const locationOf = (number) => {
+    const entry = structure.entries.get(number);
+    if (!entry) return { number, storage: "missing-from-xref" };
+    if (entry.free) return { number, storage: "free" };
+    // A compressed object's generation is 0 by definition (PDF 7.5.7): an Object Stream
+    // holds no generation field, so there is none to report but that one.
+    if (entry.compressed) {
+      return { number, storage: "object-stream", streamNumber: entry.streamNumber, indexInStream: entry.indexInStream, generation: 0 };
+    }
+    return { number, storage: "regular", offset: entry.offset, generation: entry.generation ?? null };
+  };
+  /** The object number of the dictionary the descendant walk ended on, if it ended on one. */
+  const descendantObjectNumberOf = (trace, descendant) => {
+    if (!descendant) return null;
+    const last = [...trace].reverse().find((step) => step.kind === "dictionary" && step.reference);
+    return last ? Number(last.reference.split(" ")[0]) : null;
+  };
   const report = [];
   const seen = new Set();
   for (const { object, resources } of await structure.pageContentObjects(security, decryptStreamBytes)) {
@@ -1196,9 +1219,13 @@ export async function diagnoseFontMetrics(editor) {
       }
       // Reached the same way the measurement reaches it, including an indirect
       // /DescendantFonts array -- otherwise this would report "no descendant font" for a
-      // font describeFontWidths() measures perfectly well.
+      // font describeFontWidths() measures perfectly well. `descendantTrace` is that same
+      // walk's own account of itself (see resolveDescendantFont() in font-metrics.js), so
+      // a "descendant-font-unresolved" here names the hop that actually failed instead of
+      // being re-derived by a second walk that could disagree with the first.
+      const descendantTrace = [];
       const descendant = /\/Subtype\s*\/Type0\b/.test(font.dictionary)
-        ? (await resolveDescendantFont(font.dictionary, resolve)).dictionary ?? null
+        ? (await resolveDescendantFont(font.dictionary, resolve, descendantTrace)).dictionary ?? null
         : null;
       if (descendant) {
         for (const key of ["W", "DW", "CIDToGIDMap", "FontDescriptor"]) {
@@ -1209,8 +1236,20 @@ export async function diagnoseFontMetrics(editor) {
         contentStream: object.number,
         name,
         objectNumber: fontReference.number,
+        // What the reference in /Resources /Font actually said, and where the xref puts
+        // it: a font whose object cannot be found, or that turns out to live inside an
+        // Object Stream, is the kind of thing a real document's refusal turns on.
+        objectGeneration: fontReference.generation,
+        location: locationOf(fontReference.number),
         dictionary: font.dictionary,
         descendant,
+        // The CIDFont's own object number, when the walk reached one: the last reference
+        // the trace resolved to a dictionary.
+        descendantObjectNumber: descendantObjectNumberOf(descendantTrace, descendant),
+        descendantTrace: descendantTrace.map((step) => ({
+          ...step,
+          ...(step.reference ? { location: locationOf(Number(step.reference.split(" ")[0])) } : {})
+        })),
         writingMode: writingModeOf(font.dictionary, structure),
         codeBytes: metrics?.codeBytes ?? null,
         metrics,
