@@ -2,7 +2,8 @@ name: Diagnose real PDF font metrics
 
 # Manual-only. This fetches an arbitrary external PDF into a GitHub-hosted
 # runner and is intentionally kept separate from the regular push/PR CI in
-# ci.yml, which never makes network access.
+# ci.yml, so fetching an arbitrary real-PDF URL is never triggered
+# automatically by a push or PR.
 on:
   workflow_dispatch:
     inputs:
