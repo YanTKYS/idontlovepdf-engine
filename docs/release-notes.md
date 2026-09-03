@@ -2,6 +2,16 @@
 
 各versionのリリース内容を新しい順に記載します。H2見出しには、`v`付きversionとGitHub Releaseのtitleを記載します。
 
+## v0.4.3 - Inline descendant CIDFont dictionaries
+
+- **v0.4.2 で`/W 25 0 R`まで解決可能になった`22550.pdf`の`/F3`が、それでも`descendant-font-unresolved`だった原因を解決した version です。** 原因は`/DescendantFonts`が PDF 仕様の許すもう一つの書き方——CIDFont dictionary を array の中に直接書く inline dictionary（`/DescendantFonts [ << ... >> ] `）——で書かれていたことでした。`/DescendantFonts [7 0 R]`のような indirect reference ではありません
+- **`parseReferenceArray()`は、この inline dictionary の内部にある reference（`/Ordering`・`/Registry`・`/FontBBox`・`/StemV`・`/FontFile2`・`/W`）を、すべて`/DescendantFonts`自身の array 要素であるかのように誤認していました。** その結果、要素 1 つの合法な array を「要素 6 つの仕様違反」と誤判定し、実際には存在する`/W`に到達できないまま拒否していました
+- **`src/pdf-dictionary-text.js`に`topLevelArrayElements()`を追加しました。** 既存の`skipOneValue()`（dictionary は`skipDictionary()`、array は`skipArray()`に委譲）を再利用し、array の要素を値の境界を理解した上で 1 つずつ読みます。新しい PDF parser ではなく、既存 parser の再利用です。nested dictionary 内部の reference は 1 つの値として読み飛ばされるため、array 自身の要素として誤認されることはありません
+- **`/DescendantFonts`の 3 形を区別して扱います。** direct reference array（`[7 0 R]`）・indirect array object（`11 0 R` → `[7 0 R]`）・inline dictionary（`[ << ... >> ]`）のいずれも、CIDFont dictionary が一意に 1 つ決まる場合だけ解決します。要素が 0 個・2 個以上、reference と dictionary の混在、CIDFontType0/2 以外の inline dictionary は、従来どおり`FALLBACK_FONT_METRICS_UNAVAILABLE`で拒否します
+- **診断 CLI（`scripts/diagnose-font-metrics.js`）も同じ`resolveDescendantFont()`を使うため、production と食い違いません。** inline dictionary の場合は新しい`inline-dictionary` hop を trace に表示し、以前のように内部の reference を array 要素として表示することはありません
+- **実 PDF（`22550.pdf`）で確認しました。** `令和 → しょ`（fallback font 経路）・`令和 → 平成`（既存 font 経路、回帰確認）の両方が、検索→ fallback font 設定 → `checkTextMatchReplacement()` → `replaceTextMatch()` → `save()` → 新しい`PdfTextEditor`で reopen → 再検索まで成功しました。置換後に続くテキストの描画位置は、この engine と実装を共有しない pdfminer.six で独立に確認し、置換前後で座標が一致することを確認しました。保存した PDF は qpdf（構造チェック）と Chromium 本体の PDF viewer でも問題なく開けます。詳細は [descendant font の診断](../docs/descendant-font-diagnosis.md) を参照してください
+- **PR #26 で記録した、`resolveObject()`が indirect reference の generation 番号を検証せず object 番号だけで解決する件は、この version の対象外です。** 別の安全性レビュー課題として残しています
+
 ## v0.4.2 - Font widths a real PDF actually states
 
 - **v0.4.1 の `TJ` fallback を、実務 PDF で成立させるための version です。** 実 PDF（`22550.pdf`）の `/F3` で `令和 → しょ` が `FALLBACK_FONT_METRICS_UNAVAILABLE` になっていました。同じ箇所の `令和 → 平成` は成功します（元 font で書けるため fallback 経路に入らない）。つまり `TJ` 対応そのものではなく、**元 font の glyph 幅を PDF から正確に読み取れないこと**が原因です
