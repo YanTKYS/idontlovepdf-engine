@@ -575,10 +575,26 @@ export class PdfStructure {
       }
       object.rawValue = decodeBinaryString(this.bytes.subarray(start, valueEnd));
     } else {
-      const scalar = readInteger(this.bytes, cursor);
-      const terminator = skipSpace(this.bytes, scalar.end);
-      if (!keywordAt(this.bytes, terminator, "endobj")) throw new Error(`Unsupported non-dictionary PDF object ${number}`);
-      object.value = scalar.value;
+      // A bare numeric object. PDF numbers are plain decimal -- an optional sign, digits
+      // and at most one point, never exponent notation -- and a real is as legal here as
+      // an integer (`10 0 obj 999.5 endobj` for a font's /DW, say). Read with the same
+      // grammar interpretCompressedObject() applies inside an Object Stream, so the two
+      // paths agree about what a number is rather than one of them accepting less.
+      const start = skipSpace(this.bytes, cursor);
+      const first = this.bytes[start];
+      if (first !== 0x2b && first !== 0x2d && first !== 0x2e && !(first >= 0x30 && first <= 0x39)) {
+        throw new Error(`Unsupported non-dictionary PDF object ${number}`);
+      }
+      let valueEnd = start + (first === 0x2b || first === 0x2d ? 1 : 0);
+      while ((this.bytes[valueEnd] >= 0x30 && this.bytes[valueEnd] <= 0x39) || this.bytes[valueEnd] === 0x2e) valueEnd += 1;
+      const value = Number(decodeBinaryString(this.bytes.subarray(start, valueEnd)));
+      // "1.2.3" and a lone sign or point scan the same way and are not numbers; the digit
+      // scan also stops at the "e" of "1e3", leaving tokens the endobj check below rejects.
+      if (!Number.isFinite(value)) throw new Error(`Malformed number in PDF object ${number}`);
+      if (!keywordAt(this.bytes, skipSpace(this.bytes, valueEnd), "endobj")) {
+        throw new Error(`Unsupported non-dictionary PDF object ${number}`);
+      }
+      object.value = value;
     }
     this.cache.set(number, object);
     return object;

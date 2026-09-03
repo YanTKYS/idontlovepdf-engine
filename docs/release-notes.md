@@ -11,6 +11,8 @@
 - **対応を広げたのは 1 点だけです: width を持つ entry が間接 object として書かれている構造。** `/Widths 123 0 R`・`/W 456 0 R`・`/DW`・`/FirstChar`・`/MissingWidth`・`/DescendantFonts` の間接参照を、engine が既に持つ PDF object resolver（`PdfStructure.resolveObject()`）で解決します。正規表現で PDF を展開するのではなく、通常の object 解決経路を通します。`/Encoding` の name 自体が間接 object の場合も、`/Identity-H` と確認できるときに限り解決します（writing mode の判定も同じ経路で `-H` / `-V` を見ます）。あわせて `PdfStructure.object()` が「値が array・name の indirect object」を読めるようにしました（従来は dictionary と整数のみ）
 - **解決するのは「数値がどこにあるか」だけです。** 値そのものは従来どおり PDF が書いた数値をそのまま読み、推測は一切しません。`/DW` や `/FirstChar` が間接参照のときに **object 番号を値と取り違えていた読み取り**（`/FirstChar 12 0 R` を 12 と読む）も塞ぎました。誤った幅から誤った adjustment を書き得るため、これは v0.4.1 に対する修正でもあります
 - **key はあるが値を読めない場合を「無い」扱いにしません。** 例えば数値でない `/DW` を 1000（spec の既定値）とみなすことはせず、拒否します
+- **間接 number は実数（real）も読みます。** `10 0 obj 999.5 endobj` のような合法的な値を、Object Stream 内の number 解析と同じ文法（符号・小数点あり、指数表記なし）で読みます。従来 `PdfStructure.object()` は通常 object の scalar を整数しか読まなかったため、この形は拒否になっていました。`1.2.3` や `1e3` のような PDF number でない値は引き続き拒否します
+- **診断 CLI も測定と同じ経路で descendant font へ到達します。** `/DescendantFonts 11 0 R` → `11 0 obj [7 0 R]` のように array object を挟む構造でも、実際の CIDFont の `/W`・`/DW` を表示します（測定側と同じ `resolveDescendantFont()` を共有）。診断が測定より手前で止まると、読めている font を「widths が無い」と誤って報告してしまうためです
 - **次は引き続き No-Go（fail closed）です。**
   - `/Encoding` が `/Identity-H` 以外。predefined CMap（`/90ms-RKSJ-H` 等）は PDF 内に無く、embedded CMap stream は解析しません。`/ToUnicode` から CID を逆算することもしません（ToUnicode は Unicode 抽出用で、code → CID と同一とは限らないため）
   - Type 3 font、`/Widths` を持たない標準 14 font

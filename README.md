@@ -235,7 +235,7 @@ v0.4.1 では、この値が font dictionary の中に**直接**書かれてい�
 - simple font（`/Type1`・`/TrueType`・`/MMType1`）の `/Widths`・`/FirstChar`・`/MissingWidth`
 - CID font（`/Type0` + `/Encoding /Identity-H`）の `/DescendantFonts`・`/W`・`/DW`
 
-解決するのは**どこに数値があるか**だけで、値そのものは従来どおり PDF が書いた数値をそのまま読みます。推測は一切しません。次はこれまでどおり拒否します。
+解決するのは**どこに数値があるか**だけで、値そのものは従来どおり PDF が書いた数値をそのまま読みます（間接 number は `999.5` のような実数も対象。指数表記は PDF number ではないため拒否します）。推測は一切しません。次はこれまでどおり拒否します。
 
 - `/Encoding` が `/Identity-H` 以外（predefined CMap も embedded CMap stream も）。code から CID を一意に決められないため。`/ToUnicode` から CID を逆算することはしません（ToUnicode は Unicode 抽出用で、code → CID とは限らないため）
 - Type 3 font（幅が font 自身の glyph space にあるため）、`/Widths` を持たない標準 14 font

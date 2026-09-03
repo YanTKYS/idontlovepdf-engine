@@ -1,6 +1,6 @@
 import { encodeHex, encodeLiteral, parseTextArrayRegion, replaceTextRuns, scanTextRuns } from "./content-stream.js";
 import { FALLBACK_FONT_MARKER, buildFallbackFontObjects, fingerprintFont, freeResourceName, glyphSpaceWidth, glyphsFor, glyphsFromToUnicode, identityEncode, parseFallbackFont } from "./fallback-font.js";
-import { describeFontWidths, measureCodes } from "./font-metrics.js";
+import { describeFontWidths, measureCodes, resolveDescendantFont } from "./font-metrics.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
 import { summarizeEncryption } from "./encryption.js";
 import { deflate, decodeStreamBytes, filters } from "./flate.js";
@@ -1194,15 +1194,15 @@ export async function diagnoseFontMetrics(editor) {
       for (const key of ["Encoding", "DescendantFonts", "W", "Widths", "FontDescriptor", "ToUnicode"]) {
         for (const target of parseReferenceArray(font.dictionary, key)) related.push({ key, ...await shapeOf(target) });
       }
-      const [descendantReference] = parseReferenceArray(font.dictionary, "DescendantFonts");
-      let descendant = null;
-      if (descendantReference) {
-        const resolved = await resolve(descendantReference).catch(() => null);
-        descendant = resolved?.dictionary || null;
-        if (descendant) {
-          for (const key of ["W", "DW", "CIDToGIDMap", "FontDescriptor"]) {
-            for (const target of parseReferenceArray(descendant, key)) related.push({ key: `descendant /${key}`, ...await shapeOf(target) });
-          }
+      // Reached the same way the measurement reaches it, including an indirect
+      // /DescendantFonts array -- otherwise this would report "no descendant font" for a
+      // font describeFontWidths() measures perfectly well.
+      const descendant = /\/Subtype\s*\/Type0\b/.test(font.dictionary)
+        ? (await resolveDescendantFont(font.dictionary, resolve)).dictionary ?? null
+        : null;
+      if (descendant) {
+        for (const key of ["W", "DW", "CIDToGIDMap", "FontDescriptor"]) {
+          for (const target of parseReferenceArray(descendant, key)) related.push({ key: `descendant /${key}`, ...await shapeOf(target) });
         }
       }
       report.push({

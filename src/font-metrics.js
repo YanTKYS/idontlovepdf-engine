@@ -280,12 +280,16 @@ async function identityEncoding(fontDictionary, resolve) {
 }
 
 /**
- * The descendant CIDFont's own dictionary. `/DescendantFonts` is an array of exactly one
- * font (PDF 9.7.6.2); the array itself may be written indirectly, which is followed once
- * and no further -- this resolves the structure a real file states, it does not evaluate
- * arbitrary object graphs.
+ * The descendant CIDFont's own dictionary, as `{ dictionary }`, or a refusal saying why it
+ * could not be reached. `/DescendantFonts` is an array of exactly one font (PDF 9.7.6.2);
+ * the array itself may be written indirectly, which is followed once and no further -- this
+ * resolves the structure a real file states, it does not evaluate arbitrary object graphs.
+ *
+ * Exported so diagnoseFontMetrics() in pdf-document.js reaches the descendant by exactly
+ * the same path the measurement does: a diagnosis that stopped a hop short of the real
+ * CIDFont would describe a font this can measure as if it stated no widths.
  */
-async function descendantFont(fontDictionary, resolve) {
+export async function resolveDescendantFont(fontDictionary, resolve) {
   const [target] = parseReferenceArray(fontDictionary, "DescendantFonts");
   if (!target) return refuse("descendant-font-missing");
   const unresolved = () => refuse("descendant-font-unresolved", `${target.number} ${target.generation} R`);
@@ -302,7 +306,7 @@ async function descendantFont(fontDictionary, resolve) {
 async function type0Widths(fontDictionary, resolve) {
   const encoding = await identityEncoding(fontDictionary, resolve);
   if (encoding) return encoding;
-  const descendant = await descendantFont(fontDictionary, resolve);
+  const descendant = await resolveDescendantFont(fontDictionary, resolve);
   if (descendant.reason) return descendant;
   if (!/\/Subtype\s*\/CIDFontType[02]\b/.test(descendant.dictionary)) {
     return refuse("unsupported-cid-font", /\/Subtype\s*\/([^\s/<>[\]()]+)/.exec(descendant.dictionary)?.[0] ?? null);

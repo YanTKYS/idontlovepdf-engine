@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { PdfTextEditor } from "../src/index.js";
+import { diagnoseFontMetrics } from "../src/pdf-document.js";
 import { TEST_FONT, readTestFont } from "../scripts/fetch-test-font.js";
 import { fontTable, simulate } from "./helpers/text-advance.js";
 import { CMAP, W_ARRAY, buildPdf, encode, glyphs, streamObject } from "./helpers/document-font.js";
@@ -179,6 +180,42 @@ test("measures a CID font whose /Encoding name is itself an indirect object", { 
   assert.deepEqual(trailing(after), trailing(before));
 });
 
+test("reads an indirect /DW written as a real number, not just an integer", { skip }, async () => {
+  // A PDF number is plain decimal, and a real is as legal as an integer wherever a number
+  // is expected. 和 is left out of /W here, so its width is /DW: 999.5, making the whole
+  // match 1999.5 wide against しょ's 2000 -- an adjustment of 0.5, which has to be written
+  // as such rather than the file being refused for stating a width with a decimal point.
+  const pdf = makeCidPdf({
+    widthObject: "9 0 obj\n[1 [1000] 3 [500] 4 [1000] 5 [1000]]\nendobj\n",
+    defaultWidthObject: "10 0 obj\n999.5\nendobj\n"
+  });
+  const { stream, before, after } = await replaceAndMeasure(pdf, "令和", "しょ", "fallback-font");
+  assert.match(stream, /\/F3 36 Tf \[0.5 -50 <000300040005>\] TJ/);
+  const trailing = (drawn) => drawn.filter((glyph) => glyph.font === "F3" && glyph.code >= 0x0003).map((glyph) => glyph.x);
+  assert.deepEqual(trailing(after), trailing(before), "every glyph after the match must be drawn where it was");
+});
+
+test("diagnoses the descendant font by the same path the measurement takes", { skip }, async () => {
+  // The diagnosis is the next thing a real document is judged by, so it must not stop a
+  // hop short of the CIDFont that states the widths: /DescendantFonts written as an object
+  // of its own has to be followed, exactly as describeFontWidths() follows it.
+  const pdf = makeCidPdf({
+    descendantFonts: "/DescendantFonts 11 0 R",
+    extraObjects: ["11 0 obj\n[7 0 R]\nendobj\n"]
+  });
+  const editor = new PdfTextEditor(pdf);
+  const [font] = await diagnoseFontMetrics(editor);
+
+  assert.equal(font.name, "F3");
+  assert.equal(font.codeBytes, 2, "the widths are readable, so the diagnosis must say so");
+  assert.match(font.descendant ?? "", /\/Subtype \/CIDFontType2/, "the real descendant font must be reported");
+  assert.match(font.descendant ?? "", /\/W 9 0 R/);
+  const width = font.related.find((item) => item.key === "descendant /W");
+  assert.ok(width, "the /W object the widths actually come from must be listed");
+  assert.equal(width.reference, "9 0 R");
+  assert.match(width.detail, /\[1 \[1000\] 2 \[950\]/);
+});
+
 test("measures a simple font whose /Widths and /FirstChar are indirect objects", { skip }, async () => {
   const pdf = makeSimplePdf();
   assert.match(latin1.decode(pdf), /\/Widths 7 0 R/);
@@ -239,6 +276,16 @@ test("refuses every structure whose widths it cannot establish exactly, and chan
     {
       what: "a /DW pointing at an object that is not a number",
       pdf: makeCidPdf({ defaultWidthObject: "10 0 obj\n(1000)\nendobj\n" }),
+      unsafeReason: "invalid-default-width"
+    },
+    {
+      what: "a /DW pointing at an object that is not a well-formed number",
+      pdf: makeCidPdf({ defaultWidthObject: "10 0 obj\n1.2.3\nendobj\n" }),
+      unsafeReason: "invalid-default-width"
+    },
+    {
+      what: "a /DW pointing at an object written in exponent notation, which PDF has no such thing as",
+      pdf: makeCidPdf({ defaultWidthObject: "10 0 obj\n1e3\nendobj\n" }),
       unsafeReason: "invalid-default-width"
     },
     {
