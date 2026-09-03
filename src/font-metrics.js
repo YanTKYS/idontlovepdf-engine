@@ -350,11 +350,23 @@ export async function resolveDescendantFont(fontDictionary, resolve, trace = nul
       // differs between them and the trace has to say which one this is.
       form: direct !== null ? "direct-array" : targets.length ? "indirect-reference" : "absent",
       raw: rawEntryText(fontDictionary, "DescendantFonts"),
-      references: targets.map((target) => `${target.number} ${target.generation} R`)
+      references: targets.map((target) => `${target.number} ${target.generation} R`),
+      // Whether the walk goes on from here, so a refusal decided by the entry itself is
+      // visible as such instead of looking like a hop that was never taken.
+      accepted: targets.length === 1
     });
   }
   const [target] = targets;
   if (!target) return refuse("descendant-font-missing");
+  // PDF 9.7.6.2 makes /DescendantFonts a ONE-element array. More than one element is
+  // malformed, and nothing in the file says which of them a reader should measure with --
+  // so taking the first would be a guess, and a guess here is a wrong width from a font
+  // the document never asked for. Refused, exactly as the same array written as an object
+  // of its own already was: which of the two shapes a writer chose must not decide whether
+  // the document is measured or refused.
+  if (targets.length > 1) {
+    return refuse("descendant-font-unresolved", targets.map((entry) => `${entry.number} ${entry.generation} R`).join(" "));
+  }
   const unresolved = () => refuse("descendant-font-unresolved", `${target.number} ${target.generation} R`);
   const object = await tracedResolve(resolve, target, trace, "resolve-first-reference");
   if (!object) return unresolved();

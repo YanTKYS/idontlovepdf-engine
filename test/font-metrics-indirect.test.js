@@ -216,6 +216,14 @@ test("diagnoses the descendant font by the same path the measurement takes", { s
   assert.match(width.detail, /\[1 \[1000\] 2 \[950\]/);
 });
 
+/**
+ * A second CIDFont, deliberately not identical to object 7: a `/DescendantFonts` naming
+ * both must not quietly measure with whichever one happens to come first.
+ */
+const SECOND_CID_FONT = "12 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /GHIJKL+Other "
+  + "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R "
+  + "/W 9 0 R /DW 10 0 R /CIDToGIDMap /Identity >>\nendobj\n";
+
 /* --------------------------------------------------- the walk's own account of itself */
 
 // "descendant-font-unresolved" names a walk, not a hop: /DescendantFonts may be a direct
@@ -272,12 +280,21 @@ test("names the hop that failed, not just that one did", { skip }, async () => {
       check: (step) => assert.equal(step.matched, false)
     },
     {
-      what: "an array holding more than the one font the spec allows",
-      pdf: makeCidPdf({ descendantFonts: "/DescendantFonts 11 0 R", extraObjects: ["11 0 obj\n[7 0 R 7 0 R]\nendobj\n"] }),
+      what: "an indirect array holding more than the one font the spec allows",
+      pdf: makeCidPdf({ descendantFonts: "/DescendantFonts 11 0 R", extraObjects: ["11 0 obj\n[7 0 R 12 0 R]\nendobj\n", SECOND_CID_FONT] }),
       lastStep: "nested-array-element",
       check: (step) => {
         assert.equal(step.matched, false);
-        assert.equal(step.inner.trim(), "7 0 R 7 0 R", "the contents that defeated it must be readable");
+        assert.equal(step.inner.trim(), "7 0 R 12 0 R", "the contents that defeated it must be readable");
+      }
+    },
+    {
+      what: "a direct array holding more than the one font the spec allows",
+      pdf: makeCidPdf({ descendantFonts: "/DescendantFonts [7 0 R 12 0 R]", extraObjects: [SECOND_CID_FONT] }),
+      lastStep: "descendant-fonts-entry",
+      check: (step) => {
+        assert.equal(step.accepted, false, "the entry itself must stop the walk");
+        assert.deepEqual(step.references, ["7 0 R", "12 0 R"], "both fonts the array named must be reported");
       }
     }
   ];
@@ -305,6 +322,50 @@ test("reports where the cross-reference table puts each object of the walk", { s
   for (const step of font.descendantTrace.filter((step) => step.reference)) {
     assert.equal(step.location.storage, "regular", `${step.reference} is a normal indirect object in this fixture`);
     assert.equal(typeof step.location.offset, "number");
+  }
+});
+
+test("refuses two descendant fonts whichever way the array is written", { skip }, async () => {
+  // PDF 9.7.6.2 makes /DescendantFonts a one-element array, and nothing in a file with two
+  // says which to measure with -- so both shapes must refuse. The asymmetry this pins down
+  // is the one that mattered: written directly, the array used to resolve to whichever font
+  // came first and MEASURE with it, while the identical array written as an object of its
+  // own was refused. Which shape the writer chose must not decide that.
+  const direct = makeCidPdf({ descendantFonts: "/DescendantFonts [7 0 R 12 0 R]", extraObjects: [SECOND_CID_FONT] });
+  const indirect = makeCidPdf({
+    descendantFonts: "/DescendantFonts 11 0 R",
+    extraObjects: ["11 0 obj\n[7 0 R 12 0 R]\nendobj\n", SECOND_CID_FONT]
+  });
+
+  for (const [what, pdf] of [["direct", direct], ["indirect", indirect]]) {
+    const [font] = await diagnoseFontMetrics(new PdfTextEditor(pdf));
+    assert.equal(font.reason, "descendant-font-unresolved", `${what}: two descendant fonts must be refused`);
+    assert.equal(font.metrics, null, `${what}: no widths may be established from either of them`);
+    assert.equal(font.descendantObjectNumber, null, `${what}: neither font may be named as the descendant`);
+  }
+
+  // And the refusal has to reach the caller, not just the diagnosis: a TJ replacement
+  // needing the fallback font is refused with the public code, and replaceTextMatch()
+  // refuses on the same ground rather than writing anything.
+  for (const [what, pdf] of [["direct", direct], ["indirect", indirect]]) {
+    const editor = new PdfTextEditor(pdf);
+    await editor.setFallbackFont(fontBytes);
+    const [match] = await editor.searchText("令和");
+    assert.ok(match, `${what}: the fixture must contain 令和`);
+    const checked = await editor.checkTextMatchReplacement(match.id, "しょ");
+    assert.equal(checked.allowed, false, what);
+    assert.equal(checked.code, "FALLBACK_FONT_METRICS_UNAVAILABLE", what);
+    assert.equal(checked.unsafeReason, "descendant-font-unresolved", what);
+    await assert.rejects(() => editor.replaceTextMatch(match.id, "しょ"), /./, `${what}: replace must refuse too`);
+    assert.deepEqual(await editor.save(), pdf, `${what}: the document's bytes must be untouched`);
+  }
+
+  // The one-element array both shapes are meant to accept still measures, so this is a
+  // refusal of the malformed case and not of the structure itself.
+  for (const pdf of [makeCidPdf(), makeCidPdf({ descendantFonts: "/DescendantFonts 11 0 R", extraObjects: ["11 0 obj\n[7 0 R]\nendobj\n"] })]) {
+    const [font] = await diagnoseFontMetrics(new PdfTextEditor(pdf));
+    assert.equal(font.codeBytes, 2);
+    assert.equal(font.descendantObjectNumber, 7);
   }
 });
 

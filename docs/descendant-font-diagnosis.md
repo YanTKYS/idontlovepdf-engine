@@ -37,9 +37,18 @@ endobj
 3. 解決できたが dictionary でも array でもない
 4. array だが中身が `<num> <gen> R` ひとつ**だけ**ではない
 
+`/DescendantFonts` は PDF 9.7.6.2 で「要素ひとつの array」と定められています。
+複数要素はいずれも仕様違反であり、どれを使うかは file に書かれていないため、
+**direct / indirect のどちらの書き方でも拒否します**（4 に該当）。
+以前は direct array のときだけ先頭要素を採用して計測していましたが、
+これは「最初に見つかった CIDFont を使う」推測にあたるため取り除きました。
+writer がどちらの書き方を選んだかで、計測するか拒否するかが変わってはいけません。
+
 なお、**generation 番号の不一致は原因になりません**。
 `PdfStructure#object()` / `#resolveObject()` は object 番号だけで引くため、
 generation が違っても解決自体は成功します。
+これは以前からの挙動で本件の原因ではありませんが、
+fail closed を原則とする engine としては後日の安全性レビュー対象です（本 document の範囲外）。
 **Object Stream 内にあること自体も原因になりません**（test で確認済み）。
 
 ## 実行してほしい診断コマンド
@@ -87,8 +96,8 @@ CLI は読み取り専用で、ネットワークアクセスは一切しませ�
     → 現行の `^\s*(\d+)\s+(\d+)\s+R\s*$` が合法な array syntax を取りこぼしています。
       既存の PDF token parser を使う小さな修正で安全に解決できます（v0.4.3 候補）。
   - 参照が複数ある
-    → PDF 9.7.6.2 は `/DescendantFonts` を「font ひとつの array」と定めており、
-      複数要素は仕様違反です。どれを使うかは推測になるため fail closed を維持します。
+    → 仕様違反であり、どれを使うかは推測になるため fail closed を維持します
+      （direct / indirect いずれの書き方でも同じ扱いです）。
 
 いずれの場合も公開 error code は `FALLBACK_FONT_METRICS_UNAVAILABLE` のままで、
 本体 `idontlovepdf` 側が新しい code に対応する必要はありません。
