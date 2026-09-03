@@ -473,12 +473,21 @@ test("raises an explicit error for corrupted AES ciphertext instead of returning
   // previous ciphertext block only afterwards) -- so corrupting an early block
   // leaves the final block, where PKCS#7 padding lives, decrypting perfectly fine
   // and produces merely garbled *content* (a zlib error later), not a padding
-  // failure. To reliably exercise the padding check itself, corrupt a byte in the
-  // LAST 16-byte ciphertext block, immediately before "endstream".
-  const marker = encode("\nendstream");
-  const endIndex = Buffer.from(pdf).indexOf(Buffer.from(marker));
+  // failure. So the padding is damaged where CBC makes that exact: the stream is
+  // `IV | C1 | ... | Cn`, the last plaintext block is `Pn = D(Cn) XOR C(n-1)`, and
+  // flipping the LAST BYTE of C(n-1) flips exactly the padding length byte. Whatever
+  // that length is, `length ^ 0xff` is at least 239, which is never valid padding, so
+  // the check fires every time. (Flipping a byte of Cn itself, as this test used to,
+  // leaves Pn an unrelated 16 bytes -- valid PKCS#7 about 1 time in 256, and then this
+  // fails with a zlib error instead. See test/aes.test.js for the same reasoning.)
+  const bytes = Buffer.from(pdf);
+  const endIndex = bytes.indexOf(Buffer.from(encode("\nendstream")));
+  const dataStart = bytes.lastIndexOf(Buffer.from(encode("stream\n")), endIndex) + "stream\n".length;
+  const paddingLengthByte = endIndex - 1 - 16;
+  assert.equal((endIndex - dataStart) % 16, 0, "the stream must be whole 16-byte blocks of IV || ciphertext");
+  assert.ok(paddingLengthByte >= dataStart, "the byte to flip must be inside the stream's IV || ciphertext");
   const corrupted = Uint8Array.from(pdf);
-  corrupted[endIndex - 1] ^= 0xff;
+  corrupted[paddingLengthByte] ^= 0xff;
   const editor = new PdfTextEditor(corrupted);
   await assert.rejects(editor.listTextRuns(), /AES-CBC decryption failed/);
 });

@@ -61,12 +61,25 @@ test("both paths refuse a wrong key rather than returning mis-unpadded data", as
 
 test("both paths refuse every damaged padding byte of a final block", async () => {
   const key = new Uint8Array(randomBytes(32));
-  // 16 bytes of plaintext, so the last block is padding through and through: flipping any
-  // byte of it must be caught, not just the length byte at the end.
+  // 16 bytes of plaintext, so PKCS#7 adds a whole block of 0x10 and the file is exactly
+  // IV | C1 (the plaintext block) | C2 (the padding block).
   const data = encrypt(Buffer.from(key), Buffer.alloc(16, 0x41));
-  for (let index = data.length - 16; index < data.length; index += 1) {
+  assert.equal(data.length, 48, "the fixture must be IV plus exactly two ciphertext blocks");
+  const paddingBlock = data.length - 16;      // C2, which decrypts to the padding
+  const previousBlock = paddingBlock - 16;    // C1, which CBC then XORs into it
+
+  // The padding block is damaged through C1, not through C2 itself. In CBC the last
+  // plaintext block is `P2 = D(C2) XOR C1`, so flipping bits in C1 flips exactly those
+  // bits of P2 and leaves the rest of it alone: padding byte i becomes 0x10 ^ 0xff = 0xef,
+  // which is never valid padding, for every i and for every key. Damaging C2 instead
+  // would replace P2 with an unrelated block, which is valid PKCS#7 about 1 time in 256
+  // (measured: 0.4% of single-byte flips) -- the same test, but passing by luck.
+  for (let index = previousBlock; index < paddingBlock; index += 1) {
     const damaged = Uint8Array.from(data);
     damaged[index] ^= 0xff;
+    // Only the last of these damages the length byte; the other fifteen leave it saying
+    // 16 and corrupt a byte the padding claims to cover, so an unpadding step that reads
+    // the length and nothing else accepts them and fails this test.
     await withWebCrypto(() => assert.rejects(decryptAesCbc(key, damaged), /AES-CBC decryption failed/, `Web Crypto, byte ${index}`));
     await withoutWebCrypto(() => assert.rejects(decryptAesCbc(key, damaged), /AES-CBC decryption failed/, `JavaScript, byte ${index}`));
   }
