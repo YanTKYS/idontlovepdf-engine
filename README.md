@@ -39,6 +39,7 @@
 - fallback font を使うと font 全体が埋め込まれ、ファイルサイズが数 MB 増えます（subset 化は未対応）
 - fallback font で置換した箇所は前後と font が変わるため、**保存して開き直した後**は `searchText()` で前後をまたいだ 1 つの文字列としては検索されません（置換した文字列自体は検索できます）。保存前の同じ editor では、その run はまだ 1 つの run として扱われるため前後と連結して検索されます。この差が問題になる場合は `save()` して開き直してください
 - 複数の text run にまたがる一致で文字数が変わる置換は、対象 run 間に他の operator がなく、かつ対象 run 間の `TJ` numeric adjustment の合計が 0 の場合のみ対応します。字間調整が残る場合や `Tc`/`Tw`/`Tz`/`Tr`・色指定・marked content をまたぐ場合は `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として拒否します（同じ文字数への置換と削除は構造によらず可能です）
+- `TJ` 置換で後続位置を維持するために必要な glyph 幅は、PDF 自身の `/Widths`・`/W`・`/DW`（間接 object も解決）からのみ取得します。`/Identity-H` 以外の `/Encoding`、Type 3 font、`/Widths` の無い標準 14 font などは幅を確定できないため `FALLBACK_FONT_METRICS_UNAVAILABLE` で拒否します
 - 字間調整（`TJ` の numeric adjustment）の削除・合算・再計算、glyph 幅からの文字送り計算、text matrix の再構成は行いません
 - 検索は `Td` / `TD` / `Tm` / `T*`、別 `BT ... ET`、font 変更等をまたぎません。これらをまたいで 1 つの語が描画されている PDF では、その語は分断されたまま検索されます
 
@@ -218,12 +219,30 @@ match の終端から**何も描画されない**場合（match が列の末尾�
 
 `TJ` でも次の場合は**引き続き拒否**します。
 
-- 元 font の glyph 幅を正確に読み取れない（`/Widths` も `/W`・`/DW` も無い、`/Encoding` が `/Identity-H` 以外で code から CID を決められない、Type 3 font、幅が間接参照で解決できない）→ `FALLBACK_FONT_METRICS_UNAVAILABLE`
+- 元 font の glyph 幅を正確に読み取れない（下記「font metrics をどこから読むか」を参照）→ `FALLBACK_FONT_METRICS_UNAVAILABLE`
 - 上記の `Tc` / `Tw` の条件を満たさない → `FALLBACK_CHAR_SPACING_UNSUPPORTED` / `FALLBACK_WORD_SPACING_UNSUPPORTED`
 - match の operand 間に `Tc` / `Tw` / `Tz` / `Tr` / 色指定 / marked content などがある（異なる text state で描画されているものを 1 つとして描き直すことになるため）→ `FALLBACK_MULTI_RUN_UNSUPPORTED`
 - 配列の外に数値が書かれている等、対象範囲を `[`・`]`・string・数値・`TJ` だけの列として読み切れない（配列外の数値は reader が字送りとして扱わないため、字送りとみなすと位置がずれる）→ `FALLBACK_LAYOUT_UNSUPPORTED`
 - 縦書き font / writing mode 不明 → `FALLBACK_WRITING_MODE_UNSUPPORTED`（v0.4.0 と同じ）
 - match が `Tj` と `TJ` にまたがる → `FALLBACK_OPERATOR_UNSUPPORTED`
+
+**font metrics をどこから読むか**（v0.4.2 で対応範囲を拡大）
+
+上の計算に使う「元の幅」は、**その PDF 自身の font dictionary の値**です。PDF reader が位置決めに使う数値がそれであり、埋め込み font program の `hmtx` は見ません（reader はそれを無視してよいため、一致するとは限りません）。
+
+v0.4.1 では、この値が font dictionary の中に**直接**書かれている場合しか読めませんでした。実際の PDF では `/Widths` や `/W` を独立した indirect object として書く writer が多く、その場合は幅を取得できず `FALLBACK_FONT_METRICS_UNAVAILABLE` になっていました。v0.4.2 では、engine が既に持っている object resolver を通して次を解決します。
+
+- simple font（`/Type1`・`/TrueType`・`/MMType1`）の `/Widths`・`/FirstChar`・`/MissingWidth`
+- CID font（`/Type0` + `/Encoding /Identity-H`）の `/DescendantFonts`・`/W`・`/DW`
+
+解決するのは**どこに数値があるか**だけで、値そのものは従来どおり PDF が書いた数値をそのまま読みます（間接 number は `999.5` のような実数も対象。指数表記は PDF number ではないため拒否します）。推測は一切しません。次はこれまでどおり拒否します。
+
+- `/Encoding` が `/Identity-H` 以外（predefined CMap も embedded CMap stream も）。code から CID を一意に決められないため。`/ToUnicode` から CID を逆算することはしません（ToUnicode は Unicode 抽出用で、code → CID とは限らないため）
+- Type 3 font（幅が font 自身の glyph space にあるため）、`/Widths` を持たない標準 14 font
+- 参照先の object が存在しない、数値の配列として読めない、`/DW` や `/FirstChar` が数値でない
+- font program の `hmtx` しか手掛かりがない場合
+
+拒否の内訳は開発者向けに `unsafeReason`（`w-unresolved`・`widths-unresolved`・`invalid-width-array`・`non-identity-encoding`・`embedded-cmap-encoding`・`unsupported-type3` など）として返します。公開 `code` は `FALLBACK_FONT_METRICS_UNAVAILABLE` のままです。実 PDF の構造を確認するには `node scripts/diagnose-font-metrics.js <file.pdf> [--text 令和]` を使ってください（読み取り専用・ネットワークアクセスなし）。
 
 **`'` / `"` は対象外です**（`FALLBACK_OPERATOR_UNSUPPORTED`）。これらは描画前に改行を伴うため、いずれの組み替えでも扱えません。v0.4.1 で `TJ` に対応したこととは切り離しています。
 
@@ -374,7 +393,7 @@ npm ci
 npm run build
 ```
 
-`scripts/build.js` が esbuild を実行し、`dist/idontlovepdf-engine.js` を生成します。`esbuild` は devDependency としてのみ使用し、生成物には含まれません（production/runtime 依存ではありません）。`opentype.js` と `@noble/hashes` は dependency で、bundle へ取り込まれます（この分、bundle は約 116KB から約 506KB になりました。v0.4.1 時点）。`npm test` は `pretest` npm script 経由でビルドを自動実行するため、`npm test` を一度実行すれば `dist/` は常に最新の状態になります。
+`scripts/build.js` が esbuild を実行し、`dist/idontlovepdf-engine.js` を生成します。`esbuild` は devDependency としてのみ使用し、生成物には含まれません（production/runtime 依存ではありません）。`opentype.js` と `@noble/hashes` は dependency で、bundle へ取り込まれます（この分、bundle は約 116KB から約 514KB になりました。v0.4.2 時点）。`npm test` は `pretest` npm script 経由でビルドを自動実行するため、`npm test` を一度実行すれば `dist/` は常に最新の状態になります。
 
 ### version 確認方法
 
@@ -443,7 +462,7 @@ Web Crypto API（`crypto.subtle`）は**あれば使う**位置づけで、必�
 | `src/cmap.js` | `/ToUnicode` CMap の解析・エンコード/デコード | 内部 |
 | `src/sha2.js` | SHA-256/384/512（Web Cryptoがあればそれ、無ければ @noble/hashes） | 内部 |
 | `src/fallback-font.js` | fallback font の解析・PDF font object 生成（Type0/CIDFontType2/FontFile2/ToUnicode） | 内部 |
-| `src/font-metrics.js` | 元 PDF の font dictionary から glyph 幅（`/Widths`・`/W`・`/DW`）を読み取る。`TJ` 置換で後続位置を維持するための計測に使用 | 内部 |
+| `src/font-metrics.js` | 元 PDF の font dictionary から glyph 幅（`/Widths`・`/W`・`/DW`）を読み取る（間接 object も解決）。`TJ` 置換で後続位置を維持するための計測に使用 | 内部 |
 | `src/content-stream.js` | content stream 内のテキスト表示オペランド・dictionary operand の走査 | 内部 |
 | `src/encryption.js` | `/Encrypt` 辞書の診断（復号は行わない） | 内部 |
 | `src/pdf-dictionary-text.js` | 辞書 text 内の名前・文字列・真偽値・入れ子辞書の抽出 | 内部 |
@@ -451,6 +470,7 @@ Web Crypto API（`crypto.subtle`）は**あれば使う**位置づけで、必�
 | `src/assessment.js` | 評価パイプライン本体。Node 版 CLI とブラウザ PoC で共有 | 内部（PoC専用） |
 | `scripts/build.js` / `scripts/sync-version.js` | bundle 生成・version 同期スクリプト | ビルド専用 |
 | `scripts/assess-corpus.js` | 実 PDF corpus 一括評価用 Node CLI | 開発者向けツール |
+| `scripts/diagnose-font-metrics.js` | 実 PDF の font が glyph 幅をどう記述しているか、読めない場合はどの構造が原因かを表示する Node CLI（読み取り専用） | 開発者向けツール |
 | `web/*` | GitHub Pages ブラウザ PoC の実装 | PoC専用 |
 
 ## GitHub PagesブラウザPoC

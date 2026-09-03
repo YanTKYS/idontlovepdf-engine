@@ -82,10 +82,11 @@ function dictionaryEnd(bytes, position) {
  * Finds the end of a PDF array `[ ... ]`, tracking `[`/`]` depth (arrays can nest)
  * while skipping over literal strings, nested dictionaries, and hex strings the same
  * way dictionaryEnd() does -- an unescaped `]` inside a string, or one that closes a
- * nested array/dictionary, must not be mistaken for this array's own end. Used only
- * by interpretCompressedObject() below, to find an Object Stream entry's boundary
- * when it is an array rather than a dictionary; the array's contents are kept as raw
- * text (see that function), not parsed element by element.
+ * nested array/dictionary, must not be mistaken for this array's own end. Used to
+ * find the boundary of an object whose value is an array rather than a dictionary --
+ * an Object Stream entry (interpretCompressedObject()) or an ordinary indirect object
+ * (object()); either way the array's contents are kept as raw text, not parsed
+ * element by element.
  */
 function arrayEnd(bytes, position) {
   if (bytes[position] !== 0x5b) throw new Error("Expected a PDF array");
@@ -532,7 +533,7 @@ export class PdfStructure {
     }
     cursor += 3;
     const dictionary = extractDictionary(this.bytes, cursor);
-    const object = { number, generation: generation.value, dictionary: dictionary?.text ?? "", data: null, value: null };
+    const object = { number, generation: generation.value, dictionary: dictionary?.text ?? "", data: null, value: null, rawValue: null };
     if (dictionary) {
       cursor = skipSpace(this.bytes, dictionary.end);
       if (keywordAt(this.bytes, cursor, "stream")) {
@@ -552,11 +553,48 @@ export class PdfStructure {
         const afterStream = skipSpace(this.bytes, cursor + length);
         if (!keywordAt(this.bytes, afterStream, "endstream")) throw new Error(`PDF stream ${number} length does not end at endstream`);
       }
+    } else if (this.bytes[skipSpace(this.bytes, cursor)] === 0x2f) {
+      // A bare name object -- how a PDF may write, for instance, a Type0 font's
+      // `/Encoding /Identity-H` indirectly. Kept as its own text, like the array below.
+      const start = skipSpace(this.bytes, cursor);
+      let valueEnd = start + 1;
+      while (isRegular(this.bytes[valueEnd])) valueEnd += 1;
+      if (!keywordAt(this.bytes, skipSpace(this.bytes, valueEnd), "endobj")) {
+        throw new Error(`PDF name object ${number} does not end at endobj`);
+      }
+      object.rawValue = decodeBinaryString(this.bytes.subarray(start, valueEnd));
+    } else if (this.bytes[skipSpace(this.bytes, cursor)] === 0x5b) {
+      // A bare array object -- what a PDF writer produces for a long /Widths or /W (see
+      // font-metrics.js), and legal wherever an array is expected. Its text is kept whole,
+      // exactly as interpretCompressedObject() keeps a compressed one's; whoever asked for
+      // it parses its elements, and only the shapes they accept are ever read.
+      const start = skipSpace(this.bytes, cursor);
+      const valueEnd = arrayEnd(this.bytes, start);
+      if (!keywordAt(this.bytes, skipSpace(this.bytes, valueEnd), "endobj")) {
+        throw new Error(`PDF array object ${number} does not end at endobj`);
+      }
+      object.rawValue = decodeBinaryString(this.bytes.subarray(start, valueEnd));
     } else {
-      const scalar = readInteger(this.bytes, cursor);
-      const terminator = skipSpace(this.bytes, scalar.end);
-      if (!keywordAt(this.bytes, terminator, "endobj")) throw new Error(`Unsupported non-dictionary PDF object ${number}`);
-      object.value = scalar.value;
+      // A bare numeric object. PDF numbers are plain decimal -- an optional sign, digits
+      // and at most one point, never exponent notation -- and a real is as legal here as
+      // an integer (`10 0 obj 999.5 endobj` for a font's /DW, say). Read with the same
+      // grammar interpretCompressedObject() applies inside an Object Stream, so the two
+      // paths agree about what a number is rather than one of them accepting less.
+      const start = skipSpace(this.bytes, cursor);
+      const first = this.bytes[start];
+      if (first !== 0x2b && first !== 0x2d && first !== 0x2e && !(first >= 0x30 && first <= 0x39)) {
+        throw new Error(`Unsupported non-dictionary PDF object ${number}`);
+      }
+      let valueEnd = start + (first === 0x2b || first === 0x2d ? 1 : 0);
+      while ((this.bytes[valueEnd] >= 0x30 && this.bytes[valueEnd] <= 0x39) || this.bytes[valueEnd] === 0x2e) valueEnd += 1;
+      const value = Number(decodeBinaryString(this.bytes.subarray(start, valueEnd)));
+      // "1.2.3" and a lone sign or point scan the same way and are not numbers; the digit
+      // scan also stops at the "e" of "1e3", leaving tokens the endobj check below rejects.
+      if (!Number.isFinite(value)) throw new Error(`Malformed number in PDF object ${number}`);
+      if (!keywordAt(this.bytes, skipSpace(this.bytes, valueEnd), "endobj")) {
+        throw new Error(`Unsupported non-dictionary PDF object ${number}`);
+      }
+      object.value = value;
     }
     this.cache.set(number, object);
     return object;

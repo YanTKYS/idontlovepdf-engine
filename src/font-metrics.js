@@ -16,11 +16,17 @@
  * advance and the `TJ` adjustment alike -- see the derivation in pdf-document.js).
  *
  * Nothing here guesses. A font whose widths cannot be read exactly -- no `/Widths` at all,
- * a Type 3 font's own glyph space, a `/Encoding` whose codes are not CIDs, widths written
- * as an indirect object this cannot resolve -- yields null, and the caller refuses the
- * replacement rather than estimating a width. No font parser is involved: these are the
- * PDF's own numbers, read with the same dictionary-text handling the rest of the engine
- * uses.
+ * a Type 3 font's own glyph space, an `/Encoding` whose codes are not CIDs, a width array
+ * this cannot resolve or cannot read as numbers -- yields no metrics and a reason saying
+ * which, and the caller refuses the replacement rather than estimating a width. No font
+ * parser is involved: these are the PDF's own numbers, read with the same dictionary-text
+ * handling the rest of the engine uses.
+ *
+ * v0.4.2 widened *which structures can be read*, never what may be assumed about one that
+ * cannot. A `/Widths`, `/W`, `/DW`, `/FirstChar` or `/MissingWidth` written as an indirect
+ * object is now fetched through the same object resolver the rest of the engine uses and
+ * read exactly; if that object is missing, or is not an array of numbers, the answer is
+ * still no.
  */
 import { parseReferenceArray, reference } from "./pdf-structure.js";
 
@@ -36,8 +42,68 @@ const MAX_CID_RANGE = 0x10000;
 
 const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
 
+/**
+ * Why a font's widths could not be read. Internal detail: it reaches the outside only as
+ * the `unsafeReason` beside a FALLBACK_FONT_METRICS_UNAVAILABLE refusal, which names the
+ * structure and never the document's content. Kept in one place so a real document can be
+ * diagnosed (see scripts/diagnose-font-metrics.js) instead of just answering "no".
+ */
+export const FONT_METRICS_REASONS = Object.freeze([
+  /** Not a font kind whose widths this reads: not Type0, Type1, TrueType or MMType1. */
+  "unsupported-font-subtype",
+  /** A Type 3 font. Its widths are in its own glyph space via /FontMatrix, so /Widths alone does not give them. */
+  "unsupported-type3",
+  /** A Type0 whose /Encoding is a CMap other than /Identity-H: the code is then not the CID. */
+  "non-identity-encoding",
+  /** A Type0 whose /Encoding is an embedded CMap stream, which would have to be parsed to map codes to CIDs. */
+  "embedded-cmap-encoding",
+  /** A Type0 with no /Encoding at all. */
+  "missing-encoding",
+  /** A Type0 whose indirect /Encoding object could not be read. */
+  "encoding-unresolved",
+  /** A Type0 with no /DescendantFonts entry: nowhere for a CID font's widths to be stated. */
+  "descendant-font-missing",
+  /** The descendant font object could not be resolved. */
+  "descendant-font-unresolved",
+  /** The descendant font is not a CIDFontType0 or CIDFontType2. */
+  "unsupported-cid-font",
+  /** An indirect /W whose object could not be resolved. */
+  "w-unresolved",
+  /** An indirect /Widths whose object could not be resolved. */
+  "widths-unresolved",
+  /** A /W or /Widths that is not an array of numbers (or of numbers and nested arrays). */
+  "invalid-width-array",
+  /** A simple font with no /Widths at all -- a standard-14 font, whose widths are not in the file. */
+  "missing-widths",
+  /** A simple font with no /FirstChar, so the /Widths array cannot be indexed. */
+  "missing-first-char",
+  /** A /FirstChar that is not a non-negative integer, or whose indirect object could not be read. */
+  "invalid-first-char",
+  /** A /DW that is present but is not a finite number, or whose indirect object could not be read. */
+  "invalid-default-width",
+  /** A /MissingWidth that is present but is not a finite number. */
+  "invalid-missing-width",
+  /** An indirect /FontDescriptor whose object could not be resolved. */
+  "font-descriptor-unresolved"
+]);
+
+function refuse(reason, detail) {
+  return { metrics: null, reason, detail: detail ?? null };
+}
+
+/** Whether the dictionary states `key` at all, whatever the value turns out to be. */
+function hasKey(dictionary, key) {
+  return new RegExp(`/${key}(?![A-Za-z0-9])`).test(dictionary);
+}
+
+/**
+ * A directly written number value, or null when the key is absent or its value is not a
+ * number written right there. An indirect reference (`/FirstChar 12 0 R`) is deliberately
+ * not matched: its object number is not its value, and reading it as one would be a wrong
+ * width from a correct file.
+ */
 function directNumber(dictionary, key) {
-  const match = new RegExp(`/${key}\\s+([+-]?(?:\\d+\\.?\\d*|\\.\\d+))(?![0-9.])`).exec(dictionary);
+  const match = new RegExp(`/${key}\\s+([+-]?(?:\\d+\\.?\\d*|\\.\\d+))(?![0-9.])(?!\\s+\\d+\\s+R)`).exec(dictionary);
   return match ? Number(match[1]) : null;
 }
 
@@ -59,30 +125,103 @@ function directArrayText(dictionary, key) {
   return null;
 }
 
+/** Resolves an indirect reference through the caller's resolver, or null if it cannot be read. */
+async function tryResolve(resolve, target) {
+  try {
+    return await resolve(target);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The contents of an object that is a bare array (`12 0 obj [ 500 600 ] endobj`), without
+ * its brackets -- the same text directArrayText() returns for a direct one, so both go
+ * through the identical parsing below. Null for an object that is anything else: a
+ * dictionary, a stream, a number, a name.
+ */
+function arrayObjectText(object) {
+  if (!object || object.dictionary) return null;
+  const raw = typeof object.rawValue === "string" ? object.rawValue.trim() : null;
+  if (!raw || raw[0] !== "[" || raw.at(-1) !== "]") return null;
+  return raw.slice(1, -1);
+}
+
+/** The finite number an object holds, or null when it holds anything else. */
+function numberObjectValue(object) {
+  if (!object || object.dictionary) return null;
+  if (typeof object.value === "number" && Number.isFinite(object.value)) return object.value;
+  const raw = typeof object.rawValue === "string" ? object.rawValue.trim() : null;
+  return raw !== null && NUMBER.test(raw) ? Number(raw) : null;
+}
+
+/**
+ * A number that may be written directly or as an indirect object, both of which PDF
+ * allows anywhere a number is expected.
+ *
+ * `{ value }` -- null when the key is simply absent, so the caller applies its own default
+ * -- or `{ reason }` when the key is there but its value cannot be established exactly.
+ * "Present but unreadable" is never quietly treated as absent: a `/DW` this cannot read is
+ * not a document that meant 1000.
+ */
+async function resolvedNumber(dictionary, key, resolve, reasons) {
+  const direct = directNumber(dictionary, key);
+  if (direct !== null) return Number.isFinite(direct) ? { value: direct } : { reason: reasons.invalid };
+  const indirect = reference(dictionary, key);
+  if (indirect) {
+    const object = await tryResolve(resolve, indirect);
+    if (!object) return { reason: reasons.unresolved };
+    const value = numberObjectValue(object);
+    return value === null ? { reason: reasons.invalid } : { value };
+  }
+  if (hasKey(dictionary, key)) return { reason: reasons.invalid };
+  return { value: null };
+}
+
+/**
+ * A width array that may be written directly or as an indirect object -- the shape real
+ * PDF writers produce for anything long, and the one v0.4.1 refused outright.
+ *
+ * `{ text }` (null when the key is absent) or `{ reason }`. The array's *contents* are
+ * still read by the same numeric parsing as a direct one: resolving the object only says
+ * where the numbers are, never what they are.
+ */
+async function resolvedArrayText(dictionary, key, resolve, reasons) {
+  const direct = directArrayText(dictionary, key);
+  if (direct !== null) return { text: direct };
+  const indirect = reference(dictionary, key);
+  if (indirect) {
+    const object = await tryResolve(resolve, indirect);
+    if (!object) return { reason: reasons.unresolved };
+    const text = arrayObjectText(object);
+    return text === null ? { reason: "invalid-width-array" } : { text };
+  }
+  // Present, but neither a direct array nor a reference: malformed, not absent.
+  if (hasKey(dictionary, key)) return { reason: "invalid-width-array" };
+  return { text: null };
+}
+
 /** The tokens of an array of numbers and nested arrays, or null if it holds anything else. */
 function numericTokens(text) {
   if (!/^[\s\d+\-.[\]]*$/.test(text)) return null;
   return text.match(/\[|\]|[+-]?(?:\d+\.?\d*|\.\d+)/g) ?? [];
 }
 
-/** `/Widths` as a plain array of numbers, or null when it is not one. */
-function widthArray(dictionary) {
-  const text = directArrayText(dictionary, "Widths");
-  if (text === null) return null;
+/** A `/Widths` array's text as a plain array of numbers, or null when it is not one. */
+function widthArray(text) {
   const tokens = numericTokens(text);
   if (!tokens || tokens.some((token) => !NUMBER.test(token))) return null;
   return tokens.map(Number);
 }
 
 /**
- * `/W` as CID -> width. Both forms of the spec's grammar are read: `c [w1 w2 ...]` gives
- * consecutive CIDs from `c`, and `c_first c_last w` gives one width to a whole range.
- * Returns null on anything that does not parse as exactly that, so a `/W` this does not
- * understand refuses the replacement instead of silently falling back to `/DW`.
+ * A `/W` array's text as CID -> width. Both forms of the spec's grammar are read:
+ * `c [w1 w2 ...]` gives consecutive CIDs from `c`, and `c_first c_last w` gives one width
+ * to a whole range. Returns null on anything that does not parse as exactly that, so a
+ * `/W` this does not understand refuses the replacement instead of silently falling back
+ * to `/DW`.
  */
-function cidWidths(dictionary) {
-  const text = directArrayText(dictionary, "W");
-  if (text === null) return new Map();
+function cidWidths(text) {
   const tokens = numericTokens(text);
   if (!tokens) return null;
   const widths = new Map();
@@ -117,71 +256,146 @@ function cidWidths(dictionary) {
 }
 
 /**
- * How wide, in glyph-space units, each code of this font is -- or null when that cannot be
+ * Whether this Type0's `/Encoding` makes a character code equal to a CID -- the only case
+ * where `/W` can be looked up with the bytes of the operand.
+ *
+ * `/Identity-H` does, written directly or as an indirect name object. Nothing else is
+ * accepted: a predefined CMap (`/UniJIS-UCS2-H`, `/90ms-RKSJ-H`, ...) is not in the file
+ * at all, and an embedded CMap stream would have to be parsed. A width looked up under
+ * the wrong CID is a wrong width, so both are refused with a reason that says which.
+ */
+async function identityEncoding(fontDictionary, resolve) {
+  const named = /\/Encoding\s*\/([^\s/<>[\]()]+)/.exec(fontDictionary);
+  if (named) return named[1] === "Identity-H" ? null : refuse("non-identity-encoding", `/Encoding /${named[1]}`);
+  const indirect = reference(fontDictionary, "Encoding");
+  if (!indirect) return refuse("missing-encoding");
+  const object = await tryResolve(resolve, indirect);
+  if (!object) return refuse("encoding-unresolved", `/Encoding ${indirect.number} ${indirect.generation} R`);
+  // A CMap is a stream, so it resolves to an object with a dictionary of its own.
+  if (object.dictionary) return refuse("embedded-cmap-encoding", `/Encoding ${indirect.number} ${indirect.generation} R`);
+  const raw = typeof object.rawValue === "string" ? object.rawValue.trim() : null;
+  if (raw === "/Identity-H") return null;
+  if (raw && raw.startsWith("/")) return refuse("non-identity-encoding", raw);
+  return refuse("encoding-unresolved", `/Encoding ${indirect.number} ${indirect.generation} R`);
+}
+
+/**
+ * The descendant CIDFont's own dictionary, as `{ dictionary }`, or a refusal saying why it
+ * could not be reached. `/DescendantFonts` is an array of exactly one font (PDF 9.7.6.2);
+ * the array itself may be written indirectly, which is followed once and no further -- this
+ * resolves the structure a real file states, it does not evaluate arbitrary object graphs.
+ *
+ * Exported so diagnoseFontMetrics() in pdf-document.js reaches the descendant by exactly
+ * the same path the measurement does: a diagnosis that stopped a hop short of the real
+ * CIDFont would describe a font this can measure as if it stated no widths.
+ */
+export async function resolveDescendantFont(fontDictionary, resolve) {
+  const [target] = parseReferenceArray(fontDictionary, "DescendantFonts");
+  if (!target) return refuse("descendant-font-missing");
+  const unresolved = () => refuse("descendant-font-unresolved", `${target.number} ${target.generation} R`);
+  const object = await tryResolve(resolve, target);
+  if (!object) return unresolved();
+  if (object.dictionary) return { dictionary: object.dictionary };
+  const inner = arrayObjectText(object);
+  const nested = inner === null ? null : /^\s*(\d+)\s+(\d+)\s+R\s*$/.exec(inner);
+  if (!nested) return unresolved();
+  const font = await tryResolve(resolve, { number: Number(nested[1]), generation: Number(nested[2]) });
+  return font?.dictionary ? { dictionary: font.dictionary } : unresolved();
+}
+
+async function type0Widths(fontDictionary, resolve) {
+  const encoding = await identityEncoding(fontDictionary, resolve);
+  if (encoding) return encoding;
+  const descendant = await resolveDescendantFont(fontDictionary, resolve);
+  if (descendant.reason) return descendant;
+  if (!/\/Subtype\s*\/CIDFontType[02]\b/.test(descendant.dictionary)) {
+    return refuse("unsupported-cid-font", /\/Subtype\s*\/([^\s/<>[\]()]+)/.exec(descendant.dictionary)?.[0] ?? null);
+  }
+  const array = await resolvedArrayText(descendant.dictionary, "W", resolve, { unresolved: "w-unresolved" });
+  if (array.reason) return refuse(array.reason);
+  const widths = array.text === null ? new Map() : cidWidths(array.text);
+  if (!widths) return refuse("invalid-width-array", "/W");
+  const defaultWidth = await resolvedNumber(descendant.dictionary, "DW", resolve, {
+    unresolved: "invalid-default-width",
+    invalid: "invalid-default-width"
+  });
+  if (defaultWidth.reason) return refuse(defaultWidth.reason, "/DW");
+  const fallbackWidth = defaultWidth.value ?? DEFAULT_CID_WIDTH;
+  return { metrics: { codeBytes: 2, widthOf: (code) => widths.get(code) ?? fallbackWidth }, reason: null, detail: null };
+}
+
+async function simpleFontWidths(fontDictionary, resolve) {
+  const array = await resolvedArrayText(fontDictionary, "Widths", resolve, { unresolved: "widths-unresolved" });
+  if (array.reason) return refuse(array.reason);
+  if (array.text === null) return refuse("missing-widths");
+  const widths = widthArray(array.text);
+  if (!widths) return refuse("invalid-width-array", "/Widths");
+  const first = await resolvedNumber(fontDictionary, "FirstChar", resolve, {
+    unresolved: "invalid-first-char",
+    invalid: "invalid-first-char"
+  });
+  if (first.reason) return refuse(first.reason, "/FirstChar");
+  if (first.value === null) return refuse("missing-first-char");
+  const firstChar = first.value;
+  if (!Number.isInteger(firstChar) || firstChar < 0) return refuse("invalid-first-char", "/FirstChar");
+  let missingWidth = 0;
+  const descriptorReference = reference(fontDictionary, "FontDescriptor");
+  if (descriptorReference) {
+    const descriptor = await tryResolve(resolve, descriptorReference);
+    if (!descriptor) return refuse("font-descriptor-unresolved", `${descriptorReference.number} ${descriptorReference.generation} R`);
+    const stated = await resolvedNumber(descriptor.dictionary, "MissingWidth", resolve, {
+      unresolved: "invalid-missing-width",
+      invalid: "invalid-missing-width"
+    });
+    if (stated.reason) return refuse(stated.reason, "/MissingWidth");
+    missingWidth = stated.value ?? 0;
+  }
+  return {
+    metrics: {
+      codeBytes: 1,
+      widthOf: (code) => {
+        const width = widths[code - firstChar];
+        return code >= firstChar && width !== undefined ? width : missingWidth;
+      }
+    },
+    reason: null,
+    detail: null
+  };
+}
+
+/**
+ * How wide, in glyph-space units, each code of this font is -- or why that cannot be
  * established exactly.
  *
- * Returns `{ codeBytes, widthOf }`: how many bytes one code takes in a string operand, and
- * the width of a given code. `resolve(reference)` is the caller's object resolver (see
- * loadFontMaps() in pdf-document.js), used for the descendant font of a Type0 and for a
- * simple font's `/FontDescriptor`.
+ * Returns `{ metrics, reason, detail }`. `metrics` is `{ codeBytes, widthOf }`: how many
+ * bytes one code takes in a string operand, and the width of a given code. It is null
+ * exactly when `reason` is set (one of FONT_METRICS_REASONS above), and then the caller
+ * refuses the replacement rather than estimating a width. `resolve(reference)` is the
+ * caller's object resolver (see loadFontMaps() in pdf-document.js).
  *
  * Supported, because they are the cases where the mapping from operand bytes to widths is
  * exact and needs nothing this engine does not already read:
  *
- * - a simple font (`/Type1`, `/TrueType`, `/MMType1`) with a direct `/Widths` array: one
- *   byte per code, `/FirstChar` says where the array starts, and `/MissingWidth` (default
- *   0) covers the rest.
+ * - a simple font (`/Type1`, `/TrueType`, `/MMType1`) with a `/Widths` array: one byte per
+ *   code, `/FirstChar` says where the array starts, and `/MissingWidth` (default 0) covers
+ *   the rest.
  * - a Type0 font with `/Encoding /Identity-H`, whose descendant is a CIDFont: two bytes
  *   per code and the code *is* the CID, so `/W` and `/DW` apply directly.
  *
+ * In both, the array and the numbers around it may be direct or indirect objects.
+ *
  * Everything else -- a standard-14 font with no `/Widths`, a Type 3 font (its `/FontMatrix`
- * is its own glyph space), a predefined or embedded CMap that maps codes to CIDs some other
- * way, an indirect `/Widths` or `/W` -- is null. There is no fallback to "probably 1000".
+ * is its own glyph space), a predefined or embedded CMap that maps codes to CIDs some
+ * other way, an object that cannot be resolved or is not an array of numbers -- has no
+ * metrics. There is no fallback to "probably 1000".
  */
-export async function loadFontWidths(fontDictionary, resolve) {
-  if (/\/Subtype\s*\/Type0\b/.test(fontDictionary)) {
-    // Only /Identity-H makes the code equal the CID. Any other CMap needs the CMap itself
-    // to map codes to CIDs, and a width looked up under the wrong CID is a wrong width.
-    if (!/\/Encoding\s*\/Identity-H\b/.test(fontDictionary)) return null;
-    const [descendantReference] = parseReferenceArray(fontDictionary, "DescendantFonts");
-    if (!descendantReference) return null;
-    let descendant;
-    try {
-      descendant = await resolve(descendantReference);
-    } catch {
-      return null;
-    }
-    if (!/\/Subtype\s*\/CIDFontType[02]\b/.test(descendant.dictionary)) return null;
-    if (reference(descendant.dictionary, "W")) return null;
-    const widths = cidWidths(descendant.dictionary);
-    if (!widths) return null;
-    const defaultWidth = directNumber(descendant.dictionary, "DW") ?? DEFAULT_CID_WIDTH;
-    if (!Number.isFinite(defaultWidth)) return null;
-    return { codeBytes: 2, widthOf: (code) => widths.get(code) ?? defaultWidth };
+export async function describeFontWidths(fontDictionary, resolve) {
+  if (/\/Subtype\s*\/Type0\b/.test(fontDictionary)) return type0Widths(fontDictionary, resolve);
+  if (/\/Subtype\s*\/Type3\b/.test(fontDictionary)) return refuse("unsupported-type3", "/Subtype /Type3");
+  if (!/\/Subtype\s*\/(?:Type1|TrueType|MMType1)\b/.test(fontDictionary)) {
+    return refuse("unsupported-font-subtype", /\/Subtype\s*\/([^\s/<>[\]()]+)/.exec(fontDictionary)?.[0] ?? null);
   }
-  if (!/\/Subtype\s*\/(?:Type1|TrueType|MMType1)\b/.test(fontDictionary)) return null;
-  if (reference(fontDictionary, "Widths")) return null;
-  const widths = widthArray(fontDictionary);
-  if (!widths) return null;
-  const firstChar = directNumber(fontDictionary, "FirstChar");
-  if (!Number.isInteger(firstChar) || firstChar < 0) return null;
-  let missingWidth = 0;
-  const descriptorReference = reference(fontDictionary, "FontDescriptor");
-  if (descriptorReference) {
-    try {
-      missingWidth = directNumber((await resolve(descriptorReference)).dictionary, "MissingWidth") ?? 0;
-    } catch {
-      return null;
-    }
-  }
-  if (!Number.isFinite(missingWidth)) return null;
-  return {
-    codeBytes: 1,
-    widthOf: (code) => {
-      const width = widths[code - firstChar];
-      return code >= firstChar && width !== undefined ? width : missingWidth;
-    }
-  };
+  return simpleFontWidths(fontDictionary, resolve);
 }
 
 /**

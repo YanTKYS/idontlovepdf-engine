@@ -155,6 +155,57 @@ export type TextMatchReplacementObstacle =
   /** The match's runs are not attached to each other in a shape this version knows. */
   | "unsupported-topology";
 
+/**
+ * Why a font's glyph widths could not be established exactly. Secondary detail alongside
+ * `FALLBACK_FONT_METRICS_UNAVAILABLE`, for diagnosing a document that refuses a
+ * replacement; it names the structure and never the document's content. Treat it as
+ * developer detail rather than a stable contract: the set grows as more structures are
+ * read exactly, and a caller should key its behaviour off the `code`.
+ */
+export type FontMetricsObstacle =
+  /** Not a font kind whose widths this reads (not Type0, Type1, TrueType or MMType1). */
+  | "unsupported-font-subtype"
+  /** A Type 3 font: its widths are in its own glyph space, via /FontMatrix. */
+  | "unsupported-type3"
+  /** A Type0 whose /Encoding is a CMap other than /Identity-H, so a code is not a CID. */
+  | "non-identity-encoding"
+  /** A Type0 whose /Encoding is an embedded CMap stream, which this does not parse. */
+  | "embedded-cmap-encoding"
+  /** A Type0 with no /Encoding at all. */
+  | "missing-encoding"
+  /** A Type0 whose indirect /Encoding object could not be read. */
+  | "encoding-unresolved"
+  /** A Type0 with no /DescendantFonts entry. */
+  | "descendant-font-missing"
+  /** The descendant font object could not be resolved. */
+  | "descendant-font-unresolved"
+  /** The descendant font is not a CIDFontType0 or CIDFontType2. */
+  | "unsupported-cid-font"
+  /** An indirect /W whose object could not be resolved. */
+  | "w-unresolved"
+  /** An indirect /Widths whose object could not be resolved. */
+  | "widths-unresolved"
+  /** A /W or /Widths that is not an array of numbers. */
+  | "invalid-width-array"
+  /** A simple font that states no /Widths at all. */
+  | "missing-widths"
+  /** A simple font with no /FirstChar, so its /Widths cannot be indexed. */
+  | "missing-first-char"
+  /** A /FirstChar that is not a non-negative integer. */
+  | "invalid-first-char"
+  /** A /DW that is present but is not a finite number. */
+  | "invalid-default-width"
+  /** A /MissingWidth that is present but is not a finite number. */
+  | "invalid-missing-width"
+  /** An indirect /FontDescriptor whose object could not be resolved. */
+  | "font-descriptor-unresolved"
+  /** The character codes the match is drawn with could not be recovered from its operand. */
+  | "operand-codes-unrecoverable"
+  /** The font states no width for some code the match is drawn with. */
+  | "code-width-unavailable"
+  /** The width the match occupies cannot be written back exactly as a TJ adjustment. */
+  | "adjustment-not-representable";
+
 /** What checkTextMatchReplacement() reports. */
 export type TextMatchReplacementCheck =
   | { readonly allowed: true; readonly mode: TextMatchReplacementMode }
@@ -163,7 +214,7 @@ export type TextMatchReplacementCheck =
       readonly mode: null;
       readonly code: PdfTextEditorErrorCode;
       readonly reason: string;
-      readonly unsafeReason?: TextMatchReplacementObstacle;
+      readonly unsafeReason?: TextMatchReplacementObstacle | FontMetricsObstacle;
       /**
        * The characters no available font can write, for a FONT_ENCODING_UNSUPPORTED or
        * FALLBACK_FONT_MISSING_GLYPH refusal. Present so a caller can name them to a user
