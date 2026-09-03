@@ -2,6 +2,39 @@
 
 各versionのリリース内容を新しい順に記載します。H2見出しには、`v`付きversionとGitHub Releaseのtitleを記載します。
 
+## v0.4.1 - Fallback font for text drawn by TJ
+
+- **`TJ` 配列で描画された文字にも fallback font を適用できるようになりました。** v0.4.0 の fallback は実質 `Tj` 限定で、`TJ` は一律 `FALLBACK_OPERATOR_UNSUPPORTED` で拒否していました。`TJ` は一般的な PDF で普通に現れるため、`[(令和) -50 (8年度)] TJ` のような箇所で `令和 → しょ` が成立しないことが実用上の制約になっていました
+- **対応の第一目標は「後続文字の開始位置が置換前と一致すること」です。** `TJ` を `Tj` へ単純変換したり、見た目が合うことを期待したりはしません。安全性を証明できる範囲だけ許可し、それ以外は従来どおり fail closed で拒否します
+- **方式。** match が含まれる `[` から最後の `TJ` までを 1 つの要素列（string と字送り数値の並び）として読み、次の形へ組み替えます。隣接する `TJ` operator の境界そのものは描画に影響しないため、`[(令) 120] TJ [(和)] TJ` と `[(令) 120 (和)] TJ` は同じ列として扱われます
+
+  ```text
+  置換前: [(令和) -50 (8年度)] TJ
+  置換後: /ILPFallback 36 Tf [<しょ>] TJ /FJP 36 Tf [50 -50 (8年度)] TJ
+  ```
+
+- **match の外にある要素は元の byte をそのまま複製します。** 数値の再フォーマット・並べ替え・統合・欠落・重複は起きず、`0` / `+0` / `-0` / `0.0` も書かれたとおりに残ります。engine が新しく書くのは補正用の adjustment 1 つだけです
+- **補正値は計測して求めます。** PDF の字送りは `tx = ((w0 - Tj/1000) * Tfs + Tc + Tw) * Th` であり、glyph 幅と `TJ` adjustment はどちらも `Tfs * Th` 倍されるため、両者を等値に置く式から **font size と horizontal scaling が消えます**。残るのは glyph space（1/1000 em）同士の比較で、書くべき値は `n = 置換文字列の合計幅 - 元 match の合計幅 + match 内部にあった adjustment の合計` になります
+  - 元の幅は **その PDF 自身の `/Widths`（simple font）または `/W`・`/DW`（CID font）** から取ります。PDF reader が実際に位置決めに使う数値です。埋め込み font program の `hmtx` は見ません
+  - 置換後の幅は **埋め込む fallback font の `/W` に実際に書き込む値** から取ります。両者が同じ丸めを共有するよう、値を計算する関数を 1 つにしています
+  - 「日本語はだいたい全角だから同じ幅だろう」という仮定は使いません。テスト fixture の font も意図的に等幅にしていません（和 = 950、8 = 500）
+- **`Tc` / `Tw` の項は相殺を仮定せず、条件として課します。** `Tc` が 0 でない場合は置換後の glyph 数が元と同じときだけ許可します（`FALLBACK_CHAR_SPACING_UNSUPPORTED`）。`Tw` は 1 バイトの文字コード 32 にしか効かないため、match が 1 バイトのスペースを含み `Tw` が有効な場合は拒否します（`FALLBACK_WORD_SPACING_UNSUPPORTED`）。`q`/`Q` や `"` で値を追跡できない場合は 0 とみなさず拒否します
+- **match の終端から何も描画されない場合**（match が列の末尾で、直後が `ET` / `BT` / `Td` / `TD` / `Tm` / `T*`）は adjustment 自体が不要なので書かず、font metrics も要求しません。v0.4.0 の `Tj` と同じ扱いです
+- **新しい `mode` は増やしていません。** `TJ` で描画された match も `fallback-font` / `fallback-font-partial` / `fallback-font-multi-run` を返します。`TJ` かどうかを利用側が知る必要はなく、公開 API の形も変わりません
+- **拒否理由に対応した `code` を返します。** `TJ` 自体は対応 operator になったため、一律の `FALLBACK_OPERATOR_UNSUPPORTED` は返しません
+  - `FALLBACK_FONT_METRICS_UNAVAILABLE`（新規）: 元 font の glyph 幅を正確に読み取れない（`/Widths` も `/W`・`/DW` も無い、`/Encoding` が `/Identity-H` 以外で code から CID を決められない、Type 3 font、幅が間接参照で解決できない）
+  - `FALLBACK_CHAR_SPACING_UNSUPPORTED`（新規）: `Tc` が有効で、置換後の glyph 数が元と異なる
+  - `FALLBACK_WORD_SPACING_UNSUPPORTED`・`FALLBACK_MULTI_RUN_UNSUPPORTED`・`FALLBACK_LAYOUT_UNSUPPORTED`・`FALLBACK_WRITING_MODE_UNSUPPORTED` は既存 code を再利用します
+  - `FALLBACK_OPERATOR_UNSUPPORTED` は `'` / `"`、および match が `Tj` と `TJ` にまたがる場合に限定しました
+- **`'` / `"` は対象外のままです。** 描画前に改行を伴うため、`TJ` 対応に合わせて広げてはいません
+- **`FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE` の考え方は弱めていません。** `Tj` の判定は v0.4.0 のままで、`TJ` については「後続位置を正確に維持できることを証明できたため許可範囲が増えた」という形の変更です
+- **検証。** `test/fallback-font-tj.test.js` は PDF の字送り式を **engine とは独立に実装した simulator** を持ち、保存後の PDF から両 font の `/W` を読み直したうえで、置換前後の各 glyph の描画 x 座標を突き合わせます。目視やスクリーンショットではなく数値の一致で確認しています。`test/browser/fallback-font.test.js` には `TJ` 置換後の PDF を **Chromium 内蔵の PDF viewer** で開く検証を追加しました
+- **安全性を証明できない fixture も用意しています。** font metrics を取得できない、writing mode 不明、対象範囲をまたぐ text state 変更などのケースで `checkTextMatchReplacement()` が `allowed: false` を返し、`replaceTextMatch()` が同じ `code` で失敗し、PDF が 1 バイトも変わらないことを確認しています
+- **段落の reflow・行の折り返し・再レイアウトは行いません。** 目的は「既存 PDF が指定している後続文字位置を維持したまま、限定的に fallback font で文字を差し替える」ことです。**「`TJ` に対応したので任意の PDF を編集できる」わけではありません**
+- 依存ライブラリは増やしていません。font metrics は PDF 自身の辞書から読み、fallback font 側は既存の opentype.js の解析結果を使います
+- ファイルサイズへの影響は v0.4.0 と同じです（fallback を使う保存で font 1 本ぶん、以降の保存は数 KB）。`TJ` 対応で増えるのは adjustment 1 つぶんの数バイトです。browser bundle は約 488KB → 約 506KB になりました
+- v0.4.0 までの挙動を維持: `Tj` fallback、partial-run、multi-run、既存 font だけで書ける通常置換、same-length multi-run、削除、`variable-length-safe`、fallback を使わない PDF への font 非埋め込み、重複埋め込み防止、ToUnicode 更新、save → reopen、`/P` permission、暗号化 PDF の制約、HTTP 環境（Web Crypto なし）対応、opaque match ID、`MATCH_STALE` / `UNKNOWN_MATCH`、check と replace の判定一致、atomic な置換
+
 ## v0.4.0 - Fallback Japanese font
 
 - **元PDFの既存fontに存在しない文字へ置換できるようになりました。** PDFの埋め込みfontは通常subset化されており、`/ToUnicode` にはその文書が実際に使った文字しか載りません。そのため v0.3.0 までは `令和 → しょうわ` のような置換が `FONT_ENCODING_UNSUPPORTED` で失敗していました

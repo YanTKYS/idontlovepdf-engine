@@ -53,21 +53,42 @@ export type PdfTextEditorErrorCode =
   | "FALLBACK_FONT_INVALID"
   /** The fallback font has no glyph for some character of the replacement either. */
   | "FALLBACK_FONT_MISSING_GLYPH"
-  /** The match is drawn by `TJ`, `'` or `"`, which the fallback font is not written with. */
+  /**
+   * The match is drawn by `'` or `"` -- which move to the next line before drawing -- or is
+   * split between a `Tj` and a `TJ`. `Tj` and `TJ` are each written; neither rewrite covers
+   * a line move, and a match spanning both would have to be both rewrites at once.
+   */
   | "FALLBACK_OPERATOR_UNSUPPORTED"
   /**
-   * Text is drawn from where the match ends. The fallback font's characters are not the
-   * widths the document's own font used, so that text would move.
+   * Text is drawn from where a `Tj`-drawn match ends. The fallback font's characters are not
+   * the widths the document's own font used, so that text would move. (A `TJ`-drawn match
+   * instead writes an adjustment that puts the following text back exactly -- see
+   * FALLBACK_FONT_METRICS_UNAVAILABLE for when even that cannot be done.)
    */
   | "FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE"
+  /**
+   * Text is drawn after a `TJ`-drawn match, so the width the match occupied has to be
+   * measured to keep that text where it is -- and this document does not state that font's
+   * glyph widths in a form the engine can read exactly. Nothing is estimated, so the
+   * replacement is refused.
+   */
+  | "FALLBACK_FONT_METRICS_UNAVAILABLE"
+  /**
+   * Character spacing (`Tc`) is in force where a `TJ`-drawn match sits, and the replacement
+   * would draw a different number of glyphs -- so the text after it would move by the
+   * difference in spacing, which a `TJ` adjustment cannot express exactly at every font
+   * size. A replacement drawing the same number of glyphs is written normally.
+   */
+  | "FALLBACK_CHAR_SPACING_UNSUPPORTED"
   /** The match's runs are not simply adjacent, so they cannot be redrawn as one piece. */
   | "FALLBACK_MULTI_RUN_UNSUPPORTED"
   /** The page's structure leaves nowhere safe to put, or to reach, the fallback font. */
   | "FALLBACK_LAYOUT_UNSUPPORTED"
   /**
-   * Word spacing (`Tw`) is in force and the replacement contains a space. `Tw` reaches
-   * single-byte code 32 only, so text written through the fallback font would not be
-   * spaced the way the document's other spaces are.
+   * Word spacing (`Tw`) is in force and the replacement contains a space -- or a `TJ`-drawn
+   * match removes a single-byte space. `Tw` reaches single-byte code 32 only, so text
+   * written through the fallback font would neither be spaced the way the document's other
+   * spaces are nor occupy the width the removed space did.
    */
   | "FALLBACK_WORD_SPACING_UNSUPPORTED"
   /**
@@ -108,6 +129,13 @@ export type TextMatchReplacementMode =
   | "fallback-font-partial"
   /** A match spanning several runs, redrawn as one piece in the fallback font. */
   | "fallback-font-multi-run";
+
+/*
+ * The three fallback modes describe what was replaced, not which operator drew it: a match
+ * drawn by `TJ` is reported with the same modes as one drawn by `Tj`. Whether the engine
+ * had to write a `TJ` adjustment to hold the following text in place is its own business,
+ * and deliberately not part of this API.
+ */
 
 /**
  * Why a length-changing multi-run replacement could not be written safely. Secondary

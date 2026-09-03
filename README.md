@@ -2,7 +2,7 @@
 
 既存 PDF の content stream にあるテキスト表示オペランドを、ブラウザ内だけで置換する PDF 処理エンジンです。Apryse WebViewer や Foxit PDF SDK for Web が提供する「既存本文編集」のうち、最小限の置換処理を、サーバー送信・外部 API・実行時依存パッケージなしで実現します。
 
-> **スコープ:** PDF の文字列は、見た目の文章ではなく、フォント固有の文字コードと描画命令です。本エンジンはレイアウトを再構成せず、既存の `Tj`、`TJ`、`'`、`"` の文字列オペランドを置換します。行の折返し、字間調整、フォント埋込みは行いません。**任意の PDF を完全に編集できることを保証するものではありません。** 暗号化 PDF は認証・復号・検索まで対応しますが、**暗号化 PDF への変更の再保存（再暗号化）は未対応**です。複数の text run にまたがる一致で置換前後の文字数が変わる場合は、**engine が安全性を証明できる構造に限って**対応し、それ以外は拒否します（理由と対応範囲は [`replaceTextMatch()`](#await-editorreplacetextmatchmatchid-replacement) を参照）。
+> **スコープ:** PDF の文字列は、見た目の文章ではなく、フォント固有の文字コードと描画命令です。本エンジンはレイアウトを再構成せず、既存の `Tj`、`TJ`、`'`、`"` の文字列オペランドを置換します。行の折返し、段落の再流し込み、ページ全体の再レイアウトは行いません。元 PDF の font で書けない文字は、呼び出し側が渡した fallback font を埋め込んで描画できます（`Tj` は v0.4.0、`TJ` は v0.4.1 から。いずれも**後続文字の位置を維持できることを証明できる範囲に限り**対応し、それ以外は拒否します）。**任意の PDF を完全に編集できることを保証するものではありません。** 暗号化 PDF は認証・復号・検索まで対応しますが、**暗号化 PDF への変更の再保存（再暗号化）は未対応**です。複数の text run にまたがる一致で置換前後の文字数が変わる場合は、**engine が安全性を証明できる構造に限って**対応し、それ以外は拒否します（理由と対応範囲は [`replaceTextMatch()`](#await-editorreplacetextmatchmatchid-replacement) を参照）。
 
 ## 目的・位置付け
 
@@ -167,13 +167,67 @@ await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font �
 
 #### fallback font で置換できる構造
 
-いずれも対象が `Tj` で描画されており、かつ **match の終端位置から他のテキストが描画されない**（直後が `ET` / `BT`、または `Td` / `TD` / `Tm` / `T*` で位置が設定し直される）場合に限ります。fallback font の文字幅は元 font と同じではないため、そこから続けて描画されるテキストがあると動いてしまうためです。
+`mode` は「何を置換したか」を表します。`Tj` で描画されていても `TJ` で描画されていても同じ `mode` を返します（どちらで描画されているかを利用側が知る必要はありません）。
 
 | `mode` | 内容 |
 | --- | --- |
 | `fallback-font` | run 全体の置換。**文字数が変わっても可** |
 | `fallback-font-partial` | run の一部だけを置換し、前後は元 font のまま維持（`申請は令和です → 申請はしょうわです`） |
-| `fallback-font-multi-run` | 複数 run にまたがる match を 1 つとして描画。隣接判定は `variable-length-safe` と同じ規則です |
+| `fallback-font-multi-run` | 複数 run にまたがる match を 1 つとして描画 |
+
+対応可能かどうかは、描画している operator によって条件が異なります。
+
+**`Tj` で描画されている場合**（v0.4.0 から変更なし）
+
+**match の終端位置から他のテキストが描画されない**（直後が `ET` / `BT`、または `Td` / `TD` / `Tm` / `T*` で位置が設定し直される）場合に限ります。fallback font の文字幅は元 font と同じではないため、そこから続けて描画されるテキストがあると動いてしまうためです。複数 run にまたがる場合の隣接判定は `variable-length-safe` と同じ規則です。
+
+**`TJ` で描画されている場合**（v0.4.1 で追加）
+
+v0.4.0 では `TJ` は一律 `FALLBACK_OPERATOR_UNSUPPORTED` で拒否していました。v0.4.1 では、**後続文字の開始位置が置換前と完全に一致することを証明できる範囲に限り**対応します。
+
+`TJ` は「文字列と字送り数値の並び」を順に処理する operator で、隣接する `TJ` operator の境界そのものは何もしません。そのため match が含まれる `[` から最後の `TJ` までを 1 つの列として扱い、次の形へ組み替えます。
+
+```text
+置換前: [(令和) -50 (8年度)] TJ
+置換後: /ILPFallback 36 Tf [<しょ>] TJ /FJP 36 Tf [50 -50 (8年度)] TJ
+```
+
+match の外にある要素（`-50` や前後の string operand）は**元の byte をそのまま複製**します。数値の再フォーマット・並べ替え・統合・欠落・重複は起きず、`0` / `+0` / `-0` / `0.0` も書かれたとおりに残ります。engine が新しく書くのは先頭の 1 つの adjustment（上の `50`）だけです。
+
+その値は推測ではなく計算で求めます。PDF の字送りは
+
+```text
+tx = ((w0 - Tj/1000) * Tfs + Tc + Tw) * Th
+```
+
+であり、glyph 幅 `w0` と adjustment `Tj` はどちらも `Tfs * Th` 倍されるため、両者を等しく置く式から **font size と horizontal scaling は消えます**。残るのは glyph space（1/1000 em）同士の比較で、書くべき adjustment は
+
+```text
+n = (置換文字列の合計幅) - (元の match の合計幅) + (match 内部にあった adjustment の合計)
+```
+
+になります。元の幅は**その PDF 自身の `/Widths`（simple font）または `/W`・`/DW`（CID font）**から、置換後の幅は**埋め込む fallback font の `/W` に実際に書き込む値**から取ります。どちらも PDF reader が実際に位置決めに使う数値です。「日本語だからどれも全角」のような仮定は使いません。
+
+上の式が成立するには `Tc` と `Tw` の項が相殺する必要があり、これは仮定せず条件として課します。
+
+- `Tc`（character spacing）が 0 でない場合、**置換後の glyph 数が元と同じときだけ**許可します（`Tc` の項が相殺するため）。異なる場合は `FALLBACK_CHAR_SPACING_UNSUPPORTED` で拒否します
+- `Tw`（word spacing）は 1 バイトの文字コード 32 にしか効かず、fallback font は 2 バイト符号化なので置換側には効きません。match が 1 バイトのスペースを含み、かつ `Tw` が有効な場合は `FALLBACK_WORD_SPACING_UNSUPPORTED` で拒否します
+- `Tc` / `Tw` の値が追跡できない場合（対応する `q` のない `Q`、`"` operator など）は 0 とみなさず拒否します
+
+match の終端から**何も描画されない**場合（match が列の末尾で、直後が `ET` / `BT` / `Td` / `TD` / `Tm` / `T*`）は adjustment 自体が不要なので書きません。この場合は font metrics も必要ありません（`Tj` と同じ扱いです）。
+
+`TJ` でも次の場合は**引き続き拒否**します。
+
+- 元 font の glyph 幅を正確に読み取れない（`/Widths` も `/W`・`/DW` も無い、`/Encoding` が `/Identity-H` 以外で code から CID を決められない、Type 3 font、幅が間接参照で解決できない）→ `FALLBACK_FONT_METRICS_UNAVAILABLE`
+- 上記の `Tc` / `Tw` の条件を満たさない → `FALLBACK_CHAR_SPACING_UNSUPPORTED` / `FALLBACK_WORD_SPACING_UNSUPPORTED`
+- match の operand 間に `Tc` / `Tw` / `Tz` / `Tr` / 色指定 / marked content などがある（異なる text state で描画されているものを 1 つとして描き直すことになるため）→ `FALLBACK_MULTI_RUN_UNSUPPORTED`
+- 配列の外に数値が書かれている等、対象範囲を `[`・`]`・string・数値・`TJ` だけの列として読み切れない（配列外の数値は reader が字送りとして扱わないため、字送りとみなすと位置がずれる）→ `FALLBACK_LAYOUT_UNSUPPORTED`
+- 縦書き font / writing mode 不明 → `FALLBACK_WRITING_MODE_UNSUPPORTED`（v0.4.0 と同じ）
+- match が `Tj` と `TJ` にまたがる → `FALLBACK_OPERATOR_UNSUPPORTED`
+
+**`'` / `"` は対象外です**（`FALLBACK_OPERATOR_UNSUPPORTED`）。これらは描画前に改行を伴うため、いずれの組み替えでも扱えません。v0.4.1 で `TJ` に対応したこととは切り離しています。
+
+段落の再流し込み・行の折り返し・ページ全体の再レイアウトは行いません。目的は「元 PDF が指定している後続文字位置を維持したまま、限定的に fallback font で文字を差し替える」ことです。**「`TJ` に対応したので任意の PDF を編集できる」わけではありません。**
 
 **縦書き font** で描画されたテキストは置換できません（`FALLBACK_WRITING_MODE_UNSUPPORTED`）。fallback font は横書き（`/Identity-H`）で埋め込むためです。判定に使うのは font 自身の writing mode で、text matrix による回転は対象外です（回転した横書き font は置換できます）。
 
@@ -261,11 +315,13 @@ adjustment の合計は、その数値が**どこに書かれているかによ�
 | `MULTI_RUN_FONT_CHANGE_UNSUPPORTED` | 一致が複数 font にまたがる（検索側で font 変更を境界にしているため通常は発生しません） |
 | `FONT_ENCODING_UNSUPPORTED` | 既存 font にその文字の glyph がなく、fallback font も設定されていない。`characters` に該当文字が入ります |
 | `FALLBACK_FONT_MISSING_GLYPH` | fallback font にもその文字の glyph がない。`characters` に該当文字が入ります |
-| `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE` | match の終端位置から他のテキストが描画されるため、font を変えると位置が動く |
-| `FALLBACK_OPERATOR_UNSUPPORTED` | 対象が `TJ` / `'` / `"` で描画されている |
+| `FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE` | `Tj` で描画された match の終端位置から他のテキストが描画されるため、font を変えると位置が動く |
+| `FALLBACK_FONT_METRICS_UNAVAILABLE` | `TJ` で描画された match の後ろにテキストがあるが、元 font の glyph 幅を正確に読み取れないため後続位置を維持できない |
+| `FALLBACK_CHAR_SPACING_UNSUPPORTED` | `Tc` が有効な `TJ` で、置換後の glyph 数が元と異なるため後続位置を維持できない |
+| `FALLBACK_OPERATOR_UNSUPPORTED` | 対象が `'` / `"` で描画されている、または match が `Tj` と `TJ` にまたがっている |
 | `FALLBACK_MULTI_RUN_UNSUPPORTED` | 複数 run の match が単純に隣接していない |
 | `FALLBACK_LAYOUT_UNSUPPORTED` | ページ構造上、fallback font を安全に配置できない |
-| `FALLBACK_WORD_SPACING_UNSUPPORTED` | word spacing（`Tw`）が有効な箇所で、置換文字列に半角スペースが含まれる |
+| `FALLBACK_WORD_SPACING_UNSUPPORTED` | word spacing（`Tw`）が有効な箇所で、置換文字列に半角スペースが含まれる。または `TJ` で、match が 1 バイトのスペースを含む |
 | `FALLBACK_FONT_INVALID` | `setFallbackFont()` に TrueType font 以外が渡された |
 | `FALLBACK_WRITING_MODE_UNSUPPORTED` | 縦書き font（`/Identity-V`、`/WMode 1` 等）、または writing mode が判定できない font で描画されている |
 | `FALLBACK_EDIT_REQUIRES_SAVE` | 同じ editor で fallback 置換済みの箇所を再度編集しようとした。`save()` して開き直してください |
@@ -318,7 +374,7 @@ npm ci
 npm run build
 ```
 
-`scripts/build.js` が esbuild を実行し、`dist/idontlovepdf-engine.js` を生成します。`esbuild` は devDependency としてのみ使用し、生成物には含まれません（production/runtime 依存ではありません）。`opentype.js` と `@noble/hashes` は dependency で、bundle へ取り込まれます（この分、bundle は約 116KB から約 488KB になりました）。`npm test` は `pretest` npm script 経由でビルドを自動実行するため、`npm test` を一度実行すれば `dist/` は常に最新の状態になります。
+`scripts/build.js` が esbuild を実行し、`dist/idontlovepdf-engine.js` を生成します。`esbuild` は devDependency としてのみ使用し、生成物には含まれません（production/runtime 依存ではありません）。`opentype.js` と `@noble/hashes` は dependency で、bundle へ取り込まれます（この分、bundle は約 116KB から約 506KB になりました。v0.4.1 時点）。`npm test` は `pretest` npm script 経由でビルドを自動実行するため、`npm test` を一度実行すれば `dist/` は常に最新の状態になります。
 
 ### version 確認方法
 
@@ -369,7 +425,8 @@ Web Crypto API（`crypto.subtle`）は**あれば使う**位置づけで、必�
 
 - `npm run test:no-subtle` — process から Web Crypto を取り除いた状態で全testを実行します（CIでも通常実行と2回走ります）
 - `test/fallback-font-no-subtle.test.js` — `crypto.subtle` なしで `setFallbackFont()` → `令和 → しょうわ` → `save()` → 開き直しまでを検証します
-- `test/browser/fallback-font.test.js` — 同じ流れを、**配布bundleを読み込んだChromiumのページから `crypto.subtle` を取り除いた状態**で検証します
+- `test/browser/fallback-font.test.js` — 同じ流れを、**配布bundleを読み込んだChromiumのページから `crypto.subtle` を取り除いた状態**で検証します。`TJ` 置換後の PDF を Chromium 内蔵の PDF viewer で開く検証も含みます
+- `test/fallback-font-tj.test.js` — `TJ` で描画された match の fallback 置換。PDF の字送り式を **engine とは独立に実装した simulator** で、置換前後の各 glyph の描画 x 座標を突き合わせ、後続文字が動いていないことを機械的に検証します
 - `test/sha2.test.js` / `test/aes.test.js` — 両経路の出力を `node:crypto`（OpenSSL）と、および相互に照合します
 
 ## モジュール構成（公開API / 内部実装）
@@ -386,6 +443,7 @@ Web Crypto API（`crypto.subtle`）は**あれば使う**位置づけで、必�
 | `src/cmap.js` | `/ToUnicode` CMap の解析・エンコード/デコード | 内部 |
 | `src/sha2.js` | SHA-256/384/512（Web Cryptoがあればそれ、無ければ @noble/hashes） | 内部 |
 | `src/fallback-font.js` | fallback font の解析・PDF font object 生成（Type0/CIDFontType2/FontFile2/ToUnicode） | 内部 |
+| `src/font-metrics.js` | 元 PDF の font dictionary から glyph 幅（`/Widths`・`/W`・`/DW`）を読み取る。`TJ` 置換で後続位置を維持するための計測に使用 | 内部 |
 | `src/content-stream.js` | content stream 内のテキスト表示オペランド・dictionary operand の走査 | 内部 |
 | `src/encryption.js` | `/Encrypt` 辞書の診断（復号は行わない） | 内部 |
 | `src/pdf-dictionary-text.js` | 辞書 text 内の名前・文字列・真偽値・入れ子辞書の抽出 | 内部 |

@@ -273,9 +273,11 @@ test("finds and replaces every occurrence separately", { skip }, async () => {
 
 /* -------------------------------------------------------------- operators and limits */
 
-test("refuses every text-showing operator but Tj", { skip }, async () => {
+test("refuses ' and \", the text-showing operators that carry a line move", { skip }, async () => {
+  // `TJ` is written since v0.4.1 -- see test/fallback-font-tj.test.js, which covers it in
+  // full. `'` and `\"` move to the next line before drawing, which neither rewrite accounts
+  // for, and are deliberately not widened along with it.
   for (const [operators, operator] of [
-    [`[${glyphs("令和")}] TJ`, "TJ"],
     [`14 TL ${glyphs("令和")} '`, "'"],
     [`14 TL 0 0 ${glyphs("令和")} "`, '"']
   ]) {
@@ -286,6 +288,23 @@ test("refuses every text-showing operator but Tj", { skip }, async () => {
     assert.equal(refused.code, "FALLBACK_OPERATOR_UNSUPPORTED");
     assert.equal(editor.pendingObjects.size, 0);
   }
+  // A match half in a TJ and half in a Tj would have to be both rewrites at once.
+  const mixed = await editorFor(body(`[${glyphs("令")}] TJ ${glyphs("和")} Tj`));
+  const [match] = await mixed.searchText("令和");
+  const refused = await mixed.checkTextMatchReplacement(match.id, "しょうわ");
+  assert.equal(refused.code, "FALLBACK_OPERATOR_UNSUPPORTED");
+  assert.match(refused.reason, /mixes/);
+  assert.equal(mixed.pendingObjects.size, 0);
+});
+
+test("writes a TJ whose match ends the array with nothing drawn after it", { skip }, async () => {
+  // The v0.4.0 rule reached through a TJ: nothing is drawn from where the match ends, so no
+  // width arithmetic is needed and this document's font -- which states no widths at all --
+  // is no obstacle. The full TJ story is in test/fallback-font-tj.test.js.
+  const editor = await editorFor(body(`[${glyphs("令和")}] TJ`));
+  const { runs, reopened } = await replaceAndReopen(editor, "令和", "しょうわ", "fallback-font");
+  assert.deepEqual(runs, ["しょうわ"]);
+  assert.equal((await reopened.searchText("しょうわ")).length, 1);
 });
 
 /* ------------------------------- what a fallback rewrite means for the rest of the session */

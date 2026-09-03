@@ -58,6 +58,17 @@ export async function fingerprintFont(bytes) {
   return sha256Hex(bytes);
 }
 
+/**
+ * A glyph's advance in PDF glyph space -- exactly the number written into the `/W` array
+ * by buildFallbackFontObjects() below, and therefore exactly the number a reader will
+ * position the text with. Shared with the TJ fallback arithmetic in pdf-document.js, which
+ * has to predict that width before the font objects are built: computing it a second way
+ * there would let the rounding drift apart from what is actually embedded.
+ */
+export function glyphSpaceWidth(fallback, advanceWidth) {
+  return Math.round(((advanceWidth ?? fallback.unitsPerEm) * PDF_UNITS_PER_EM) / fallback.unitsPerEm);
+}
+
 const hex4 = (value) => value.toString(16).toUpperCase().padStart(4, "0");
 
 /** A ToUnicode destination: the character as UTF-16BE, which is what a bfchar holds. */
@@ -157,7 +168,7 @@ export async function buildFallbackFontObjects(fallback, numbers, glyphs, { prog
   const os2 = font.tables.os2 ?? {};
   const drawn = [...glyphs.entries()].sort((a, b) => a[0] - b[0]);
 
-  const widths = drawn.map(([glyphId, { advanceWidth }]) => `${glyphId} [${scale(advanceWidth)}]`).join(" ");
+  const widths = drawn.map(([glyphId, { advanceWidth }]) => `${glyphId} [${glyphSpaceWidth(fallback, advanceWidth)}]`).join(" ");
   const bfchar = [];
   for (let start = 0; start < drawn.length; start += MAX_BFCHAR_ENTRIES) {
     const group = drawn.slice(start, start + MAX_BFCHAR_ENTRIES);

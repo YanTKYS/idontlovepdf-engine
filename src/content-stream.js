@@ -323,12 +323,23 @@ export function scanTextRuns(bytes, context = "") {
   // is read as an operator's own operand -- specifically `Tf`'s size -- rather than as
   // spacing. Cleared by every operator, so it is only ever that operator's operand.
   let lastNumber = null;
+  // Byte offset of the most recent `[`, so a `TJ` can be rewritten as a whole operator --
+  // array brackets included -- rather than one operand at a time. Cleared by every
+  // operator, exactly like `lastName`, so it can only ever be that operator's own array
+  // (`[3 3] 0 d` sets it and `d` discards it again).
+  let arrayStart = null;
   // The text state's word spacing, which `Tw` sets and `q`/`Q` save and restore along with
   // the rest of the graphics state. Tracked because it applies only to single-byte code
   // 32: text redrawn through a 2-byte encoding would silently ignore a `Tw` the document's
   // own font obeys (see the fallback-font rules in pdf-document.js). null means "cannot be
   // sure" -- a `Q` with nothing saved, or a `"`, whose own operand sets it.
   let wordSpacing = 0;
+  // The text state's character spacing, which `Tc` sets and `q`/`Q` save and restore with
+  // the rest of the graphics state. Tracked for the same reason `Tw` is: it is added to
+  // every glyph's advance, so a rewrite that changes how many glyphs are shown changes the
+  // width by a multiple of it (see the TJ fallback arithmetic in pdf-document.js). null
+  // means "cannot be sure" -- a `Q` with nothing saved, or a `"`, whose own operand sets it.
+  let charSpacing = 0;
   const graphicsStack = [];
   // Two `BT ... ET` blocks in the same content stream are usually positioned
   // independently (a new `Td`/`Tm` moves the text cursor elsewhere on the page), so
@@ -382,6 +393,17 @@ export function scanTextRuns(bytes, context = "") {
       cursor = token.end;
       continue;
     }
+    // `[` and `]` are delimiters, not operators: they neither end a run of text nor
+    // consume the pending numbers. Only the position of the `[` is worth keeping.
+    if (bytes[cursor] === 0x5b) {
+      arrayStart = cursor;
+      cursor += 1;
+      continue;
+    }
+    if (bytes[cursor] === 0x5d) {
+      cursor += 1;
+      continue;
+    }
     if (bytes[cursor] === 0x2f) {
       const start = ++cursor;
       while (isRegular(bytes[cursor])) cursor += 1;
@@ -405,6 +427,9 @@ export function scanTextRuns(bytes, context = "") {
       lastNumber = Number(operator);
       continue;
     }
+    // Whatever `[` was last seen belongs to this operator and to no later one.
+    const openedArray = arrayStart;
+    arrayStart = null;
     if (operator === "BI") {
       cursor = skipInlineImage(bytes, cursor);
       strings.length = 0;
@@ -449,8 +474,11 @@ export function scanTextRuns(bytes, context = "") {
       // `'` and `"` reposition before drawing, so whatever came before them is not
       // followed by text drawn from its own end position; `Tj`/`TJ` draw exactly there.
       resolveFollowedBy(operator === "'" || operator === "\"" ? "repositioned" : "text-continues");
-      // `"` takes its word spacing as an operand, which is not tracked here.
-      if (operator === "\"") wordSpacing = null;
+      // `"` takes its word spacing and character spacing as operands, neither tracked here.
+      if (operator === "\"") {
+        wordSpacing = null;
+        charSpacing = null;
+      }
       if (operator === "'" || operator === "\"") continuityId += 1;
       strings.forEach((string, index) => {
         // Each string carries the net displacement accumulated since the previous string
@@ -469,7 +497,12 @@ export function scanTextRuns(bytes, context = "") {
           fontSize: currentFontSize,
           // The word spacing in force where this run is drawn; null when unknown.
           wordSpacing,
+          // The character spacing in force where this run is drawn; null when unknown.
+          charSpacing,
           operator,
+          // For a `TJ` operand, the byte offset of the `[` that opens its array, so the
+          // whole `[ ... ] TJ` can be rewritten as a unit. null for every other operator.
+          arrayStart: operator === "TJ" ? openedArray : null,
           // Byte offset just past the text-showing operator that drew this run, so the
           // whole `<operand> Tj` can be rewritten as a unit rather than the operand alone.
           operatorEnd: cursor,
@@ -489,8 +522,13 @@ export function scanTextRuns(bytes, context = "") {
       boundaryClean = true;
     } else {
       if (operator === "Tw") wordSpacing = lastNumber;
-      else if (operator === "q") graphicsStack.push(wordSpacing);
-      else if (operator === "Q") wordSpacing = graphicsStack.length ? graphicsStack.pop() : null;
+      else if (operator === "Tc") charSpacing = lastNumber;
+      else if (operator === "q") graphicsStack.push({ wordSpacing, charSpacing });
+      else if (operator === "Q") {
+        const restored = graphicsStack.length ? graphicsStack.pop() : { wordSpacing: null, charSpacing: null };
+        wordSpacing = restored.wordSpacing;
+        charSpacing = restored.charSpacing;
+      }
       strings.length = 0;
       lastName = null;
       lastNumber = null;
@@ -537,4 +575,71 @@ export function replaceTextRuns(bytes, replacements) {
     offset += chunk.length;
   }
   return output;
+}
+
+/**
+ * Parses one contiguous stretch of `[ ... ] TJ` operators -- from the `[` that opens the
+ * first array through the `TJ` that closes the last -- into the flat list of elements a
+ * PDF reader would process, in order.
+ *
+ * A `TJ` array's elements are simply processed one after another, and the operator
+ * boundary between two adjacent `TJ`s does nothing at all, so `[(A) 120] TJ [(B)] TJ` and
+ * `[(A) 120 (B)] TJ` are the same drawing. Flattening them into one list is what lets the
+ * fallback rewrite in pdf-document.js account for every displacement in the stretch it
+ * replaces, wherever the PDF happened to write it.
+ *
+ * Each element carries its own byte range, so anything the rewrite keeps is copied out of
+ * the original stream verbatim -- an adjustment is never re-formatted, reordered, merged,
+ * or dropped, and `0`, `+0`, `-0` and `0.0` come back out exactly as they went in.
+ *
+ * Deliberately strict: anything that is not a string, a number inside an array, a `[`, a
+ * `]` or a `TJ` throws. A number *outside* an array is not a displacement -- a reader
+ * discards it as a stray operand -- and a rewrite that counted it as one would move the
+ * following text, so this refuses to describe such a region rather than guess at it.
+ */
+export function parseTextArrayRegion(bytes, start, end) {
+  const elements = [];
+  let cursor = start;
+  let insideArray = false;
+  let operators = 0;
+  while (cursor < end) {
+    cursor = skipWhite(bytes, cursor);
+    if (cursor >= end) break;
+    const byte = bytes[cursor];
+    if (byte === 0x5b) {
+      if (insideArray) throw new Error("A TJ array cannot contain another array");
+      insideArray = true;
+      cursor += 1;
+      continue;
+    }
+    if (byte === 0x5d) {
+      if (!insideArray) throw new Error("Unbalanced ] in a TJ region");
+      insideArray = false;
+      cursor += 1;
+      continue;
+    }
+    if (byte === 0x28 || byte === 0x3c) {
+      if (!insideArray) throw new Error("A string operand outside a TJ array");
+      const token = byte === 0x28 ? readLiteral(bytes, cursor) : readHex(bytes, cursor);
+      if (token.end > end) throw new Error("A string operand runs past the end of the TJ region");
+      elements.push({ kind: "string", start: cursor, end: token.end, value: token.value, syntax: token.syntax });
+      cursor = token.end;
+      continue;
+    }
+    const tokenStart = cursor;
+    while (cursor < end && isRegular(bytes[cursor])) cursor += 1;
+    if (cursor === tokenStart) throw new Error("Unexpected byte in a TJ region");
+    const token = latin1.decode(bytes.subarray(tokenStart, cursor));
+    if (NUMBER.test(token)) {
+      if (!insideArray) throw new Error("A number outside a TJ array is not a displacement");
+      elements.push({ kind: "number", start: tokenStart, end: cursor, value: Number(token) });
+      continue;
+    }
+    if (token !== "TJ") throw new Error(`Unexpected operator ${token} in a TJ region`);
+    if (insideArray) throw new Error("TJ inside an unterminated array");
+    operators += 1;
+  }
+  if (insideArray) throw new Error("Unterminated array in a TJ region");
+  if (!operators) throw new Error("No TJ operator in the region");
+  return elements;
 }
