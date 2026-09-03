@@ -1,6 +1,6 @@
 import { encodeHex, encodeLiteral, parseTextArrayRegion, replaceTextRuns, scanTextRuns } from "./content-stream.js";
 import { FALLBACK_FONT_MARKER, buildFallbackFontObjects, fingerprintFont, freeResourceName, glyphSpaceWidth, glyphsFor, glyphsFromToUnicode, identityEncode, parseFallbackFont } from "./fallback-font.js";
-import { loadFontWidths, measureCodes } from "./font-metrics.js";
+import { describeFontWidths, measureCodes } from "./font-metrics.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
 import { summarizeEncryption } from "./encryption.js";
 import { deflate, decodeStreamBytes, filters } from "./flate.js";
@@ -531,13 +531,15 @@ function planTextArrayRewrite(editor, pieces, glyphs, fallback) {
     if (!metrics) {
       return refusal(
         "FALLBACK_FONT_METRICS_UNAVAILABLE",
-        `Text is drawn after this match, so the width it occupied has to be measured to keep that text where it is -- but this document does not state the glyph widths of font /${first.fontName} in a form this engine can read exactly (a /Widths or /W array it can resolve). Nothing is estimated, so this replacement is refused.`
+        `Text is drawn after this match, so the width it occupied has to be measured to keep that text where it is -- but this document does not state the glyph widths of font /${first.fontName} in a form this engine can read exactly (a /Widths or /W array it can resolve). Nothing is estimated, so this replacement is refused.`,
+        stream.fontWidthReasons?.get(first.fontName)
       );
     }
     if (splits.some((split) => !split)) {
       return refusal(
         "FALLBACK_FONT_METRICS_UNAVAILABLE",
-        "The exact character codes this match is drawn with could not be recovered from the operand it sits in, so the width it occupies cannot be measured and the text after it cannot be kept in place"
+        "The exact character codes this match is drawn with could not be recovered from the operand it sits in, so the width it occupies cannot be measured and the text after it cannot be kept in place",
+        "operand-codes-unrecoverable"
       );
     }
     let width = 0;
@@ -546,7 +548,7 @@ function planTextArrayRewrite(editor, pieces, glyphs, fallback) {
     for (const split of splits) {
       const measured = measureCodes(metrics, split.bytes.matched);
       if (!measured) {
-        return refusal("FALLBACK_FONT_METRICS_UNAVAILABLE", `This document does not give a width for every character code this match is drawn with in font /${first.fontName}, so the width it occupies cannot be measured`);
+        return refusal("FALLBACK_FONT_METRICS_UNAVAILABLE", `This document does not give a width for every character code this match is drawn with in font /${first.fontName}, so the width it occupies cannot be measured`, "code-width-unavailable");
       }
       width += measured.width;
       glyphCount += measured.glyphs;
@@ -577,7 +579,8 @@ function planTextArrayRewrite(editor, pieces, glyphs, fallback) {
     if (formatted === null || replacementWidth - Number(formatted) !== width - between) {
       return refusal(
         "FALLBACK_FONT_METRICS_UNAVAILABLE",
-        "The width this match occupies cannot be matched exactly by a TJ adjustment, so the text after it would move"
+        "The width this match occupies cannot be matched exactly by a TJ adjustment, so the text after it would move",
+        "adjustment-not-representable"
       );
     }
     adjustment = formatted;
@@ -1108,7 +1111,14 @@ function writingModeOf(fontDictionary, structure) {
   if (!indirect) return "unknown";
   try {
     // A CMap is always a stream, so it is never inside an Object Stream (PDF 7.5.7).
-    const wmode = structure.object(indirect).dictionary.match(/\/WMode\s+(\d+)/);
+    const object = structure.object(indirect);
+    // The name may itself be written as an indirect object, and says as much as a direct
+    // one does: a predefined CMap's name ends in -H or -V.
+    if (!object.dictionary && typeof object.rawValue === "string" && object.rawValue.startsWith("/")) {
+      if (/-V$/.test(object.rawValue)) return "vertical";
+      return /-H$/.test(object.rawValue) ? "horizontal" : "unknown";
+    }
+    const wmode = object.dictionary.match(/\/WMode\s+(\d+)/);
     if (!wmode) return "unknown";
     return wmode[1] === "1" ? "vertical" : "horizontal";
   } catch {
@@ -1120,6 +1130,11 @@ async function loadFontMaps(resources, structure, security) {
   const result = new Map();
   const modes = new Map();
   const widths = new Map();
+  // Why a font's widths could not be read, when they could not (see FONT_METRICS_REASONS).
+  // Structure only, never content: it travels no further than the `unsafeReason` beside a
+  // FALLBACK_FONT_METRICS_UNAVAILABLE refusal, so a caller can tell an indirect object
+  // this could not resolve from a font whose widths the file never states at all.
+  const widthReasons = new Map();
   // A font dictionary can itself be compressed (a common PDF-writer optimization);
   // its own /ToUnicode target, however, is always a stream, and streams are never
   // stored in an Object Stream (PDF spec 7.5.7), so that lookup stays on the
@@ -1130,14 +1145,82 @@ async function loadFontMaps(resources, structure, security) {
     // The widths a reader positions this font's text with, when they can be read exactly.
     // Only the TJ fallback rewrite needs them, and only when it has to keep following text
     // where it is; null here simply means that rewrite refuses (see loadFontWidths()).
-    const metrics = await loadFontWidths(font.dictionary, (target) => structure.resolveObject(target, security, decryptStreamBytes));
+    const { metrics, reason } = await describeFontWidths(font.dictionary, (target) => structure.resolveObject(target, security, decryptStreamBytes));
     if (metrics) widths.set(name, metrics);
+    else widthReasons.set(name, reason);
     const toUnicode = reference(font.dictionary, "ToUnicode");
     if (!toUnicode) continue;
     const cmapObject = structure.object(toUnicode);
     result.set(name, parseToUnicodeCMap(await decodeStream(cmapObject, "ToUnicode stream", security)));
   }
-  return { maps: result, modes, widths };
+  return { maps: result, modes, widths, widthReasons };
+}
+
+/**
+ * How each of this document's font resources states its glyph widths, and -- when they
+ * cannot be read exactly -- which structure defeated it (see FONT_METRICS_REASONS in
+ * font-metrics.js).
+ *
+ * Developer-facing and deliberately not part of the public API: index.js does not export
+ * it, and nothing in the engine calls it. It exists so a real document that refuses a `TJ`
+ * fallback replacement with FALLBACK_FONT_METRICS_UNAVAILABLE can be diagnosed from the
+ * file itself -- see scripts/diagnose-font-metrics.js -- instead of guessed about.
+ */
+export async function diagnoseFontMetrics(editor) {
+  await editor.listTextRuns();
+  const structure = editor.document;
+  const security = editor.security;
+  const resolve = (target) => structure.resolveObject(target, security, decryptStreamBytes);
+  const shapeOf = async (target) => {
+    let object;
+    try {
+      object = await resolve(target);
+    } catch (error) {
+      return { reference: `${target.number} ${target.generation} R`, kind: "unresolved", detail: error.message };
+    }
+    const kind = object.data ? "stream" : object.dictionary ? "dictionary" : object.rawValue !== null ? "array-or-name" : "number";
+    const text = object.dictionary || (object.rawValue ?? String(object.value));
+    return { reference: `${target.number} ${target.generation} R`, kind, detail: text.length > 400 ? `${text.slice(0, 400)}...` : text };
+  };
+  const report = [];
+  const seen = new Set();
+  for (const { object, resources } of await structure.pageContentObjects(security, decryptStreamBytes)) {
+    if (seen.has(object.number)) continue;
+    seen.add(object.number);
+    for (const [name, fontReference] of await fontReferences(resources, structure, security)) {
+      const font = await resolve(fontReference);
+      const { metrics, reason, detail } = await describeFontWidths(font.dictionary, resolve);
+      const related = [];
+      for (const key of ["Encoding", "DescendantFonts", "W", "Widths", "FontDescriptor", "ToUnicode"]) {
+        for (const target of parseReferenceArray(font.dictionary, key)) related.push({ key, ...await shapeOf(target) });
+      }
+      const [descendantReference] = parseReferenceArray(font.dictionary, "DescendantFonts");
+      let descendant = null;
+      if (descendantReference) {
+        const resolved = await resolve(descendantReference).catch(() => null);
+        descendant = resolved?.dictionary || null;
+        if (descendant) {
+          for (const key of ["W", "DW", "CIDToGIDMap", "FontDescriptor"]) {
+            for (const target of parseReferenceArray(descendant, key)) related.push({ key: `descendant /${key}`, ...await shapeOf(target) });
+          }
+        }
+      }
+      report.push({
+        contentStream: object.number,
+        name,
+        objectNumber: fontReference.number,
+        dictionary: font.dictionary,
+        descendant,
+        writingMode: writingModeOf(font.dictionary, structure),
+        codeBytes: metrics?.codeBytes ?? null,
+        metrics,
+        reason,
+        detail,
+        related
+      });
+    }
+  }
+  return report;
 }
 
 export class PdfTextEditor {
@@ -1233,7 +1316,7 @@ export class PdfTextEditor {
         const runs = scanTextRuns(decoded, `content stream object ${object.number}`);
         if (runs.length) {
           const fonts = await loadFontMaps(resources, this.document, this.security);
-          this.streams.push({ object, decoded, runs, resources, fontMaps: fonts.maps, fontModes: fonts.modes, fontWidths: fonts.widths });
+          this.streams.push({ object, decoded, runs, resources, fontMaps: fonts.maps, fontModes: fonts.modes, fontWidths: fonts.widths, fontWidthReasons: fonts.widthReasons });
         }
       }
     }

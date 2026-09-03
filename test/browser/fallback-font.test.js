@@ -122,7 +122,7 @@ async function fallbackFlowInPage({ includeSaved }) {
  * as its own page function for the same reason as the one above -- Playwright ships it to
  * the browser by source, so it captures nothing from this module.
  */
-async function tjFlowInPage() {
+async function tjFlowInPage({ indirectWidths = false } = {}) {
   const { PdfTextEditor } = await import("/idontlovepdf-engine.js");
   const fontBytes = new Uint8Array(await (await fetch("/fallback.ttf")).arrayBuffer());
   const encode = (value) => new TextEncoder().encode(value);
@@ -142,8 +142,13 @@ async function tjFlowInPage() {
     "5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+Doc /Encoding /Identity-H /DescendantFonts [7 0 R] /ToUnicode 6 0 R >>\nendobj\n",
     stream(6, cmap),
     "7 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+Doc /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>"
-      + " /FontDescriptor 8 0 R /DW 1000 /W [1 [1000] 2 [950] 3 [500] 4 [1000] 5 [1000]] /CIDToGIDMap /Identity >>\nendobj\n",
-    "8 0 obj\n<< /Type /FontDescriptor /FontName /ABCDEF+Doc /Flags 4 /FontBBox [0 -200 1000 800] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >>\nendobj\n"
+      + " /FontDescriptor 8 0 R"
+      // v0.4.2: the same widths, written the way a real PDF writer writes a long array --
+      // as indirect objects of their own rather than values inside the font dictionary.
+      + (indirectWidths ? " /DW 9 0 R /W 10 0 R" : " /DW 1000 /W [1 [1000] 2 [950] 3 [500] 4 [1000] 5 [1000]]")
+      + " /CIDToGIDMap /Identity >>\nendobj\n",
+    "8 0 obj\n<< /Type /FontDescriptor /FontName /ABCDEF+Doc /Flags 4 /FontBBox [0 -200 1000 800] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >>\nendobj\n",
+    ...(indirectWidths ? ["9 0 obj\n1000\nendobj\n", "10 0 obj\n[1 [1000] 2 [950] 3 [500] 4 [1000] 5 [1000]]\nendobj\n"] : [])
   ];
   let source = "%PDF-1.4\n";
   const offsets = [];
@@ -199,6 +204,48 @@ test("keeps the text after a TJ match in place, in a browser, and opens in Chrom
     assert.equal(result.year, 1, "8年度 must still be there, and still searchable");
     // 令和 was 1000 + 950 glyph-space units wide and しょ is 1000 + 1000, so the array is
     // pulled back by exactly 50 -- and the document's own -50 kern is still written once.
+    assert.match(result.rewritten, /\/ILPFallback 28 Tf \[<[0-9a-f]+>\] TJ \/FJP 28 Tf \[50 -50 <000300040005>\] TJ/);
+
+    state.saved = result.saved;
+    const viewer = await browser.newPage({ viewport: { width: 660, height: 240 } });
+    const viewerErrors = [];
+    viewer.on("pageerror", (error) => viewerErrors.push(error));
+    await viewer.goto(`http://127.0.0.1:${port}/viewer`);
+    await viewer.waitForSelector("embed#v");
+    await viewer.waitForTimeout(4000);
+    const shot = await viewer.screenshot();
+    await viewer.close();
+
+    assert.deepEqual(viewerErrors, []);
+    assert.ok(shot.length > 3000, `Chromium appears to have rendered a blank page (${shot.length} byte screenshot)`);
+  } finally {
+    await browser.close();
+    server.close();
+  }
+});
+
+test("measures a font whose widths are indirect objects, in a browser, and opens in Chromium's viewer", { skip }, async () => {
+  // The v0.4.2 case: the same page, the same widths, but stated as objects of their own --
+  // which v0.4.1 refused with FALLBACK_FONT_METRICS_UNAVAILABLE. The adjustment written
+  // must be identical to the direct-array case above, and the file must still open.
+  const state = {};
+  const server = await serve(state);
+  const { port } = server.address();
+  const browser = await chromium.launch({ channel: "chromium" });
+  try {
+    const page = await browser.newPage();
+    const pageErrors = [];
+    page.on("pageerror", (error) => pageErrors.push(error));
+    await page.goto(`http://127.0.0.1:${port}/`);
+
+    const result = await page.evaluate(tjFlowInPage, { indirectWidths: true });
+
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(result.allowed, { allowed: true, mode: "fallback-font" });
+    assert.deepEqual(result.runs, ["しょ", "8年度"]);
+    assert.equal(result.found, 1);
+    assert.equal(result.gone, 0);
+    assert.equal(result.year, 1);
     assert.match(result.rewritten, /\/ILPFallback 28 Tf \[<[0-9a-f]+>\] TJ \/FJP 28 Tf \[50 -50 <000300040005>\] TJ/);
 
     state.saved = result.saved;

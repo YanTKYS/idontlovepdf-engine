@@ -2,6 +2,26 @@
 
 各versionのリリース内容を新しい順に記載します。H2見出しには、`v`付きversionとGitHub Releaseのtitleを記載します。
 
+## v0.4.2 - Font widths a real PDF actually states
+
+- **v0.4.1 の `TJ` fallback を、実務 PDF で成立させるための version です。** 実 PDF（`22550.pdf`）の `/F3` で `令和 → しょ` が `FALLBACK_FONT_METRICS_UNAVAILABLE` になっていました。同じ箇所の `令和 → 平成` は成功します（元 font で書けるため fallback 経路に入らない）。つまり `TJ` 対応そのものではなく、**元 font の glyph 幅を PDF から正確に読み取れないこと**が原因です
+- **その `22550.pdf` はこのリポジトリにも開発環境にも無いため、`/F3` の構造を推測して実装することはしていません。** この version で行ったのは「原因を特定できる状態を作ること」と「PDF 自身の情報だけで幅を**正確に**決定できる構造を追加すること」の 2 つです。実 PDF での Go / No-Go は、下記の診断 CLI を `22550.pdf` に対して実行し、`/F3` の `VERDICT` 行で確認してください。`widths readable` なら v0.4.1 で読めなかった原因は間接 object であり、この version で解決しています。`non-identity-encoding` / `embedded-cmap-encoding` / `unsupported-type3` / `missing-widths` などが表示される場合は**引き続き No-Go**で、その font は推測なしには扱えません
+- **原因の切り分けができるようにしました。** `loadFontWidths()` は「安全に読めないケース」をまとめて `null` にしていたため、実 PDF で何が原因かを判別できませんでした。内部では `unsupported-font-subtype` / `non-identity-encoding` / `embedded-cmap-encoding` / `descendant-font-unresolved` / `w-unresolved` / `widths-unresolved` / `invalid-width-array` / `missing-first-char` / `unsupported-type3` などに分類し、開発者向けに `unsafeReason` として返します。公開 `code` は `FALLBACK_FONT_METRICS_UNAVAILABLE` のままで、一般利用者向け API の形は変わりません
+- **実 PDF の構造を確認するための診断 CLI を追加しました。** `node scripts/diagnose-font-metrics.js <file.pdf> [--password ...] [--text 令和]` が、各 font resource の object 番号・`/Subtype`・`/BaseFont`・`/Encoding`・descendant font・`/W`・`/DW`・`/Widths`・`/FirstChar`・`/ToUnicode`、各値が direct か indirect か、参照先の実体、対象文字の operand bytes と code ごとの幅、そして「読めない場合の理由」を表示します。読み取り専用で、ネットワークアクセスはありません
+- **対応を広げたのは 1 点だけです: width を持つ entry が間接 object として書かれている構造。** `/Widths 123 0 R`・`/W 456 0 R`・`/DW`・`/FirstChar`・`/MissingWidth`・`/DescendantFonts` の間接参照を、engine が既に持つ PDF object resolver（`PdfStructure.resolveObject()`）で解決します。正規表現で PDF を展開するのではなく、通常の object 解決経路を通します。`/Encoding` の name 自体が間接 object の場合も、`/Identity-H` と確認できるときに限り解決します（writing mode の判定も同じ経路で `-H` / `-V` を見ます）。あわせて `PdfStructure.object()` が「値が array・name の indirect object」を読めるようにしました（従来は dictionary と整数のみ）
+- **解決するのは「数値がどこにあるか」だけです。** 値そのものは従来どおり PDF が書いた数値をそのまま読み、推測は一切しません。`/DW` や `/FirstChar` が間接参照のときに **object 番号を値と取り違えていた読み取り**（`/FirstChar 12 0 R` を 12 と読む）も塞ぎました。誤った幅から誤った adjustment を書き得るため、これは v0.4.1 に対する修正でもあります
+- **key はあるが値を読めない場合を「無い」扱いにしません。** 例えば数値でない `/DW` を 1000（spec の既定値）とみなすことはせず、拒否します
+- **次は引き続き No-Go（fail closed）です。**
+  - `/Encoding` が `/Identity-H` 以外。predefined CMap（`/90ms-RKSJ-H` 等）は PDF 内に無く、embedded CMap stream は解析しません。`/ToUnicode` から CID を逆算することもしません（ToUnicode は Unicode 抽出用で、code → CID と同一とは限らないため）
+  - Type 3 font、`/Widths` を持たない標準 14 font
+  - 参照先 object が無い・array でない・数値として読めない、`/DW`・`/FirstChar` が数値でない
+  - 埋め込み font program の `hmtx` しか手掛かりがない場合（PDF reader が位置決めに使うのは PDF 側の値のため）
+- **`TJ` の安全条件は緩めていません。** `置換後の幅 - adjustment === 元の幅 - 元の adjustment` が成立することを、書き込む数値から検算したうえでのみ許可します。`FALLBACK_CHAR_SPACING_UNSUPPORTED` / `FALLBACK_WORD_SPACING_UNSUPPORTED` / `FALLBACK_MULTI_RUN_UNSUPPORTED` / `FALLBACK_LAYOUT_UNSUPPORTED` / `FALLBACK_WRITING_MODE_UNSUPPORTED` もそのままです
+- **検証。** `test/font-metrics-indirect.test.js` を追加しました。間接 `/W`・`/DW`・`/DescendantFonts`・`/Widths`・`/FirstChar`・`/MissingWidth` を持つ最小 PDF で、`令和 → しょ` が `allowed: true` になり、置換後も後続文字（`8年度`）の x 座標が置換前と完全に一致すること、save → 開き直して「しょ」が検索でき「令和」が消えていること、font program が 1 回だけ埋め込まれることを確認します。座標の照合には v0.4.1 の**独立 text-advance simulator** を使い、`test/helpers/text-advance.js` として両 test file で共有しています（この simulator は `src/` を一切 import せず、間接 object も自前で解決します）
+- **unsafe fixture も 20 件追加しました。** 参照先が存在しない `/W`・`/Widths`、array でない参照先、名前や参照が混ざった width array、数値でない `/DW`・`/FirstChar`、predefined CMap、embedded CMap stream、descendant font 不在・解決不能、CID font でない descendant、`/Widths` 無し、`/FirstChar` 無し、Type 3、未対応 subtype、adjustment として厳密に表現できない幅、間接 object で書かれた縦書き `/Encoding`。いずれも `checkTextMatchReplacement()` が `allowed: false`、`replaceTextMatch()` が同じ `code` で失敗し、**PDF の byte が 1 バイトも変わらない**ことを確認しています
+- 公開 API（`setFallbackFont()` / `searchText()` / `checkTextMatchReplacement()` / `replaceTextMatch()` / `save()` / `ENGINE_VERSION`）は変更していません。追加依存もありません。browser bundle は約 506KB → 約 514KB になりました
+- v0.4.1 までの挙動を維持: `Tj` / `TJ` fallback、partial-run、multi-run、既存 font による通常置換、same-length multi-run、`variable-length-safe`、削除、fallback font の必要時のみ埋め込みと重複埋め込み防止、ToUnicode 更新、save → reopen、`/P` permission、暗号化 PDF の対応範囲、Web Crypto なし環境、check と replace の判定一致、atomic な置換、`MATCH_STALE` / `UNKNOWN_MATCH`、`'` / `"` 非対応、縦書きの制限、外部通信なし
+
 ## v0.4.1 - Fallback font for text drawn by TJ
 
 - **`TJ` 配列で描画された文字にも fallback font を適用できるようになりました。** v0.4.0 の fallback は実質 `Tj` 限定で、`TJ` は一律 `FALLBACK_OPERATOR_UNSUPPORTED` で拒否していました。`TJ` は一般的な PDF で普通に現れるため、`[(令和) -50 (8年度)] TJ` のような箇所で `令和 → しょ` が成立しないことが実用上の制約になっていました
