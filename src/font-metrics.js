@@ -28,7 +28,8 @@
  * read exactly; if that object is missing, or is not an array of numbers, the answer is
  * still no.
  */
-import { parseReferenceArray, reference } from "./pdf-structure.js";
+import { reference } from "./pdf-structure.js";
+import { topLevelArrayElements } from "./pdf-dictionary-text.js";
 
 /** A CID font's default width when `/DW` is absent, per PDF 9.7.4.3. */
 const DEFAULT_CID_WIDTH = 1000;
@@ -321,11 +322,38 @@ async function tracedResolve(resolve, target, trace, step) {
   return object;
 }
 
+/** Whether an array element's verbatim text is an indirect reference, and its target if so. */
+const REFERENCE_ELEMENT = /^(\d+)\s+(\d+)\s+R$/;
+
+/**
+ * What one `/DescendantFonts` array element turns out to be, from its own verbatim text
+ * (as topLevelArrayElements() in pdf-dictionary-text.js returns it): a reference to resolve,
+ * a dictionary written right there, or -- a name, a number, anything else PDF allows in an
+ * array but PDF 9.7.6.2 never puts here -- something this cannot use as a CIDFont either
+ * way. Trimmed defensively even though topLevelArrayElements() already returns tight text,
+ * since a direct dictionary is told apart from other text only by its own `<<`/`>>`.
+ */
+function classifyDescendantElement(text) {
+  const trimmed = text.trim();
+  const asReference = REFERENCE_ELEMENT.exec(trimmed);
+  if (asReference) return { kind: "reference", number: Number(asReference[1]), generation: Number(asReference[2]), label: trimmed };
+  if (trimmed.startsWith("<<") && trimmed.endsWith(">>")) return { kind: "dictionary", text: trimmed };
+  return { kind: "other", text: trimmed };
+}
+
 /**
  * The descendant CIDFont's own dictionary, as `{ dictionary }`, or a refusal saying why it
- * could not be reached. `/DescendantFonts` is an array of exactly one font (PDF 9.7.6.2);
- * the array itself may be written indirectly, which is followed once and no further -- this
- * resolves the structure a real file states, it does not evaluate arbitrary object graphs.
+ * could not be reached. `/DescendantFonts` is an array of exactly one font (PDF 9.7.6.2),
+ * and PDF allows that one element to be either an indirect reference or a dictionary
+ * written right there in the array -- both are read here. The array itself may also be
+ * written indirectly, which is followed once and no further -- this resolves the structure
+ * a real file states, it does not evaluate arbitrary object graphs.
+ *
+ * The array's own elements are read with topLevelArrayElements() (pdf-dictionary-text.js),
+ * which walks the array one whole value at a time instead of searching its raw text for a
+ * pattern -- the only way to tell "this array's one genuine element" apart from a reference
+ * nested inside that element's own dictionary (e.g. `/W 25 0 R` inside an inline CIDFont
+ * dictionary), which a plain regex over the array's text cannot.
  *
  * Exported so diagnoseFontMetrics() in pdf-document.js reaches the descendant by exactly
  * the same path the measurement does: a diagnosis that stopped a hop short of the real
@@ -339,34 +367,57 @@ async function tracedResolve(resolve, target, trace, step) {
  * second implementation that might disagree with this one.
  */
 export async function resolveDescendantFont(fontDictionary, resolve, trace = null) {
-  const targets = parseReferenceArray(fontDictionary, "DescendantFonts");
+  const elements = topLevelArrayElements(fontDictionary, "DescendantFonts");
+  const indirectReference = elements === null ? reference(fontDictionary, "DescendantFonts") : null;
+  const classified = elements?.map(classifyDescendantElement) ?? null;
+  // Whether the walk goes on from here, so a refusal decided by the entry itself is
+  // visible as such instead of looking like a hop that was never taken. A direct array
+  // must hold exactly the one element PDF 9.7.6.2 allows; an indirect reference is
+  // always exactly one reference by construction, so there is nothing further to count
+  // until it is resolved.
+  const accepted = elements !== null ? elements.length === 1 : Boolean(indirectReference);
   if (trace) {
-    const direct = directArrayText(fontDictionary, "DescendantFonts");
     trace.push({
       step: "descendant-fonts-entry",
       // Which shape the entry is written in. "direct-array" and "indirect-reference" are
-      // the two parseReferenceArray() distinguishes; it returns the array's elements for
-      // the first and the reference itself for the second, so the next hop's meaning
+      // the two topLevelArrayElements()/reference() distinguish; the next hop's meaning
       // differs between them and the trace has to say which one this is.
-      form: direct !== null ? "direct-array" : targets.length ? "indirect-reference" : "absent",
+      form: elements !== null ? "direct-array" : indirectReference ? "indirect-reference" : "absent",
       raw: rawEntryText(fontDictionary, "DescendantFonts"),
-      references: targets.map((target) => `${target.number} ${target.generation} R`),
-      // Whether the walk goes on from here, so a refusal decided by the entry itself is
-      // visible as such instead of looking like a hop that was never taken.
-      accepted: targets.length === 1
+      references: (classified ?? (indirectReference ? [{ kind: "reference", label: `${indirectReference.number} ${indirectReference.generation} R` }] : []))
+        .filter((entry) => entry.kind === "reference")
+        .map((entry) => entry.label),
+      accepted
     });
   }
-  const [target] = targets;
-  if (!target) return refuse("descendant-font-missing");
-  // PDF 9.7.6.2 makes /DescendantFonts a ONE-element array. More than one element is
-  // malformed, and nothing in the file says which of them a reader should measure with --
-  // so taking the first would be a guess, and a guess here is a wrong width from a font
-  // the document never asked for. Refused, exactly as the same array written as an object
-  // of its own already was: which of the two shapes a writer chose must not decide whether
-  // the document is measured or refused.
-  if (targets.length > 1) {
-    return refuse("descendant-font-unresolved", targets.map((entry) => `${entry.number} ${entry.generation} R`).join(" "));
+  // An empty direct array and a wholly absent key are both "nowhere to look", read the
+  // same way parseReferenceArray()'s single-target check used to read them.
+  if (elements !== null && elements.length === 0) return refuse("descendant-font-missing");
+  if (!indirectReference && elements === null) return refuse("descendant-font-missing");
+  if (!accepted) {
+    // PDF 9.7.6.2 makes /DescendantFonts a ONE-element array. More than one element is
+    // malformed, and nothing in the file says which of them a reader should measure with --
+    // so taking the first would be a guess, and a guess here is a wrong width from a font
+    // the document never asked for. Refused, exactly as the same array written as an object
+    // of its own already was: which of the two shapes a writer chose must not decide whether
+    // the document is measured or refused.
+    return refuse("descendant-font-unresolved", classified.map((entry) => entry.label ?? entry.text).join(" "));
   }
+  const single = classified
+    ? classified[0]
+    : { kind: "reference", number: indirectReference.number, generation: indirectReference.generation };
+  // The array's one element is a CIDFont dictionary written right there -- nothing to
+  // resolve, and nothing further this walk can say about it beyond recording that this is
+  // the hop that ended it (descendantObjectNumberOf() in pdf-document.js relies on a
+  // "dictionary" step carrying a `reference` to name an object; an inline dictionary has
+  // none, so it is deliberately left off here rather than naming an object that does not
+  // exist).
+  if (single.kind === "dictionary") {
+    if (trace) trace.push({ step: "inline-dictionary", kind: "dictionary", text: single.text });
+    return { dictionary: single.text };
+  }
+  if (single.kind !== "reference") return refuse("descendant-font-unresolved", single.text);
+  const target = { number: single.number, generation: single.generation };
   const unresolved = () => refuse("descendant-font-unresolved", `${target.number} ${target.generation} R`);
   const object = await tracedResolve(resolve, target, trace, "resolve-first-reference");
   if (!object) return unresolved();

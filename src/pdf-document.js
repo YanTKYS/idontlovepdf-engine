@@ -1214,7 +1214,23 @@ export async function diagnoseFontMetrics(editor) {
       const font = await resolve(fontReference);
       const { metrics, reason, detail } = await describeFontWidths(font.dictionary, resolve);
       const related = [];
-      for (const key of ["Encoding", "DescendantFonts", "W", "Widths", "FontDescriptor", "ToUnicode"]) {
+      // /DescendantFonts is deliberately not one of these keys: parseReferenceArray()'s
+      // whole-array-text regex cannot tell an inline CIDFont dictionary's own array
+      // element from a reference nested inside it (that mismatch is exactly what made
+      // 22550.pdf's /F3 undiagnosable -- see resolveDescendantFont() in font-metrics.js).
+      // `descendantTrace` below is /DescendantFonts's own, correct account of itself,
+      // read the same way the measurement reads it, so this list does not need a second,
+      // less careful reading of the same key.
+      //
+      // /W, /Widths and /FontDescriptor are skipped here for a Type0 wrapper for the same
+      // reason: none of them is ever a top-level key of a Type0 font dictionary itself (a
+      // simple font has /Widths and /FontDescriptor; a CIDFont has /W and /FontDescriptor),
+      // so on a Type0 whose /DescendantFonts is now an inline dictionary, reference()'s
+      // whole-text search would find that dictionary's own /W or /FontDescriptor and
+      // misreport it as the wrapper's, duplicating (harmlessly, but confusingly) what the
+      // "descendant /..." keys below already report correctly.
+      const isType0 = /\/Subtype\s*\/Type0\b/.test(font.dictionary);
+      for (const key of ["Encoding", "ToUnicode", ...(isType0 ? [] : ["W", "Widths", "FontDescriptor"])]) {
         for (const target of parseReferenceArray(font.dictionary, key)) related.push({ key, ...await shapeOf(target) });
       }
       // Reached the same way the measurement reaches it, including an indirect

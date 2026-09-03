@@ -4,6 +4,15 @@ name: Diagnose real PDF font metrics
 # runner and is intentionally kept separate from the regular push/PR CI in
 # ci.yml, so fetching an arbitrary real-PDF URL is never triggered
 # automatically by a push or PR.
+#
+# Beyond diagnosis, this also runs an actual edit (search -> fallback font ->
+# check -> replace -> save -> reopen -> search again) against the fetched PDF
+# when `run_edit_test` is true, and verifies the result with tools that share
+# no code with this engine (pdfminer.six, qpdf, Chromium). The PDF itself is
+# never committed, uploaded as a workflow artifact, cached, or otherwise kept
+# past the job -- everything happens on the runner's own ephemeral disk, and
+# this workflow adds no network access to the engine's runtime, only to this
+# development-time job.
 on:
   workflow_dispatch:
     inputs:
@@ -19,6 +28,19 @@ on:
         description: "Font resource name (without the leading /)"
         required: true
         default: "F3"
+      run_edit_test:
+        description: "Also run the search -> fallback -> replace -> save -> reopen edit smoke test, and verify the result with pdfminer.six/qpdf/Chromium"
+        type: boolean
+        required: true
+        default: false
+      fallback_replacement:
+        description: "Replacement text that needs the fallback font (edit test only)"
+        required: true
+        default: "しょ"
+      regression_replacement:
+        description: "Replacement text expected to work through the document's own font, as a regression check (edit test only)"
+        required: true
+        default: "平成"
 
 jobs:
   diagnose:
@@ -73,3 +95,86 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/diagnose-font-metrics.js "$PDF_PATH" --font "$DIAG_FONT" --text "$DIAG_TEXT"
+
+      # Everything below only runs when run_edit_test is checked. It is the actual
+      # Go/No-Go check: not just "can this font be diagnosed" but "can this document be
+      # edited, saved, reopened, and read back -- through the public API a real caller
+      # uses, and confirmed by tools this engine shares no code with".
+      - name: Fetch the fallback-font tests' font
+        if: ${{ inputs.run_edit_test }}
+        run: npm run test:font
+
+      - name: Run the edit smoke test (search -> fallback -> check -> replace -> save -> reopen -> search)
+        if: ${{ inputs.run_edit_test }}
+        env:
+          DIAG_TEXT: ${{ inputs.text }}
+          FALLBACK_TEXT: ${{ inputs.fallback_replacement }}
+          REGRESSION_TEXT: ${{ inputs.regression_replacement }}
+        run: |
+          set -euo pipefail
+          edited="$RUNNER_TEMP/edited.pdf"
+          echo "EDITED_PDF_PATH=$edited" >> "$GITHUB_ENV"
+          node scripts/verify-real-pdf-edit.js "$PDF_PATH" \
+            --font tmp/test-fonts/BIZUDGothic-Regular.ttf \
+            --search "$DIAG_TEXT" --fallback "$FALLBACK_TEXT" --regression "$REGRESSION_TEXT" \
+            --out "$edited"
+
+      # An independent reader (pdfminer.six shares no code with src/) confirms the text
+      # drawn after the match was not moved by the TJ adjustment the engine wrote --
+      # not the engine re-checking its own arithmetic. Installed into a venv rather than
+      # the runner's system Python to avoid colliding with its preinstalled packages.
+      - name: Verify text position with pdfminer.six (independent of this engine)
+        if: ${{ inputs.run_edit_test }}
+        env:
+          DIAG_TEXT: ${{ inputs.text }}
+          FALLBACK_TEXT: ${{ inputs.fallback_replacement }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/pdfminer-venv"
+          "$RUNNER_TEMP/pdfminer-venv/bin/pip" install --quiet pdfminer.six
+          "$RUNNER_TEMP/pdfminer-venv/bin/python3" scripts/verify-real-pdf-position.py \
+            --before "$PDF_PATH" --after "$EDITED_PDF_PATH" \
+            --marker-before "$DIAG_TEXT" --marker-after "$FALLBACK_TEXT"
+
+      # qpdf --check exits 0 (clean), 2 (warnings only -- e.g. a quirk already present in
+      # the original file, or one incremental updates commonly trigger, neither of which
+      # means the file is broken), or 3+ (actual structural errors). Only 3+ fails this
+      # step; a real government PDF is not held to a stricter standard than qpdf itself
+      # applies, but a genuine structural error in either file must not be waved through.
+      - name: Verify structural integrity with qpdf (independent of this engine)
+        if: ${{ inputs.run_edit_test }}
+        run: |
+          set -uo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y qpdf
+
+          check_one() {
+            local label="$1" path="$2" code
+            echo "--- qpdf --check ($label) ---"
+            qpdf --check "$path"
+            code=$?
+            echo "qpdf --check ($label) exit code: $code"
+            if [ "$code" -ge 3 ]; then
+              echo "::error::qpdf reported structural errors in $label ($path)"
+              return 1
+            fi
+            if [ "$code" -eq 2 ]; then
+              echo "::warning::qpdf reported warnings (not structural errors) in $label ($path)"
+            fi
+            return 0
+          }
+
+          status=0
+          check_one "original" "$PDF_PATH" || status=1
+          check_one "edited" "$EDITED_PDF_PATH" || status=1
+          exit "$status"
+
+      - name: Verify the edited PDF opens in Chromium's own PDF viewer (independent of this engine)
+        if: ${{ inputs.run_edit_test }}
+        run: |
+          set -euo pipefail
+          npx playwright install --with-deps chromium
+          node scripts/verify-real-pdf-viewer.js "$EDITED_PDF_PATH"
+
+      # The PDF itself is never uploaded, cached, or committed -- only ever written to
+      # $RUNNER_TEMP, which is discarded with the runner at the end of the job.

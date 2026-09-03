@@ -244,6 +244,8 @@ v0.4.1 では、この値が font dictionary の中に**直接**書かれてい�
 
 拒否の内訳は開発者向けに `unsafeReason`（`w-unresolved`・`widths-unresolved`・`invalid-width-array`・`non-identity-encoding`・`embedded-cmap-encoding`・`unsupported-type3` など）として返します。公開 `code` は `FALLBACK_FONT_METRICS_UNAVAILABLE` のままです。実 PDF の構造を確認するには `node scripts/diagnose-font-metrics.js <file.pdf> [--text 令和] [--font F3]` を使ってください（読み取り専用・ネットワークアクセスなし）。`/Type0` font については `/DescendantFonts` の解決過程を 1 hop ずつ表示します（dictionary が書いている生の値、direct array か indirect reference か、各参照先が実際に何だったか、xref 上で通常 object か Object Stream 内か）。この trace は幅計測が呼ぶ `resolveDescendantFont()` 自身が記録するため、`descendant-font-unresolved` を「どの hop で失敗したか」まで読み取れます。→ [descendant font の診断](docs/descendant-font-diagnosis.md)
 
+**`/DescendantFonts` が inline dictionary の場合にも対応します（v0.4.3）。** PDF 9.7.6.2 は `/DescendantFonts` を「要素 1 つの array」とだけ定めており、その 1 要素は indirect reference（`[7 0 R]`）だけでなく、CIDFont dictionary を array の中に直接書く形（`[ << ... >> ]`）も許されています。後者は実 PDF（`22550.pdf` の `/F3`）が実際に書いている形で、v0.4.2 まではこの形を「複数の要素を持つ array」と誤認して拒否していました（array 内部の nested dictionary が持つ `/W` などの indirect reference まで array の要素として数えてしまうため）。v0.4.3 では array の要素を値の境界を理解した上で 1 つずつ読み、nested reference を要素と誤認しなくなりました。この修正は「新しい何かを推測できるようにした」ものではなく、PDF 仕様が元々許している書き方を正しく読めるようにしたものです。widths が読めない・CIDFontType0/2 でない等は引き続き `FALLBACK_FONT_METRICS_UNAVAILABLE` で拒否します。実 PDF（`22550.pdf`）で `令和 → しょ` の fallback 置換が成立することを確認済みです。詳細は [descendant font の診断](docs/descendant-font-diagnosis.md) を参照してください。
+
 **`'` / `"` は対象外です**（`FALLBACK_OPERATOR_UNSUPPORTED`）。これらは描画前に改行を伴うため、いずれの組み替えでも扱えません。v0.4.1 で `TJ` に対応したこととは切り離しています。
 
 段落の再流し込み・行の折り返し・ページ全体の再レイアウトは行いません。目的は「元 PDF が指定している後続文字位置を維持したまま、限定的に fallback font で文字を差し替える」ことです。**「`TJ` に対応したので任意の PDF を編集できる」わけではありません。**
