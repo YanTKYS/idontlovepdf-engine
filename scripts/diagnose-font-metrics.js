@@ -91,6 +91,14 @@ for (const font of report.filter((font) => only === null || font.name === only))
         console.log(`      inner     ${JSON.stringify(step.inner)}`);
         continue;
       }
+      if (step.step === "inline-dictionary") {
+        // The array's one element was a CIDFont dictionary written right there (PDF
+        // allows this alongside an indirect reference) -- there is nothing to resolve,
+        // so no reference, xref location, or object number applies to this hop.
+        console.log("    inline-dictionary: the array's own element is a dictionary, not a reference to one");
+        console.log(`      value     ${JSON.stringify(step.text.replace(/\s+/g, " ").slice(0, 300))}`);
+        continue;
+      }
       console.log(`    ${step.step}: ${step.reference} -> ${step.kind}${step.stream ? " (a stream object)" : ""}`);
       console.log(`      xref      ${place(step.location)}`);
       if (step.error) console.log(`      error     ${step.error}`);
@@ -98,7 +106,13 @@ for (const font of report.filter((font) => only === null || font.name === only))
     }
   }
   if (font.descendant) {
-    console.log(`  descendant font (object ${font.descendantObjectNumber}):`);
+    // An inline CIDFont dictionary (v0.4.3) is not an object of its own, so there is no
+    // object number to report for it -- only that the walk ended on one written directly
+    // inside the /DescendantFonts array (see the inline-dictionary trace step above).
+    const descendantLabel = font.descendantObjectNumber === null
+      ? "inline dictionary, no object of its own"
+      : `object ${font.descendantObjectNumber}`;
+    console.log(`  descendant font (${descendantLabel}):`);
     for (const key of ["Subtype", "BaseFont", "CIDSystemInfo", "CIDToGIDMap", "DW", "W"]) {
       console.log(`    /${key.padEnd(12)} ${entry(font.descendant, key)}`);
     }

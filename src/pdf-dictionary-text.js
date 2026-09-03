@@ -157,6 +157,47 @@ export function topLevelInteger(text, key) {
   return parseStrictInteger(bytesToText(bytes, offset, end));
 }
 
+/**
+ * The top-level elements of `/key`'s array value in a dictionary, each read whole
+ * via skipOneValue() above -- an indirect reference, a direct dictionary, or
+ * anything else PDF allows as an array element -- rather than by searching the
+ * array's raw text for a pattern. That distinction is what lets this tell "this
+ * array's own second element" apart from "a reference nested three levels inside
+ * this array's first element's own dictionary": a plain regex over the array's text
+ * cannot, and reading `/DescendantFonts [ << ... /W 25 0 R ... >> ]` that way is
+ * exactly what used to count `/W 25 0 R` (and every other reference inside the
+ * inline CIDFont dictionary) as if it were an element of the array itself, instead
+ * of the array's one genuine element -- the dictionary -- with an entry inside it.
+ *
+ * Returns null when `/key` is absent at the top level (see topLevelValueOffset()
+ * above), when its value is not a direct array (an indirect array object, `/key 11
+ * 0 R`, is the caller's to resolve and then re-read through this same function),
+ * or when the array's own `[`/`]` cannot be walked to a close -- a malformed array
+ * is not the same as an empty one, and must not be read as zero elements. Never
+ * throws: a malformed element inside the array (an unterminated nested dictionary,
+ * array, or string) is reported the same way, as null, rather than propagating a
+ * parse error out of what every caller here treats as a read that can safely fail.
+ */
+export function topLevelArrayElements(text, key) {
+  const offset = topLevelValueOffset(text, key);
+  if (offset === undefined) return null;
+  const bytes = textToBytes(text);
+  if (bytes[offset] !== 0x5b) return null;
+  try {
+    const elements = [];
+    let cursor = skipWhite(bytes, offset + 1);
+    while (cursor < bytes.length && bytes[cursor] !== 0x5d) {
+      const elementStart = cursor;
+      cursor = skipOneValue(bytes, cursor);
+      elements.push(bytesToText(bytes, elementStart, cursor));
+      cursor = skipWhite(bytes, cursor);
+    }
+    return bytes[cursor] === 0x5d ? elements : null;
+  } catch {
+    return null;
+  }
+}
+
 export function nameValue(text, key) {
   return text.match(new RegExp(`/${key}\\s*/([A-Za-z0-9_.+-]+)`))?.[1] ?? null;
 }

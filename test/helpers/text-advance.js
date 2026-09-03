@@ -76,14 +76,27 @@ function arrayTextOf(dictionary, key, objects) {
   return indirect ? objects.get(Number(indirect[1]))?.array ?? null : null;
 }
 
-/** The object number of the one font in `/DescendantFonts`, whether the array is direct or indirect. */
-function descendantNumberOf(type0, objects) {
+/**
+ * The descendant CIDFont's own dictionary text, however `/DescendantFonts` names it: a
+ * direct reference array (`[7 0 R]`), an indirect array object (`11 0 R` -> `[7 0 R]`), or
+ * -- the shape v0.4.3 added -- the array's one element written right there as a dictionary
+ * (`[ << ... >> ]`). The last is read with the same `balancedEnd()` bracket-depth walk
+ * `dictionariesOf()` above uses for every other dictionary in the file, not a plain regex
+ * over the array's text -- so a reference nested inside the inline dictionary (its own
+ * `/W`, `/FontDescriptor`, and the rest) is never mistaken for closing the array itself.
+ */
+function descendantDictionaryOf(type0, objects, dictionaries) {
   const direct = /\/DescendantFonts\s*\[\s*(\d+)\s+\d+\s+R/.exec(type0);
-  if (direct) return Number(direct[1]);
+  if (direct) return dictionaries.get(Number(direct[1])) ?? null;
+  const inlineOpener = /\/DescendantFonts\s*\[\s*(<<)/.exec(type0);
+  if (inlineOpener) {
+    const start = inlineOpener.index + inlineOpener[0].length - 2;
+    return type0.slice(start, balancedEnd(type0, start, "<<", ">>"));
+  }
   const indirect = /\/DescendantFonts\s+(\d+)\s+\d+\s+R/.exec(type0);
   const array = indirect ? objects.get(Number(indirect[1]))?.array : null;
   const inner = array ? /(\d+)\s+\d+\s+R/.exec(array) : null;
-  return inner ? Number(inner[1]) : null;
+  return inner ? dictionaries.get(Number(inner[1])) ?? null : null;
 }
 
 /** The value of `key`'s number, direct or indirect. */
@@ -127,7 +140,6 @@ export function fontTable(pdf) {
   const fonts = new Map();
   for (const entry of (/\/Font\s*<<([\s\S]*?)>>/.exec(page)?.[1] ?? "").matchAll(/\/([^\s/]+)\s+(\d+)\s+0\s+R/g)) {
     const type0 = dictionaries.get(Number(entry[2])) ?? "";
-    const descendant = descendantNumberOf(type0, objects);
     if (!/\/Subtype\s*\/Type0\b/.test(type0)) {
       // A simple font: one byte per code, widths indexed from /FirstChar.
       const first = numberOf(type0, "FirstChar", objects);
@@ -135,13 +147,14 @@ export function fontTable(pdf) {
       fonts.set(entry[1], Object.assign((code) => table[code - first] ?? 0, { codeBytes: 1 }));
       continue;
     }
+    const descendant = descendantDictionaryOf(type0, objects, dictionaries);
     if (descendant === null) {
       // A Type0 with no descendant font states no widths at all. Only the fixtures that
       // exist to be refused look like that, and none of them compares positions.
       fonts.set(entry[1], Object.assign(() => 1000, { codeBytes: 2 }));
       continue;
     }
-    const { widths, defaultWidth } = cidWidthsOf(dictionaries.get(descendant) ?? "", objects);
+    const { widths, defaultWidth } = cidWidthsOf(descendant, objects);
     fonts.set(entry[1], Object.assign((code) => widths.get(code) ?? defaultWidth, { codeBytes: 2 }));
   }
   return fonts;
