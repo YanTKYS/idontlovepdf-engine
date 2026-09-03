@@ -3,8 +3,14 @@
 `22550.pdf` の `/F3` で `令和 → しょ` が `FALLBACK_FONT_METRICS_UNAVAILABLE`
 （開発者向け `unsafeReason: descendant-font-unresolved`）になる件の調査記録です。
 
-**現状: 原因未確定。production コードは変更していません（engine は v0.4.2 のまま）。**
+**現状: 原因未確定。`22550.pdf` に対する対応範囲の拡張は行っていません（engine は v0.4.2 のまま）。**
 この document は「何が分かっていて、次に何を実行すれば確定するか」を残すためのものです。
+
+なお、診断過程で発見した `/DescendantFonts` の direct / indirect 非対称
+（direct array に複数要素があるときだけ先頭を採用して計測していた問題）は、
+production の `resolveDescendantFont()` を変更して安全側へ統一しました。
+対応範囲を**狭める**修正であり、`22550.pdf` の件を解決するものではありません。
+詳細は下記「複数要素の扱い」を参照してください。
 
 ## なぜ engine 側で確定できなかったか
 
@@ -37,6 +43,8 @@ endobj
 3. 解決できたが dictionary でも array でもない
 4. array だが中身が `<num> <gen> R` ひとつ**だけ**ではない
 
+### 複数要素の扱い
+
 `/DescendantFonts` は PDF 9.7.6.2 で「要素ひとつの array」と定められています。
 複数要素はいずれも仕様違反であり、どれを使うかは file に書かれていないため、
 **direct / indirect のどちらの書き方でも拒否します**（4 に該当）。
@@ -44,7 +52,9 @@ endobj
 これは「最初に見つかった CIDFont を使う」推測にあたるため取り除きました。
 writer がどちらの書き方を選んだかで、計測するか拒否するかが変わってはいけません。
 
-なお、**generation 番号の不一致は原因になりません**。
+### 原因から除外できるもの
+
+**generation 番号の不一致は原因になりません**。
 `PdfStructure#object()` / `#resolveObject()` は object 番号だけで引くため、
 generation が違っても解決自体は成功します。
 これは以前からの挙動で本件の原因ではありませんが、
