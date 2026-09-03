@@ -150,8 +150,11 @@ const REPLACEMENT_MODE = {
  */
 const POSITION_SAFE_AFTER = new Set(["end-of-text-object", "repositioned"]);
 
-function refusal(code, reason, unsafeReason) {
-  return unsafeReason ? { allowed: false, code, reason, unsafeReason } : { allowed: false, code, reason };
+function refusal(code, reason, unsafeReason, diagnostics) {
+  const result = { allowed: false, code, reason };
+  if (unsafeReason) result.unsafeReason = unsafeReason;
+  if (diagnostics) result.diagnostics = diagnostics;
+  return result;
 }
 
 /**
@@ -464,6 +467,19 @@ function splitRunOperand(editor, entry, run) {
  * entries the fallback font is embedded with, so both sides are the numbers that will
  * actually be in the file. Where they cannot be had exactly, this refuses.
  *
+ * Keeping the following text at `advance(original)` is necessary but not sufficient: `n`
+ * can always be chosen to land the following text exactly there, however wide the
+ * replacement is, because `n` only ever moves where the NEXT string starts. It says
+ * nothing about whether the replacement's own glyphs -- drawn at their natural width,
+ * with no `n` applied to them -- already reach past that point (v0.4.4; this is what let
+ * `令和 -> しょうわ` through in v0.4.3, drawn over the `8` that followed it). So before `n`
+ * is computed, `replacementWidth` (`W_replacement`) is compared against `width - between`
+ * (`W_original` minus the same `K` the adjustment arithmetic below uses) -- the exact
+ * advance the original text had from the start of the match to the following text, using
+ * the very numbers this function already reads for the position fix. A replacement wider
+ * than that is refused: nothing here moves the following text further away, shrinks the
+ * replacement, or reflows anything to make room.
+ *
  * When nothing at all is drawn from the end of the match -- no elements after it, no suffix
  * in its own operand, and an `ET`/`BT`/`Td`/`TD`/`Tm`/`T*` next -- no adjustment is needed
  * or written, and no metrics are required: that is the same situation the `Tj` rewrite has
@@ -572,6 +588,25 @@ function planTextArrayRewrite(editor, pieces, glyphs, fallback) {
       );
     }
     const replacementWidth = glyphs.reduce((sum, glyph) => sum + glyphSpaceWidth(fallback, glyph.advanceWidth), 0);
+    // availableAdvance is the same number the adjustment arithmetic below already treats
+    // as "how far the original text advanced from here to where the next unmoved text
+    // begins" -- W_original minus the displacements the match's own operands were
+    // separated by (see the docstring above). Comparing the replacement's own natural
+    // advance against it, before any adjustment is chosen, is what catches a replacement
+    // that would visually overrun the slot: an adjustment can always pull a *narrower*
+    // replacement's trailing text back into place, but nothing pulls a *wider*
+    // replacement's own glyphs back out of text they have already been drawn over. This
+    // is deliberately the same width and the same "between" this function already
+    // computed for the position fix -- not a second, independent measurement of the page.
+    const availableAdvance = width - between;
+    if (replacementWidth > availableAdvance) {
+      return refusal(
+        "FALLBACK_LAYOUT_UNSUPPORTED",
+        `This replacement would be ${replacementWidth} glyph-space units wide in the fallback font, but only ${availableAdvance} units are available before text that must keep its position -- so the replacement's own glyphs would be drawn over that text. Nothing is moved, shrunk, or reflowed to make room; a shorter replacement is written normally.`,
+        "fallback-replacement-overflows-slot",
+        { replacementAdvance: replacementWidth, availableAdvance }
+      );
+    }
     const value = replacementWidth - width + between;
     const formatted = formatAdjustment(value);
     // The invariant the whole rewrite rests on, checked rather than trusted: what the
@@ -1034,6 +1069,7 @@ function planError(plan) {
   error.code = plan.code;
   if (plan.unsafeReason) error.unsafeReason = plan.unsafeReason;
   if (plan.characters?.length) error.characters = plan.characters;
+  if (plan.diagnostics) error.diagnostics = plan.diagnostics;
   if (plan.cause) error.cause = plan.cause;
   return error;
 }
@@ -1538,6 +1574,9 @@ export class PdfTextEditor {
       // The characters no available font can write, so a caller can name them to a user
       // without reading the message or knowing anything about CMaps.
       if (plan.characters?.length) result.characters = plan.characters;
+      // The two widths a "fallback-replacement-overflows-slot" unsafeReason was measured
+      // from, so a caller diagnosing the refusal can see them without parsing `reason`.
+      if (plan.diagnostics) result.diagnostics = plan.diagnostics;
       return result;
     }
     return { allowed: true, mode: plan.mode };

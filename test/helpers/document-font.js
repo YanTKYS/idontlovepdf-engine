@@ -6,13 +6,19 @@
 // down the fallback path.
 //
 // The widths are deliberately not all 1000. "Japanese is full-width so the widths must
-// match" is exactly the assumption these versions are not allowed to make: 和 is 950 and 8
-// is 500, so any rewrite that does not actually do the arithmetic moves the page.
+// match" is exactly the assumption these versions are not allowed to make: 8 is 500, 申
+// and 請 are 900, で and す are 850, so any rewrite that does not actually do the
+// arithmetic moves the page. 令 and 和 are both full-width (1000): the real fallback font
+// (BIZ UDGothic) draws every common kanji and hiragana it has at exactly that width, so
+// giving 令和 a narrower combined width than that would make the "safe to place" fixtures
+// below fail for a reason with nothing to do with what they test -- the fallback font's
+// own widths, not the arithmetic that keeps following text in place (see v0.4.4's
+// overflow-safety check in planTextArrayRewrite(), src/pdf-document.js).
 export const encode = (value) => new TextEncoder().encode(value);
 
 export const FONT = new Map([
   ["令", { code: "0001", width: 1000 }],
-  ["和", { code: "0002", width: 950 }],
+  ["和", { code: "0002", width: 1000 }],
   ["8", { code: "0003", width: 500 }],
   ["年", { code: "0004", width: 1000 }],
   ["度", { code: "0005", width: 1000 }],

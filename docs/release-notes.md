@@ -2,6 +2,26 @@
 
 各versionのリリース内容を新しい順に記載します。H2見出しには、`v`付きversionとGitHub Releaseのtitleを記載します。
 
+## v0.4.4 - Fallback replacement must not overrun the text after it
+
+- **実機で確認された視覚的な不具合の修正です。** `idontlovepdf` + engine v0.4.3 で公開PDF `22550.pdf` の `令和8年度` を編集し、`令和 → しょ` は成功しましたが、`令和 → しょうわ` は `allowed: true` となり置換・保存まで進んだ結果、保存後のプレビューで `しょうわ` の末尾 `わ` と後続の `8` が重なって描画されました
+- **原因は、`TJ` fallback の adjustment 計算が「後続文字の開始位置を維持すること」だけを保証し、「置換文字列自身がその位置まで描画されないこと」を保証していなかったことです。** v0.4.1〜v0.4.3 の adjustment `n`（`n = 置換文字列の合計幅 - 元 match の合計幅 + match 内部の adjustment 合計`）は、後続文字の開始位置をどれだけ動かせば元の位置に戻るかを計算するだけで、置換文字列自身の描画幅がその位置を超えていないかは確認していませんでした。置換文字列が元の match より広い場合、adjustment は後続文字の開始位置を正しく元へ戻せても、置換文字列自身の glyph がその位置より右側まで描画され、後続文字と重なります
+- **`checkTextMatchReplacement()` / `replaceTextMatch()` が共有する既存の TJ planner（`planTextArrayRewrite()`, `src/pdf-document.js`）に、置換前の安全性判定を追加しました。** 新しい計算式や新しい measurement は導入していません。同じ関数がすでに求めていた次の 2 値を比較するだけです。
+  - `availableAdvance`（`元の match の合計幅 - match 内部の adjustment 合計`）: 置換開始位置から、同一 text flow 上で位置を維持すべき最初の後続文字が始まる位置までの advance。既存の `/Widths`・`/W`・`/DW`・TJ adjustment の読み取りをそのまま再利用しています
+  - `replacementAdvance`（`glyphSpaceWidth()` の合計）: fallback font で置換文字列を自然に描画したときの advance。既存の計算をそのまま再利用しています
+  
+  `replacementAdvance > availableAdvance` の場合は置換前に拒否します。等しい場合は許可します（浮動小数点の曖昧な許容誤差は導入していません）。`checkTextMatchReplacement()` と `replaceTextMatch()` は同じ planner を通るため、判定が食い違うことはありません
+- **`令和 → しょ` は引き続き成功します。** `令和 → しょうわ` は `allowed: false`（`code: "FALLBACK_LAYOUT_UNSUPPORTED"`、`unsafeReason: "fallback-replacement-overflows-slot"`）になり、置換・保存を実行する前に拒否されます。拒否時は `diagnostics: { replacementAdvance, availableAdvance }` を返し、原因を数値で確認できます
+- **同一 text flow 上の後続文字が置換文字列の幅に依存しないと証明できる場合は、この判定を適用しません。** match の直後に同一 flow の文字が存在しない、`ET`、明示的な `Td`/`TD`/`Tm`/`T*` によって位置が再設定される場合がこれにあたります（v0.4.1 以来の「何も描画されない場合は adjustment 不要」というルールと同じ判定です）。「ページの右側に空きがありそうだから許可する」といった geometry の推測はしません
+- **後続文字を右へ移動する、文字を横方向に縮小する、行を再流し込みする、といった代替策は実装していません。** 安全にその場所へ置けないなら断る、という既存方針のままです。ページ全体の汎用的な collision detection でもありません — 保証するのはあくまで同一 text flow 上で位置を維持する後続文字との衝突防止です
+- **`fallback-font` / `fallback-font-partial` / `fallback-font-multi-run` のいずれにも同じ判定を適用します。** 判定は `TJ` で描画された match を扱う `planTextArrayRewrite()` 1 箇所にあり、この 3 つの `mode` はすべてそこを通るため、mode ごとに別の判定を持っていません。`Tj` で描画された match は元々このリスクがありません（後続文字は置換文字列の実際の幅から自然に続けて描画されるだけで、位置を「元へ戻す」処理をしないため、置換文字列が広くても後続文字と重なりません）
+- **`FALLBACK_LAYOUT_UNSUPPORTED` を再利用しました。** 本件専用の新しい公開 error code は追加していません。開発者向けの詳細は `unsafeReason: "fallback-replacement-overflows-slot"` として区別できます
+- **既存の v0.4.3 の成果は変更していません。** inline `/DescendantFonts` dictionary、`/W`・`/DW` の間接 object 解決、実 PDF `22550.pdf` の font metrics 解決は、そのまま再利用しています。今回判明したのは「font metrics を正確に取得できること」と「長い置換を視覚的に安全に配置できること」が別問題だという点です
+- **fallback font の書体差は今回の対象外です。** `令和 → しょ` は重なりなく成功しますが、fallback font（BIZ UDGothic）は元 PDF のフォントと書体が異なります。明朝系 fallback の追加・Serif/Sans 判定・FontDescriptor の Flags による font 選択・複数 fallback font・font matching は実装していません。別課題として残しています
+- **検証。** `test/fallback-font-overflow.test.js` を追加しました。availableAdvance と replacementAdvance が「狭い」「等しい」「広い」場合の許可・拒否、後続位置が置換文字列の幅に依存しないことを証明できる場合の許可、`TJ` 配列内部の adjustment（正・負・ゼロ）が実際の利用可能幅に反映されることを、それぞれ確認します。`test/fallback-font-tj.test.js` に、実際に報告された `令和 → しょうわ` の重なりと同じ形（同一 TJ 配列内・別 operator の `Tj`・別 operator の `TJ`）を対象にした拒否テストと、拒否時に document bytes / pending state / history / fallback font object のいずれも変化しないことを確認するテストを追加しました。既存の synthetic fixture の一部（`test/helpers/document-font.js` の `令`・`和` の width と、それに依存する `test/fallback-font-tj.test.js` / `test/font-metrics-indirect.test.js` / `test/font-metrics-inline-descendant.test.js` / `test/browser/fallback-font.test.js`）は、実際の fallback font（BIZ UDGothic）の kanji/kana が例外なく全角（1000 glyph-space units）であることに合わせて調整しました（従来の `和 = 950` は意図的な非全角フィクスチャでしたが、これを残すと `しょ` が real font 換算で必ず overflow してしまい、v0.4.3 で実 PDF で確認できていた `令和 → しょ` の成功シナリオを synthetic test で再現できなくなるため）
+- 公開 API（`setFallbackFont()` / `searchText()` / `checkTextMatchReplacement()` / `replaceTextMatch()` / `save()` / `ENGINE_VERSION`）の形は変更していません。新しい `unsafeReason` の値（`fallback-replacement-overflows-slot`）と、拒否結果への `diagnostics` フィールドの追加のみです。追加依存もありません
+- v0.4.3 までの挙動を維持: classic xref、xref stream、Object Stream、R4/AESV2、R6/AESV3、`ToUnicode`、direct/indirect/inline `/DescendantFonts`、`/W`、`/DW`、`Tj`、`TJ`、`'`、`"`、既存 font 置換、same-length、variable-length-safe、削除、複数 run 検索・置換、`fallback-font`・`fallback-font-partial`・`fallback-font-multi-run`、fallback font の再利用、save → reopen、check と replace の判定一致、atomic な置換、browser bundle、HTTP 環境（Web Crypto なし）対応
+
 ## v0.4.3 - Inline descendant CIDFont dictionaries
 
 - **v0.4.2 で`/W 25 0 R`まで解決可能になった`22550.pdf`の`/F3`が、それでも`descendant-font-unresolved`だった原因を解決した version です。** 原因は`/DescendantFonts`が PDF 仕様の許すもう一つの書き方——CIDFont dictionary を array の中に直接書く inline dictionary（`/DescendantFonts [ << ... >> ] `）——で書かれていたことでした。`/DescendantFonts [7 0 R]`のような indirect reference ではありません

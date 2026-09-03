@@ -82,7 +82,11 @@ export type PdfTextEditorErrorCode =
   | "FALLBACK_CHAR_SPACING_UNSUPPORTED"
   /** The match's runs are not simply adjacent, so they cannot be redrawn as one piece. */
   | "FALLBACK_MULTI_RUN_UNSUPPORTED"
-  /** The page's structure leaves nowhere safe to put, or to reach, the fallback font. */
+  /**
+   * The page's structure leaves nowhere safe to put, or to reach, the fallback font --
+   * or (see `"fallback-replacement-overflows-slot"` below) the replacement itself would
+   * be drawn wider than the space the following text's position leaves for it.
+   */
   | "FALLBACK_LAYOUT_UNSUPPORTED"
   /**
    * Word spacing (`Tw`) is in force and the replacement contains a space -- or a `TJ`-drawn
@@ -138,9 +142,9 @@ export type TextMatchReplacementMode =
  */
 
 /**
- * Why a length-changing multi-run replacement could not be written safely. Secondary
- * detail alongside `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED`; describes the structure only,
- * never the document's content.
+ * Why a replacement could not be written safely. Secondary detail alongside
+ * `MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED` or `FALLBACK_LAYOUT_UNSUPPORTED`; describes the
+ * structure only, never the document's content.
  */
 export type TextMatchReplacementObstacle =
   /**
@@ -153,7 +157,16 @@ export type TextMatchReplacementObstacle =
   /** A `Tc`/`Tw`/`Tz`/`Tr`, colour, or marked-content operator sits between them. */
   | "text-state-boundary"
   /** The match's runs are not attached to each other in a shape this version knows. */
-  | "unsupported-topology";
+  | "unsupported-topology"
+  /**
+   * A `TJ`-drawn replacement, written through the fallback font at its natural width,
+   * would reach past where the following text in the same text flow must keep starting --
+   * so its own glyphs would be drawn over that text. The `TJ` adjustment that holds the
+   * following text's position can always be chosen; it cannot un-draw the replacement's
+   * own glyphs from the space that adjustment reclaims. See `diagnostics` on the same
+   * refusal for the two widths (in PDF glyph-space units) that were compared.
+   */
+  | "fallback-replacement-overflows-slot";
 
 /**
  * Why a font's glyph widths could not be established exactly. Secondary detail alongside
@@ -221,6 +234,15 @@ export type TextMatchReplacementCheck =
        * without reading `reason` or knowing anything about a PDF's fonts.
        */
       readonly characters?: readonly string[];
+      /**
+       * The two widths, in PDF glyph-space units (1000 per em, independent of font size
+       * and horizontal scaling), a `"fallback-replacement-overflows-slot"` unsafeReason
+       * was measured from: `replacementAdvance` is how wide the replacement would be in
+       * the fallback font, `availableAdvance` how much room the following text's position
+       * leaves for it. Present so a caller can log or diagnose a refusal exactly, without
+       * a normal user ever needing to see either number.
+       */
+      readonly diagnostics?: { readonly replacementAdvance: number; readonly availableAdvance: number };
     };
 
 export class PdfTextEditor {

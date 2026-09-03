@@ -2,7 +2,7 @@
 
 既存 PDF の content stream にあるテキスト表示オペランドを、ブラウザ内だけで置換する PDF 処理エンジンです。Apryse WebViewer や Foxit PDF SDK for Web が提供する「既存本文編集」のうち、最小限の置換処理を、サーバー送信・外部 API・実行時依存パッケージなしで実現します。
 
-> **スコープ:** PDF の文字列は、見た目の文章ではなく、フォント固有の文字コードと描画命令です。本エンジンはレイアウトを再構成せず、既存の `Tj`、`TJ`、`'`、`"` の文字列オペランドを置換します。行の折返し、段落の再流し込み、ページ全体の再レイアウトは行いません。元 PDF の font で書けない文字は、呼び出し側が渡した fallback font を埋め込んで描画できます（`Tj` は v0.4.0、`TJ` は v0.4.1 から。いずれも**後続文字の位置を維持できることを証明できる範囲に限り**対応し、それ以外は拒否します）。**任意の PDF を完全に編集できることを保証するものではありません。** 暗号化 PDF は認証・復号・検索まで対応しますが、**暗号化 PDF への変更の再保存（再暗号化）は未対応**です。複数の text run にまたがる一致で置換前後の文字数が変わる場合は、**engine が安全性を証明できる構造に限って**対応し、それ以外は拒否します（理由と対応範囲は [`replaceTextMatch()`](#await-editorreplacetextmatchmatchid-replacement) を参照）。
+> **スコープ:** PDF の文字列は、見た目の文章ではなく、フォント固有の文字コードと描画命令です。本エンジンはレイアウトを再構成せず、既存の `Tj`、`TJ`、`'`、`"` の文字列オペランドを置換します。行の折返し、段落の再流し込み、ページ全体の再レイアウトは行いません。元 PDF の font で書けない文字は、呼び出し側が渡した fallback font を埋め込んで描画できます（`Tj` は v0.4.0、`TJ` は v0.4.1 から。いずれも**後続文字の位置を維持できることを証明できる範囲に限り**対応し、それ以外は拒否します。`TJ` はさらに v0.4.4 で、置換文字列自身が後続文字の位置まで描画されないことも確認し、収まらない場合は拒否します）。**任意の PDF を完全に編集できることを保証するものではありません。** 暗号化 PDF は認証・復号・検索まで対応しますが、**暗号化 PDF への変更の再保存（再暗号化）は未対応**です。複数の text run にまたがる一致で置換前後の文字数が変わる場合は、**engine が安全性を証明できる構造に限って**対応し、それ以外は拒否します（理由と対応範囲は [`replaceTextMatch()`](#await-editorreplacetextmatchmatchid-replacement) を参照）。
 
 ## 目的・位置付け
 
@@ -156,6 +156,8 @@ const matches = await editor.searchText("令和");
 await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font には無い文字
 ```
 
+上の例が実際に成功するかどうかは、この箇所の描画構造（`TJ` かどうか、後続文字がその位置に依存するか）と、`しょうわ` が fallback font で描画したときの幅が元の `令和` の占めていた幅に収まるかによります（v0.4.4、詳細は後述の「fallback font で置換できる構造」を参照）。**収まらない場合は `checkTextMatchReplacement()` / `replaceTextMatch()` が置換前に拒否し、`replaceTextMatch()` は例外を投げます。**
+
 - **設定するだけで自動的に使い分けます。** `checkTextMatchReplacement()` / `replaceTextMatch()` は常に元 PDF の font を先に試し、書けない文字があるときだけ fallback font を使います。利用側が二重のロジックを持つ必要はありません
 - **未設定なら従来どおり**の挙動です（書けない文字は `FONT_ENCODING_UNSUPPORTED`）
 - font は **TrueType**（`glyf` outline）である必要があります。それ以外は `FALLBACK_FONT_INVALID` で拒否します
@@ -217,12 +219,41 @@ n = (置換文字列の合計幅) - (元の match の合計幅) + (match 内部�
 
 match の終端から**何も描画されない**場合（match が列の末尾で、直後が `ET` / `BT` / `Td` / `TD` / `Tm` / `T*`）は adjustment 自体が不要なので書きません。この場合は font metrics も必要ありません（`Tj` と同じ扱いです）。
 
+**置換文字列自身が、後続文字のために空けるべき幅を超えて描画されないことも確認します（v0.4.4）。**
+
+上の adjustment は「後続文字の開始位置」を元の位置へ戻しますが、それだけでは**視覚的な安全性を意味しません**。置換文字列が元の match より広い場合、adjustment は後続文字の開始位置を正しく戻せても、置換文字列自身の glyph がその位置より右側まで描画され、後続文字と重なります。
+
+```text
+元:      令和8年度  (令和 は合計 2000 glyph-space units)
+置換案: しょうわ8年度 (しょうわ は fallback font で合計 4000 units)
+```
+
+このケースでは `8年度` の開始位置は正しく元の位置に戻りますが、`しょうわ` 自身の描画がその位置を超えて `8` に重なります。v0.4.3 まではこれを `allowed: true` として通していました（実 PDF `令和 → しょうわ` で実際に確認された不具合です）。v0.4.4 では、上の adjustment 計算で既に得ている 2 つの数値
+
+- `availableAdvance` — 置換開始位置から、同一 text flow 上で位置を維持すべき最初の後続文字が始まる位置までの advance（`元の match の合計幅 - match 内部の adjustment 合計`。上の `n` の式の一部としてすでに計算済みの値です）
+- `replacementAdvance` — fallback font で置換文字列を自然に描画したときの advance（`glyphSpaceWidth()` の合計。同じくすでに計算済みの値です）
+
+を比較し、
+
+```text
+replacementAdvance > availableAdvance
+```
+
+の場合は置換前に拒否します（`FALLBACK_LAYOUT_UNSUPPORTED`、`unsafeReason: "fallback-replacement-overflows-slot"`）。狭い置換・幅が完全に一致する置換は従来どおり許可します（浮動小数点の曖昧な許容誤差は導入していません。比較は adjustment 計算と同じ整数 glyph-space 表現で行います）。後続文字を右へ移動する、文字を縮小する、行を再流し込みするといった対応は行いません — **安全にその場所へ置けないなら断る**という既存方針のままです。
+
+`checkTextMatchReplacement()` の拒否結果には、診断用に `diagnostics: { replacementAdvance, availableAdvance }` が付きます（通常の利用者向け表示にこの数値をそのまま出す必要はありません）。
+
+この判定は `checkTextMatchReplacement()` と `replaceTextMatch()` が共有する同じ planner の中で行われるため、`checkTextMatchReplacement()` が `allowed: true` を返した置換が `replaceTextMatch()` で失敗することはありません。また、この安全性の保証は**同一 text flow 上で位置を維持する後続文字との衝突を防止するもの**であり、ページ上のすべての object との非衝突を保証するものではありません（ページ全体の汎用的な collision detection は範囲外です）。
+
+`checkTextMatchReplacement()`/`replaceTextMatch()` が「後続文字の位置はこの置換の幅に依存しない」と証明できる場合（match の直後に同一 flow 上の文字が存在しない、`ET`、明示的な `Td`/`TD`/`Tm`/`T*` による reposition など、上の「何も描画されない」場合と同じ判定）は、この幅の比較自体を行いません。「ページの右側に空きがありそうだから許可する」といった geometry の推測はしません。
+
 `TJ` でも次の場合は**引き続き拒否**します。
 
 - 元 font の glyph 幅を正確に読み取れない（下記「font metrics をどこから読むか」を参照）→ `FALLBACK_FONT_METRICS_UNAVAILABLE`
 - 上記の `Tc` / `Tw` の条件を満たさない → `FALLBACK_CHAR_SPACING_UNSUPPORTED` / `FALLBACK_WORD_SPACING_UNSUPPORTED`
 - match の operand 間に `Tc` / `Tw` / `Tz` / `Tr` / 色指定 / marked content などがある（異なる text state で描画されているものを 1 つとして描き直すことになるため）→ `FALLBACK_MULTI_RUN_UNSUPPORTED`
 - 配列の外に数値が書かれている等、対象範囲を `[`・`]`・string・数値・`TJ` だけの列として読み切れない（配列外の数値は reader が字送りとして扱わないため、字送りとみなすと位置がずれる）→ `FALLBACK_LAYOUT_UNSUPPORTED`
+- 置換文字列自身が後続文字の位置まで描画されてしまう（上記）→ `FALLBACK_LAYOUT_UNSUPPORTED`（`unsafeReason: "fallback-replacement-overflows-slot"`）
 - 縦書き font / writing mode 不明 → `FALLBACK_WRITING_MODE_UNSUPPORTED`（v0.4.0 と同じ）
 - match が `Tj` と `TJ` にまたがる → `FALLBACK_OPERATOR_UNSUPPORTED`
 
@@ -256,7 +287,7 @@ v0.4.1 では、この値が font dictionary の中に**直接**書かれてい�
 
 word spacing（`Tw`）が有効な箇所では、置換文字列に**半角スペースを含められません**。`Tw` は 1 バイトの文字コード 32 にのみ効き、fallback font は 2 バイト符号化で描画されるため、文書内の他のスペースと同じ字間になりません。
 
-部分置換では、置換後の文字列の幅に応じて**後続文字が自然に前後します**（`申請は令和です → 申請はしょうわです` なら `です` が後ろへ移動します）。これは通常のテキスト編集として期待される挙動です。
+部分置換では、置換後の文字列の幅に応じて**後続文字が自然に前後します**（`申請は令和です → 申請はしょうわです` なら `です` が後ろへ移動します）。これは通常のテキスト編集として期待される挙動です。これは `Tj` で描画されている場合の挙動です。`TJ` で描画されている場合は、上述のとおり後続文字の位置を元のまま維持するよう積極的に調整し（前後には動きません）、その調整でも安全に収まらない場合は v0.4.4 の判定で置換自体を拒否します。
 
 ### `await editor.checkTextMatchReplacement(matchId, replacement)`
 
@@ -448,6 +479,7 @@ Web Crypto API（`crypto.subtle`）は**あれば使う**位置づけで、必�
 - `test/fallback-font-no-subtle.test.js` — `crypto.subtle` なしで `setFallbackFont()` → `令和 → しょうわ` → `save()` → 開き直しまでを検証します
 - `test/browser/fallback-font.test.js` — 同じ流れを、**配布bundleを読み込んだChromiumのページから `crypto.subtle` を取り除いた状態**で検証します。`TJ` 置換後の PDF を Chromium 内蔵の PDF viewer で開く検証も含みます
 - `test/fallback-font-tj.test.js` — `TJ` で描画された match の fallback 置換。PDF の字送り式を **engine とは独立に実装した simulator** で、置換前後の各 glyph の描画 x 座標を突き合わせ、後続文字が動いていないことを機械的に検証します
+- `test/fallback-font-overflow.test.js`（v0.4.4） — 置換文字列自身が後続文字の位置まで描画されないことの安全性判定。狭い／幅が一致する置換は許可、広い置換（`令和 → しょうわ` の実例を含む）は置換前に拒否、後続位置が置換文字列の幅に依存しない場合は幅にかかわらず許可、`TJ` 配列内部の adjustment（正・負・ゼロ）が実際の利用可能幅にどう影響するかを検証します
 - `test/sha2.test.js` / `test/aes.test.js` — 両経路の出力を `node:crypto`（OpenSSL）と、および相互に照合します
 
 ## モジュール構成（公開API / 内部実装）

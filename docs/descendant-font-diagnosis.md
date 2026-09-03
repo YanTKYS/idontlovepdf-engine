@@ -204,3 +204,12 @@ commit・cache・workflow artifact のいずれにも残していません）。
 詳しい手順は `scripts/verify-real-pdf-edit.js`・`scripts/verify-real-pdf-position.py`・
 `scripts/verify-real-pdf-viewer.js` と、それらを呼び出す
 `.github/workflows/diagnose-real-pdf.yml` の `run_edit_test` 入力を参照してください。
+
+**`令和 → しょうわ` は視覚的に安全ではありません（v0.4.4）。** 上の `令和 → しょ` は
+fallback font で描画したときの幅が元の `令和` の占めていた幅に収まりますが、
+`令和 → しょうわ` は収まらず、置換文字列自身が後続の `8` の位置まで描画されて
+重なります。この workflow の `unsafe_replacement` 入力（既定値 `しょうわ`）は、
+`checkTextMatchReplacement()` がこれを置換前に拒否すること（`allowed: false`、
+`code: "FALLBACK_LAYOUT_UNSUPPORTED"`、`unsafeReason: "fallback-replacement-overflows-slot"`）
+と、`replaceTextMatch()` を呼んでも document が変化しないことを確認します。詳細は
+[release notes の v0.4.4](release-notes.md) を参照してください。
