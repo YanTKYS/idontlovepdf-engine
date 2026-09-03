@@ -61,6 +61,15 @@ generation が違っても解決自体は成功します。
 fail closed を原則とする engine としては後日の安全性レビュー対象です（本 document の範囲外）。
 **Object Stream 内にあること自体も原因になりません**（test で確認済み）。
 
+## ローカル環境を用意しない場合
+
+ローカルへ Node.js の依存関係を構築しなくても、GitHub Actions の
+`Diagnose real PDF font metrics`（`.github/workflows/diagnose-real-pdf.yml`）
+を手動実行すれば、GitHub-hosted runner 上で同じ診断を実行できます。
+GitHub の Actions タブから `workflow_dispatch` で実行し、PDF URL・検索文字・font 名を
+指定してください（初期値はこの `22550.pdf` の調査用です）。結果は job log にそのまま出力されます。
+通常の push/PR CI（`ci.yml`）とは分離されており、通常の CI では実行されません。
+
 ## 実行してほしい診断コマンド
 
 ```bash

@@ -1,0 +1,74 @@
+name: Diagnose real PDF font metrics
+
+# Manual-only. This fetches an arbitrary external PDF into a GitHub-hosted
+# runner and is intentionally kept separate from the regular push/PR CI in
+# ci.yml, which never makes network access.
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_url:
+        description: "PDF URL to fetch and diagnose"
+        required: true
+        default: "https://www.city.itoman.lg.jp/uploaded/attachment/22550.pdf"
+      text:
+        description: "Text to search for"
+        required: true
+        default: "令和"
+      font:
+        description: "Font resource name (without the leading /)"
+        required: true
+        default: "F3"
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch the target PDF
+        env:
+          PDF_URL: ${{ inputs.pdf_url }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/input.pdf"
+          status=$(curl --silent --show-error --location --retry 2 \
+            --output "$dest" --write-out '%{http_code}' "$PDF_URL")
+          echo "HTTP status: $status"
+          echo "URL: $PDF_URL"
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "::error::Could not fetch the PDF from this GitHub-hosted runner. URL: $PDF_URL, HTTP status: $status"
+            exit 1
+          fi
+          echo "PDF_PATH=$dest" >> "$GITHUB_ENV"
+
+      - name: Verify the download is actually a PDF
+        run: |
+          set -euo pipefail
+          if [ ! -s "$PDF_PATH" ]; then
+            echo "::error::Downloaded file is missing or empty: $PDF_PATH"
+            exit 1
+          fi
+          header=$(head -c 5 "$PDF_PATH")
+          if [ "$header" != "%PDF-" ]; then
+            echo "::error::Downloaded file does not start with %PDF- (got: $header). This is likely an HTML error page, not a PDF."
+            exit 1
+          fi
+          echo "Downloaded $(wc -c < "$PDF_PATH") bytes, header looks like a PDF."
+
+      - name: Run font metrics diagnosis
+        env:
+          DIAG_TEXT: ${{ inputs.text }}
+          DIAG_FONT: ${{ inputs.font }}
+        run: |
+          set -euo pipefail
+          node scripts/diagnose-font-metrics.js "$PDF_PATH" --font "$DIAG_FONT" --text "$DIAG_TEXT"
