@@ -1,5 +1,6 @@
-import { encodeHex, encodeLiteral, replaceTextRuns, scanTextRuns } from "./content-stream.js";
-import { FALLBACK_FONT_MARKER, buildFallbackFontObjects, fingerprintFont, freeResourceName, glyphsFor, glyphsFromToUnicode, identityEncode, parseFallbackFont } from "./fallback-font.js";
+import { encodeHex, encodeLiteral, parseTextArrayRegion, replaceTextRuns, scanTextRuns } from "./content-stream.js";
+import { FALLBACK_FONT_MARKER, buildFallbackFontObjects, fingerprintFont, freeResourceName, glyphSpaceWidth, glyphsFor, glyphsFromToUnicode, identityEncode, parseFallbackFont } from "./fallback-font.js";
+import { loadFontWidths, measureCodes } from "./font-metrics.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
 import { summarizeEncryption } from "./encryption.js";
 import { deflate, decodeStreamBytes, filters } from "./flate.js";
@@ -342,41 +343,362 @@ async function adoptExistingFallbackFont(editor, fallback) {
   return null;
 }
 
+/** Whether two operand byte strings are the same bytes. */
+function sameBytes(left, right) {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return false;
+  return true;
+}
+
+/**
+ * A `TJ` adjustment as a plain decimal a reader will read back as exactly this number.
+ *
+ * Returns null when it cannot be written exactly -- rather than rounding, which would put
+ * the following text somewhere other than where the PDF had it. Widths are whole
+ * glyph-space units in every font this engine can read metrics from, so this returns an
+ * integer in practice; the fractional path exists so a `/Widths` entry written as a real
+ * is refused rather than silently truncated. Exponent notation is never produced (a PDF
+ * number may not use it).
+ */
+function formatAdjustment(value) {
+  if (!Number.isFinite(value)) return null;
+  // `-0` is a real JS value and would be written as "-0"; it is the same displacement as 0.
+  const text = Number.isInteger(value)
+    ? String(value === 0 ? 0 : value)
+    : value.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+  // A PDF number is plain decimal: no exponent, however JS chose to spell it. Anything
+  // that does not read back as the same value is refused rather than rounded into place.
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(text)) return null;
+  return Number(text) === value ? text : null;
+}
+
+/**
+ * Splits one run's operand bytes into the part before the match, the match itself, and the
+ * part after -- and proves the split by re-encoding all three and comparing the result with
+ * the operand the document actually holds.
+ *
+ * Needed because the width of the removed text has to be measured from its *codes*, and the
+ * run is known as text: a font whose `/ToUnicode` maps two different codes to the same
+ * character would re-encode to a different code, of a possibly different width. Returning
+ * null when the round trip does not reproduce the operand byte for byte is what keeps that
+ * from being measured wrongly instead of refused.
+ */
+function splitRunOperand(editor, entry, run) {
+  const points = [...entry.runText];
+  const parts = {
+    prefix: points.slice(0, entry.charStart).join(""),
+    matched: points.slice(entry.charStart, entry.charEnd).join(""),
+    suffix: points.slice(entry.charEnd).join("")
+  };
+  let encoded;
+  try {
+    encoded = {
+      prefix: encodeReplacement(editor, entry, parts.prefix),
+      matched: encodeReplacement(editor, entry, parts.matched),
+      suffix: encodeReplacement(editor, entry, parts.suffix)
+    };
+  } catch {
+    return null;
+  }
+  const rejoined = concat([encoded.prefix, encoded.matched, encoded.suffix]);
+  // The run's *current* bytes: an ordinary replacement already staged on this run is what
+  // the match was found in, and is what the rewrite is splitting.
+  const current = editor.pending.get(entry.runId) ?? run.value;
+  return sameBytes(rejoined, current) ? { ...parts, bytes: encoded } : null;
+}
+
+/**
+ * Plans the rewrite of a match drawn inside one or more `TJ` arrays, keeping every glyph
+ * after the match exactly where the PDF put it.
+ *
+ * A `TJ` array is a list of strings and displacements processed one after another, and the
+ * boundary between two adjacent `TJ` operators does nothing at all -- so the whole stretch
+ * from the `[` that opens the match's first array to the `TJ` that closes its last is one
+ * flat list of elements (see parseTextArrayRegion()). The rewrite splits that list in three
+ * and writes it back as up to three operators:
+ *
+ *     [ <elements before the match> <prefix> ] TJ
+ *     /Fallback size Tf [ <replacement glyphs> ] TJ /Original size Tf
+ *     [ <adjustment> <suffix> <elements after the match> ] TJ
+ *
+ * Everything outside the match is copied out of the original stream byte for byte, so no
+ * adjustment is re-formatted, moved, merged, dropped or duplicated: `0`, `+0`, `-0` and
+ * `0.0` all come back exactly as written, and the numbers before and after the match keep
+ * both their values and their order.
+ *
+ * The one number this adds is `<adjustment>`, and it is what makes the rewrite safe. PDF
+ * advances the text position by
+ *
+ *     tx = ((w0 - Tj/1000) * Tfs + Tc + Tw) * Th
+ *
+ * for each glyph, where `w0` is the glyph's width in glyph space and `Tj` an adjustment
+ * from the array. Both the glyph widths and the adjustments are multiplied by `Tfs * Th`,
+ * so font size and horizontal scaling cancel out of any equation between them, and what
+ * remains is a comparison of plain glyph-space numbers:
+ *
+ *     advance(original) = W_original + g_original * Tc' + s_original * Tw' - K
+ *     advance(replacement) = W_replacement + g_replacement * Tc' - n
+ *
+ * where `W` are summed glyph widths, `g` glyph counts, `s` the count of single-byte code
+ * 32 (all `Tw` ever applies to), `K` the displacements the match's own operands were
+ * separated by, and `Tc'`/`Tw'` the spacings expressed in glyph-space units. Setting the
+ * two equal gives the adjustment to write:
+ *
+ *     n = W_replacement - W_original + K
+ *
+ * -- exactly, and with no dependence on font size or horizontal scaling -- provided the two
+ * spacing terms cancel. They are made to, rather than assumed to:
+ *
+ * - `Tc` is only allowed to be non-zero when the replacement shows exactly as many glyphs
+ *   as the original did, so `g_replacement * Tc'` equals `g_original * Tc'`. Otherwise the
+ *   difference is a multiple of `Tc * 1000 / Tfs`, which is not in general a number a `TJ`
+ *   adjustment can express exactly.
+ * - `Tw` reaches single-byte code 32 only, and the fallback font is written through a
+ *   2-byte encoding, so the replacement contributes no `Tw` at all. A match that removes a
+ *   single-byte space while `Tw` is in force is therefore refused.
+ * - a `Tc`/`Tw` this scanner could not track (a `Q` with nothing saved, a `"`) is unknown,
+ *   not assumed to be zero.
+ *
+ * `W_original` comes from the document's own `/Widths` or `/W` -- the numbers a reader
+ * positions with, read by src/font-metrics.js -- and `W_replacement` from the very `/W`
+ * entries the fallback font is embedded with, so both sides are the numbers that will
+ * actually be in the file. Where they cannot be had exactly, this refuses.
+ *
+ * When nothing at all is drawn from the end of the match -- no elements after it, no suffix
+ * in its own operand, and an `ET`/`BT`/`Td`/`TD`/`Tm`/`T*` next -- no adjustment is needed
+ * or written, and no metrics are required: that is the same situation the `Tj` rewrite has
+ * always relied on, and the replacement simply takes whatever width it takes.
+ */
+function planTextArrayRewrite(editor, pieces, glyphs, fallback) {
+  const stream = pieces[0].stream;
+  if (pieces.some((piece) => piece.stream !== stream)) {
+    return refusal("FALLBACK_MULTI_RUN_UNSUPPORTED", "This match is drawn across more than one content stream, which cannot be rewritten as one piece", "unsupported-topology");
+  }
+  if (pieces.length > 1) {
+    const current = new Map(internalRuns(editor).map((run) => [run.id, run]));
+    for (let index = 1; index < pieces.length; index += 1) {
+      const join = current.get(pieces[index].entry.runId)?.joinBefore;
+      // Unlike the Tj rewrite, a non-zero displacement between two operands is not an
+      // obstacle here: it sits inside the stretch being replaced and is accounted for in
+      // the arithmetic above. A text-state change between them still is -- the operands
+      // are drawn under different state, and this writes them as one.
+      if (!join) return refusal("FALLBACK_MULTI_RUN_UNSUPPORTED", "This match's operands are not attached to each other in a shape this version knows", "unsupported-topology");
+      if (join.kind === "state-change") {
+        return refusal("FALLBACK_MULTI_RUN_UNSUPPORTED", "This match's operands are drawn under different text state (a Tc/Tw/Tz/Tr, colour or marked-content operator sits between them), so they cannot be redrawn in another font as one piece", "text-state-boundary");
+      }
+    }
+  }
+
+  const first = pieces[0].run;
+  const last = pieces.at(-1).run;
+  if (typeof first.arrayStart !== "number" || first.arrayStart >= first.start) {
+    return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "This match's TJ array could not be located in the content stream");
+  }
+  const region = { start: first.arrayStart, end: last.operatorEnd };
+  let elements;
+  try {
+    elements = parseTextArrayRegion(stream.decoded, region.start, region.end);
+  } catch (error) {
+    return refusal("FALLBACK_LAYOUT_UNSUPPORTED", `The TJ operators this match is drawn by could not be read as a whole: ${error.message}`);
+  }
+  const firstIndex = elements.findIndex((element) => element.kind === "string" && element.start === first.start);
+  const lastIndex = elements.findIndex((element) => element.kind === "string" && element.start === last.start);
+  if (firstIndex === -1 || lastIndex === -1 || lastIndex < firstIndex) {
+    return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "This match's operands could not be located inside the TJ operators that draw them");
+  }
+  const inside = elements.slice(firstIndex, lastIndex + 1);
+  const covered = new Set(pieces.map((piece) => piece.run.start));
+  const insideStrings = inside.filter((element) => element.kind === "string");
+  if (insideStrings.length !== pieces.length || insideStrings.some((element) => !covered.has(element.start))) {
+    return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "The TJ operators this match is drawn by hold text the match does not cover between its own operands");
+  }
+  const head = elements.slice(0, firstIndex);
+  const tail = elements.slice(lastIndex + 1);
+  // The displacements written between the match's own operands. They are removed with the
+  // text they separated, so they are added back into the one adjustment below.
+  const between = inside.reduce((sum, element) => (element.kind === "number" ? sum + element.value : sum), 0);
+
+  const firstEntry = pieces[0].entry;
+  const lastEntry = pieces.at(-1).entry;
+  const prefix = [...firstEntry.runText].slice(0, firstEntry.charStart).join("");
+  const suffix = [...lastEntry.runText].slice(lastEntry.charEnd).join("");
+  const nothingFollows = !tail.length && suffix === "";
+
+  let adjustment = null;
+  if (!nothingFollows || !POSITION_SAFE_AFTER.has(last.followedBy)) {
+    const splits = pieces.map((piece) => splitRunOperand(editor, piece.entry, piece.run));
+    const metrics = stream.fontWidths?.get(first.fontName);
+    if (!metrics) {
+      return refusal(
+        "FALLBACK_FONT_METRICS_UNAVAILABLE",
+        `Text is drawn after this match, so the width it occupied has to be measured to keep that text where it is -- but this document does not state the glyph widths of font /${first.fontName} in a form this engine can read exactly (a /Widths or /W array it can resolve). Nothing is estimated, so this replacement is refused.`
+      );
+    }
+    if (splits.some((split) => !split)) {
+      return refusal(
+        "FALLBACK_FONT_METRICS_UNAVAILABLE",
+        "The exact character codes this match is drawn with could not be recovered from the operand it sits in, so the width it occupies cannot be measured and the text after it cannot be kept in place"
+      );
+    }
+    let width = 0;
+    let glyphCount = 0;
+    let spaceCount = 0;
+    for (const split of splits) {
+      const measured = measureCodes(metrics, split.bytes.matched);
+      if (!measured) {
+        return refusal("FALLBACK_FONT_METRICS_UNAVAILABLE", `This document does not give a width for every character code this match is drawn with in font /${first.fontName}, so the width it occupies cannot be measured`);
+      }
+      width += measured.width;
+      glyphCount += measured.glyphs;
+      spaceCount += measured.spaces;
+    }
+    const spacings = new Set(pieces.map((piece) => piece.run.charSpacing));
+    const charSpacing = spacings.size === 1 ? [...spacings][0] : null;
+    if (charSpacing === null || charSpacing === undefined) {
+      return refusal("FALLBACK_CHAR_SPACING_UNSUPPORTED", "The character spacing (Tc) in force where this match is drawn could not be determined, so the width it occupies cannot be measured");
+    }
+    if (charSpacing !== 0 && glyphCount !== glyphs.length) {
+      return refusal(
+        "FALLBACK_CHAR_SPACING_UNSUPPORTED",
+        `Character spacing (Tc ${charSpacing}) is in force and this replacement draws ${glyphs.length} glyphs where the original drew ${glyphCount}, so the text after it would move by the difference in spacing. A replacement drawing exactly ${glyphCount} glyphs is written normally.`
+      );
+    }
+    if (spaceCount > 0 && pieces.some((piece) => piece.run.wordSpacing !== 0)) {
+      return refusal(
+        "FALLBACK_WORD_SPACING_UNSUPPORTED",
+        "This match contains a single-byte space and word spacing (Tw) is in force, which does not reach text written through the fallback font, so the text after the match would move. Edit text drawn without word spacing, or a match that does not span a space."
+      );
+    }
+    const replacementWidth = glyphs.reduce((sum, glyph) => sum + glyphSpaceWidth(fallback, glyph.advanceWidth), 0);
+    const value = replacementWidth - width + between;
+    const formatted = formatAdjustment(value);
+    // The invariant the whole rewrite rests on, checked rather than trusted: what the
+    // replacement advances, after its adjustment, is what the original advanced.
+    if (formatted === null || replacementWidth - Number(formatted) !== width - between) {
+      return refusal(
+        "FALLBACK_FONT_METRICS_UNAVAILABLE",
+        "The width this match occupies cannot be matched exactly by a TJ adjustment, so the text after it would move"
+      );
+    }
+    adjustment = formatted;
+  }
+
+  return { region, head, tail, prefix, suffix, adjustment };
+}
+
+/**
+ * Writes the rewrite planTextArrayRewrite() decided on back into content-stream bytes, as
+ * one replacement spanning the whole stretch of `TJ` operators the match is drawn by.
+ *
+ * Every element outside the match is copied out of the original stream verbatim -- the one
+ * exception being a string operand carrying an ordinary replacement already staged on the
+ * same run, which is folded in here (as the `Tj` rewrite does) rather than left to be
+ * applied separately over bytes this edit has replaced.
+ *
+ * Every run whose operand fell inside the rewritten stretch is reported back in `runTexts`,
+ * both so search keeps showing what the page now draws and so the planner knows those runs'
+ * recorded byte offsets have been superseded (see FALLBACK_EDIT_REQUIRES_SAVE).
+ */
+function buildTextArrayEdit(editor, pieces, array, glyphs, resourceName, replacement) {
+  const stream = pieces[0].stream;
+  const first = pieces[0];
+  const size = first.run.fontSize;
+  const mappings = stream.fontMaps.get(first.run.fontName);
+  const runIds = new Map(stream.runs.map((run, index) => [run.start, `${stream.object.number}:${index}`]));
+  const runTexts = [];
+  const verbatim = (element) => latin1.decode(stream.decoded.subarray(element.start, element.end));
+  const kept = (element) => {
+    if (element.kind === "number") return verbatim(element);
+    const runId = runIds.get(element.start);
+    const pending = runId === undefined ? undefined : editor.pending.get(runId);
+    if (runId !== undefined) runTexts.push([runId, decodeWithCMap(pending ?? element.value, mappings)]);
+    if (!pending) return verbatim(element);
+    return latin1.decode(element.syntax === "hex" ? encodeHex(pending) : encodeLiteral(pending));
+  };
+  const operand = (piece, text) => latin1.decode(
+    piece.run.syntax === "hex"
+      ? encodeHex(encodeReplacement(editor, piece.entry, text))
+      : encodeLiteral(encodeReplacement(editor, piece.entry, text))
+  );
+
+  const leading = array.head.map(kept);
+  if (array.prefix) leading.push(operand(first, array.prefix));
+  const drawn = [];
+  if (leading.length) drawn.push(`[${leading.join(" ")}] TJ`);
+  drawn.push(`/${resourceName} ${size} Tf [${latin1.decode(encodeHex(identityEncode(glyphs)))}] TJ /${first.run.fontName} ${size} Tf`);
+  const trailing = [];
+  // A zero adjustment displaces nothing, so it is simply not written.
+  if (array.adjustment !== null && Number(array.adjustment) !== 0) trailing.push(array.adjustment);
+  if (array.suffix) trailing.push(operand(pieces.at(-1), array.suffix));
+  trailing.push(...array.tail.map(kept));
+  if (trailing.length) drawn.push(`[${trailing.join(" ")}] TJ`);
+
+  pieces.forEach((piece, index) => {
+    const text = pieces.length === 1
+      ? array.prefix + replacement + array.suffix
+      : (index === 0 ? array.prefix + replacement : (index === pieces.length - 1 ? array.suffix : ""));
+    runTexts.push([piece.entry.runId, text]);
+  });
+
+  return {
+    objectNumber: stream.object.number,
+    start: array.region.start,
+    end: array.region.end,
+    bytes: encoder.encode(drawn.join(" ")),
+    runTexts
+  };
+}
+
 /**
  * Plans a replacement written through the fallback font, for a match the document's own
- * font cannot express.
+ * font cannot express. One of two rewrites, chosen by the operator that draws the match.
  *
- * The rewrite is the same shape whatever the match spans, because the pieces are simply
- * drawn one after another and each `Tj` continues where the last left off (verified
- * against pdf.js: splitting a `Tj` and re-stating the same font between the pieces draws
- * the identical page, under `Tc`/`Tw`/`Tz`/`Ts` alike). The match's first run becomes
+ * **Drawn by `Tj`** (v0.4.0, unchanged). The pieces are simply drawn one after another and
+ * each `Tj` continues where the last left off (verified against pdf.js: splitting a `Tj`
+ * and re-stating the same font between the pieces draws the identical page, under
+ * `Tc`/`Tw`/`Tz`/`Ts` alike). The match's first run becomes
  *
  *     <prefix> Tj  /Fallback size Tf  <replacement> Tj  /Original size Tf
  *
  * any run wholly inside the match is emptied, and the last run keeps its suffix. So the
  * replacement is drawn where the match began, the text after it flows on from the
  * replacement's own width -- which is what editing text should do -- and no width, matrix
- * or spacing arithmetic is involved anywhere.
+ * or spacing arithmetic is involved anywhere. What has to hold, and is refused otherwise:
  *
- * What has to hold, and is refused otherwise:
- *
- * - every run of the match is drawn by a plain `Tj`. A `TJ` operand lives inside an array
- *   and `'`/`"` carry a line move, neither of which this rewrite accounts for.
- * - the runs share one font and one size, so there is a single font to restore.
  * - the runs are adjacent (the v0.3.0 rule: no state change and no net `TJ` displacement
  *   between them), so emptying the ones inside the match moves nothing.
  * - nothing is drawn from where the match's last run ends. The replacement's width is not
  *   the original's, so anything continuing from there would move. An `ET`, a `BT`, or an
  *   explicit `Td`/`TD`/`Tm`/`T*` all settle it; a following `Tj` does not.
+ *
+ * **Drawn by `TJ`** (v0.4.1). The array's own displacements are kept and one adjustment is
+ * computed from both fonts' stated widths, so everything after the match stays exactly
+ * where the PDF put it -- see planTextArrayRewrite() above for the arithmetic and for
+ * everything it refuses rather than estimate.
+ *
+ * Either way: `'` and `"` carry a line move neither rewrite accounts for, a match split
+ * between a `Tj` and a `TJ` would have to be both rewrites at once, and the runs must
+ * share one font and one size so there is a single font to restore.
  */
 async function planFallbackReplacement(editor, match, replacement) {
   const fallback = editor.fallbackFont;
   const pieces = scannedRuns(editor, match.span);
   if (pieces.some(({ run }) => !run)) return refusal("MATCH_STALE", "This match no longer describes the document");
 
-  const operator = pieces.find(({ run }) => run.operator !== "Tj");
-  if (operator) {
-    return refusal("FALLBACK_OPERATOR_UNSUPPORTED", `The fallback font is written with Tj; this match is drawn by ${operator.run.operator}`);
+  const operators = new Set(pieces.map(({ run }) => run.operator));
+  // `TJ` is rewritten by planTextArrayRewrite() above, which keeps the array's own
+  // displacements and the position of everything after the match; `Tj` by the simpler
+  // rewrite documented below. A match mixing the two would have to be both at once, and
+  // `'`/`"` carry a line move neither accounts for.
+  const drawnByArray = operators.size === 1 && operators.has("TJ");
+  if (!drawnByArray && !(operators.size === 1 && operators.has("Tj"))) {
+    const other = pieces.find(({ run }) => run.operator !== "Tj");
+    return refusal(
+      "FALLBACK_OPERATOR_UNSUPPORTED",
+      operators.size > 1
+        ? `The fallback font is written with Tj or TJ; this match mixes ${[...operators].join(" and ")}`
+        : `The fallback font is written with Tj and TJ; this match is drawn by ${other.run.operator}`
+    );
   }
   // The fallback font is embedded with a horizontal encoding (/Identity-H). Putting it in
   // place of text a vertical font drew would lay that text out along the wrong axis. What
@@ -399,7 +721,11 @@ async function planFallbackReplacement(editor, match, replacement) {
   if (pieces.some(({ run }) => !run.fontName)) {
     return refusal("FALLBACK_LAYOUT_UNSUPPORTED", "This match has no /Tf font to restore after the fallback font");
   }
-  if (match.span.length > 1) {
+  // A `Tj` rewrite simply draws the pieces one after another, so the operands it spans have
+  // to be adjacent already. The `TJ` rewrite does not need that -- it accounts for the
+  // displacements between them -- and applies its own, narrower rule (see
+  // planTextArrayRewrite()).
+  if (!drawnByArray && match.span.length > 1) {
     const current = new Map(internalRuns(editor).map((run) => [run.id, run]));
     const obstacle = variableLengthObstacle(match.span, current);
     if (obstacle) {
@@ -417,17 +743,21 @@ async function planFallbackReplacement(editor, match, replacement) {
     );
   }
 
+  const { glyphs, missing } = glyphsFor(fallback, replacement);
+  if (missing) {
+    return { ...refusal("FALLBACK_FONT_MISSING_GLYPH", `The fallback font has no glyph for ${missing.map((character) => JSON.stringify(character)).join(", ")}`), characters: missing };
+  }
+
   const last = pieces.at(-1).run;
-  if (!POSITION_SAFE_AFTER.has(last.followedBy)) {
+  let array = null;
+  if (drawnByArray) {
+    array = planTextArrayRewrite(editor, pieces, glyphs, fallback);
+    if (array.allowed === false) return array;
+  } else if (!POSITION_SAFE_AFTER.has(last.followedBy)) {
     return refusal(
       "FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE",
       `Text is drawn from where this match ends (${last.followedBy}), and the fallback font's characters are not the widths the document's own font used, so that text would move. Only a match followed by ET or an explicit Td/TD/Tm/T* is redrawn in another font.`
     );
-  }
-
-  const { glyphs, missing } = glyphsFor(fallback, replacement);
-  if (missing) {
-    return { ...refusal("FALLBACK_FONT_MISSING_GLYPH", `The fallback font has no glyph for ${missing.map((character) => JSON.stringify(character)).join(", ")}`), characters: missing };
   }
 
   // A working copy of what has been embedded so far. Planning must not touch the
@@ -461,7 +791,8 @@ async function planFallbackReplacement(editor, match, replacement) {
   // cannot write fails here rather than half-way through.
   const edits = [];
   try {
-    pieces.forEach(({ stream, run, entry }, index) => {
+    if (array) edits.push(buildTextArrayEdit(editor, pieces, array, glyphs, resourceNames.get(pieces[0].stream.object.number), replacement));
+    else pieces.forEach(({ stream, run, entry }, index) => {
       const points = [...entry.runText];
       const prefix = points.slice(0, entry.charStart).join("");
       const suffix = points.slice(entry.charEnd).join("");
@@ -651,6 +982,9 @@ function commitPlan(editor, plan) {
   for (const [objectNumber, bytes] of rebuilt) editor.pendingStreams.set(objectNumber, bytes);
   for (const edit of plan.fallback.edits) {
     if (edit.runId !== undefined) editor.fallbackRunTexts.set(edit.runId, edit.runText);
+    // A TJ rewrite spans a whole stretch of operators, so it supersedes every run inside
+    // it -- the match's own operands and any neighbouring operand it copied through.
+    for (const [runId, text] of edit.runTexts ?? []) editor.fallbackRunTexts.set(runId, text);
   }
 }
 
@@ -668,7 +1002,10 @@ function rebuildContentStream(editor, objectNumber, fallbackEdits) {
   // run spans its whole operator (run.start..run.operatorEnd) while an ordinary edit spans
   // only the operand (run.start..run.end) -- comparing ranges leaves both in place, and
   // they then overlap.
-  const rewritten = new Set(fallbackEdits.map((edit) => edit.runId).filter((runId) => runId !== undefined));
+  const rewritten = new Set(fallbackEdits.flatMap((edit) => [
+    ...(edit.runId === undefined ? [] : [edit.runId]),
+    ...(edit.runTexts ?? []).map(([runId]) => runId)
+  ]));
   const runEdits = stream.runs.flatMap((run, index) => {
     const id = `${objectNumber}:${index}`;
     const bytes = editor.pending.get(id);
@@ -782,6 +1119,7 @@ function writingModeOf(fontDictionary, structure) {
 async function loadFontMaps(resources, structure, security) {
   const result = new Map();
   const modes = new Map();
+  const widths = new Map();
   // A font dictionary can itself be compressed (a common PDF-writer optimization);
   // its own /ToUnicode target, however, is always a stream, and streams are never
   // stored in an Object Stream (PDF spec 7.5.7), so that lookup stays on the
@@ -789,12 +1127,17 @@ async function loadFontMaps(resources, structure, security) {
   for (const [name, fontReference] of await fontReferences(resources, structure, security)) {
     const font = await structure.resolveObject(fontReference, security, decryptStreamBytes);
     modes.set(name, writingModeOf(font.dictionary, structure));
+    // The widths a reader positions this font's text with, when they can be read exactly.
+    // Only the TJ fallback rewrite needs them, and only when it has to keep following text
+    // where it is; null here simply means that rewrite refuses (see loadFontWidths()).
+    const metrics = await loadFontWidths(font.dictionary, (target) => structure.resolveObject(target, security, decryptStreamBytes));
+    if (metrics) widths.set(name, metrics);
     const toUnicode = reference(font.dictionary, "ToUnicode");
     if (!toUnicode) continue;
     const cmapObject = structure.object(toUnicode);
     result.set(name, parseToUnicodeCMap(await decodeStream(cmapObject, "ToUnicode stream", security)));
   }
-  return { maps: result, modes };
+  return { maps: result, modes, widths };
 }
 
 export class PdfTextEditor {
@@ -890,7 +1233,7 @@ export class PdfTextEditor {
         const runs = scanTextRuns(decoded, `content stream object ${object.number}`);
         if (runs.length) {
           const fonts = await loadFontMaps(resources, this.document, this.security);
-          this.streams.push({ object, decoded, runs, resources, fontMaps: fonts.maps, fontModes: fonts.modes });
+          this.streams.push({ object, decoded, runs, resources, fontMaps: fonts.maps, fontModes: fonts.modes, fontWidths: fonts.widths });
         }
       }
     }

@@ -3,6 +3,11 @@
 **判定: Go**（範囲を限定した上で成立）
 
 > **この実験は engine v0.4.0 で正式機能になりました。**
+> **注記（v0.4.1）:** 本文書は v0.4.0 時点の PoC 記録です。`TJ` で描画された箇所の
+> `FALLBACK_OPERATOR_UNSUPPORTED` は v0.4.1 で解消され、後続文字位置を維持できる範囲に
+> 限って置換できるようになりました。現行の対応範囲は README と `docs/release-notes.md`
+> の v0.4.1 を参照してください。
+>
 > 実装は `src/fallback-font.js` と `src/pdf-document.js` へ移り、公開APIは
 > `await editor.setFallbackFont(fontBytes)` です。`checkTextMatchReplacement()` /
 > `replaceTextMatch()` が自動的に使い分けます。v0.4.0では本文書の制限のうち
