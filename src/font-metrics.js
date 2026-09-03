@@ -280,6 +280,48 @@ async function identityEncoding(fontDictionary, resolve) {
 }
 
 /**
+ * What an object turned out to be, for the optional trace below. Describes only the shape
+ * the resolver itself branches on -- it never parses the value further.
+ */
+function shapeOfObject(object) {
+  if (!object) return { kind: "unresolved", text: null };
+  // Branch in the order resolveDescendantFont() itself branches, so `kind` names the
+  // path the walk took and not a different reading of the same object: a stream object
+  // has a dictionary, and the walk takes it as one (a stream is not a CIDFont, so
+  // type0Widths() then refuses it on /Subtype). `stream` records that it was one.
+  if (object.dictionary) return { kind: "dictionary", stream: Boolean(object.data), text: object.dictionary };
+  if (typeof object.rawValue === "string") {
+    const raw = object.rawValue.trim();
+    const kind = raw.startsWith("[") ? "array" : raw.startsWith("/") ? "name" : "string-or-other";
+    return { kind, text: object.rawValue };
+  }
+  return { kind: "number-or-boolean", text: String(object.value) };
+}
+
+/**
+ * A key's value as the dictionary actually writes it -- the following bytes, verbatim and
+ * unparsed, so whitespace, comments and line breaks in a real file are visible. For the
+ * trace only: nothing is ever resolved or decided from this text.
+ */
+function rawEntryText(dictionary, key) {
+  const found = new RegExp(`/${key}(?![A-Za-z0-9])`).exec(dictionary);
+  return found ? dictionary.slice(found.index, found.index + 160) : null;
+}
+
+/** tryResolve(), plus a trace entry recording what the hop asked for and what came back. */
+async function tracedResolve(resolve, target, trace, step) {
+  let object = null;
+  let error = null;
+  try {
+    object = await resolve(target);
+  } catch (thrown) {
+    error = thrown?.message ?? String(thrown);
+  }
+  if (trace) trace.push({ step, reference: `${target.number} ${target.generation} R`, error, ...shapeOfObject(object) });
+  return object;
+}
+
+/**
  * The descendant CIDFont's own dictionary, as `{ dictionary }`, or a refusal saying why it
  * could not be reached. `/DescendantFonts` is an array of exactly one font (PDF 9.7.6.2);
  * the array itself may be written indirectly, which is followed once and no further -- this
@@ -288,18 +330,66 @@ async function identityEncoding(fontDictionary, resolve) {
  * Exported so diagnoseFontMetrics() in pdf-document.js reaches the descendant by exactly
  * the same path the measurement does: a diagnosis that stopped a hop short of the real
  * CIDFont would describe a font this can measure as if it stated no widths.
+ *
+ * `trace`, when an array is passed, is appended with one entry per hop: what was read, what
+ * was expected of it, and what actually came back. It is a diagnostic output only -- it
+ * changes nothing about which structures resolve, and every caller that measures a font
+ * omits it. Its point is that "descendant-font-unresolved" on a real document can be read
+ * back as *which* hop failed, from the same code that failed, rather than re-walked by a
+ * second implementation that might disagree with this one.
  */
-export async function resolveDescendantFont(fontDictionary, resolve) {
-  const [target] = parseReferenceArray(fontDictionary, "DescendantFonts");
+export async function resolveDescendantFont(fontDictionary, resolve, trace = null) {
+  const targets = parseReferenceArray(fontDictionary, "DescendantFonts");
+  if (trace) {
+    const direct = directArrayText(fontDictionary, "DescendantFonts");
+    trace.push({
+      step: "descendant-fonts-entry",
+      // Which shape the entry is written in. "direct-array" and "indirect-reference" are
+      // the two parseReferenceArray() distinguishes; it returns the array's elements for
+      // the first and the reference itself for the second, so the next hop's meaning
+      // differs between them and the trace has to say which one this is.
+      form: direct !== null ? "direct-array" : targets.length ? "indirect-reference" : "absent",
+      raw: rawEntryText(fontDictionary, "DescendantFonts"),
+      references: targets.map((target) => `${target.number} ${target.generation} R`),
+      // Whether the walk goes on from here, so a refusal decided by the entry itself is
+      // visible as such instead of looking like a hop that was never taken.
+      accepted: targets.length === 1
+    });
+  }
+  const [target] = targets;
   if (!target) return refuse("descendant-font-missing");
+  // PDF 9.7.6.2 makes /DescendantFonts a ONE-element array. More than one element is
+  // malformed, and nothing in the file says which of them a reader should measure with --
+  // so taking the first would be a guess, and a guess here is a wrong width from a font
+  // the document never asked for. Refused, exactly as the same array written as an object
+  // of its own already was: which of the two shapes a writer chose must not decide whether
+  // the document is measured or refused.
+  if (targets.length > 1) {
+    return refuse("descendant-font-unresolved", targets.map((entry) => `${entry.number} ${entry.generation} R`).join(" "));
+  }
   const unresolved = () => refuse("descendant-font-unresolved", `${target.number} ${target.generation} R`);
-  const object = await tryResolve(resolve, target);
+  const object = await tracedResolve(resolve, target, trace, "resolve-first-reference");
   if (!object) return unresolved();
   if (object.dictionary) return { dictionary: object.dictionary };
   const inner = arrayObjectText(object);
   const nested = inner === null ? null : /^\s*(\d+)\s+(\d+)\s+R\s*$/.exec(inner);
+  if (trace) {
+    trace.push({
+      step: "nested-array-element",
+      // What the object had to be for the second hop to happen: a bare array holding
+      // exactly one reference and nothing else.
+      expected: "an array object holding exactly one `<num> <gen> R` and nothing else",
+      inner,
+      matched: Boolean(nested)
+    });
+  }
   if (!nested) return unresolved();
-  const font = await tryResolve(resolve, { number: Number(nested[1]), generation: Number(nested[2]) });
+  const font = await tracedResolve(
+    resolve,
+    { number: Number(nested[1]), generation: Number(nested[2]) },
+    trace,
+    "resolve-nested-reference"
+  );
   return font?.dictionary ? { dictionary: font.dictionary } : unresolved();
 }
 

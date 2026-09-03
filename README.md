@@ -242,7 +242,7 @@ v0.4.1 では、この値が font dictionary の中に**直接**書かれてい�
 - 参照先の object が存在しない、数値の配列として読めない、`/DW` や `/FirstChar` が数値でない
 - font program の `hmtx` しか手掛かりがない場合
 
-拒否の内訳は開発者向けに `unsafeReason`（`w-unresolved`・`widths-unresolved`・`invalid-width-array`・`non-identity-encoding`・`embedded-cmap-encoding`・`unsupported-type3` など）として返します。公開 `code` は `FALLBACK_FONT_METRICS_UNAVAILABLE` のままです。実 PDF の構造を確認するには `node scripts/diagnose-font-metrics.js <file.pdf> [--text 令和]` を使ってください（読み取り専用・ネットワークアクセスなし）。
+拒否の内訳は開発者向けに `unsafeReason`（`w-unresolved`・`widths-unresolved`・`invalid-width-array`・`non-identity-encoding`・`embedded-cmap-encoding`・`unsupported-type3` など）として返します。公開 `code` は `FALLBACK_FONT_METRICS_UNAVAILABLE` のままです。実 PDF の構造を確認するには `node scripts/diagnose-font-metrics.js <file.pdf> [--text 令和] [--font F3]` を使ってください（読み取り専用・ネットワークアクセスなし）。`/Type0` font については `/DescendantFonts` の解決過程を 1 hop ずつ表示します（dictionary が書いている生の値、direct array か indirect reference か、各参照先が実際に何だったか、xref 上で通常 object か Object Stream 内か）。この trace は幅計測が呼ぶ `resolveDescendantFont()` 自身が記録するため、`descendant-font-unresolved` を「どの hop で失敗したか」まで読み取れます。→ [descendant font の診断](docs/descendant-font-diagnosis.md)
 
 **`'` / `"` は対象外です**（`FALLBACK_OPERATOR_UNSUPPORTED`）。これらは描画前に改行を伴うため、いずれの組み替えでも扱えません。v0.4.1 で `TJ` に対応したこととは切り離しています。
 
