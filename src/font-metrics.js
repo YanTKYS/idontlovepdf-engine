@@ -165,7 +165,7 @@ function numberObjectValue(object) {
  * "Present but unreadable" is never quietly treated as absent: a `/DW` this cannot read is
  * not a document that meant 1000.
  */
-async function resolvedNumber(dictionary, key, resolve, reasons) {
+export async function resolvedNumber(dictionary, key, resolve, reasons) {
   const direct = directNumber(dictionary, key);
   if (direct !== null) return Number.isFinite(direct) ? { value: direct } : { reason: reasons.invalid };
   const indirect = reference(dictionary, key);

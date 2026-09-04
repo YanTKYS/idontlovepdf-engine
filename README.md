@@ -54,6 +54,7 @@ import { PdfTextEditor, ENGINE_VERSION } from "@idontlovepdf/engine"; // また�
 **高レベル API（一般利用側はこちらを使ってください）**
 
 - `await editor.setFallbackFont(fontBytes)` — 既存 font で書けない文字用の font を渡す（任意）
+- `await editor.setFallbackFonts({ sans?, serif? })` — Serif/Sans 判定に応じて使い分ける fallback font を渡す（任意、PoC, v0.5.0〜。詳細は後述）
 - `await editor.searchText(query, password?)` — 利用者が見える文字列として本文を検索する
 - `await editor.checkTextMatchReplacement(matchId, replacement)` — その置換が可能かを、何も変更せずに判定する
 - `await editor.replaceTextMatch(matchId, replacement)` — 検索結果をそのまま置換する
@@ -167,6 +168,27 @@ await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font �
 - **font が埋め込まれるのは 1 文書につき 1 回だけ**です。同じ editor 内で何回置換しても、また `save()` して開き直してから置換を続けても、engine は以前埋め込んだ同じ font を見つけて再利用します（2 回目以降の保存で増えるのは数 KB です）。同一判定は **font program の SHA-256** で行うため、名前やサイズが同じでも中身の異なる font を取り違えることはありません（その場合は別 font として追加で埋め込まれます）
 
 動作確認には [BIZ UDGothic](https://github.com/googlefonts/morisawa-biz-ud-gothic)（SIL Open Font License 1.1）を使用しています。engine には同梱していません。
+
+### `await editor.setFallbackFonts({ sans?, serif? })`（PoC, v0.5.0〜）
+
+**元 PDF の font が明朝系か Gothic 系かに応じて、fallback font を自動で使い分けます（任意）。**
+
+`setFallbackFont()` は fallback font を 1 つしか持てないため、元 PDF が明朝系でも置換箇所は常に Gothic 系（BIZ UDGothic）で描画され、書体差が目立つという課題がありました。`setFallbackFonts()` はこれを最小限拡張し、`sans`（Gothic 系, 例: BIZ UDゴシック）と `serif`（明朝系, 例: BIZ UD明朝）を別々に渡せるようにします。
+
+```js
+await editor.setFallbackFonts({
+  sans: bizUdGothicBytes,
+  serif: bizUdMinchoBytes
+});
+```
+
+- **どの fallback font を使うかは常に engine 内部で判定します。** 利用側が font を選ぶ API ではありません。fallback が必要になった match について、その文字を描画している元の font resource の `FontDescriptor` `/Flags`（PDF 32000-1:2008, 9.8.2, Table 123 の bit 2 = Serif）を読み、**元 font が明確に Serif と判定できる場合に限り** `serif` を使います。それ以外（`sans` と判定できる場合、判定できない場合、`serif` と判定できても `serif` font が渡されていない場合）は、すべて `sans`（従来の `setFallbackFont()` と同じ既定挙動）にフォールバックします。Serif/Sans の判定は `/Flags` のみから行い、font 名（`MS-Mincho` 等の文字列マッチ）は使いません
+- **`setFallbackFont(fontBytes)` は `setFallbackFonts({ sans: fontBytes })` の糖衣構文です。** そのため、`setFallbackFont()` だけを呼ぶ既存の利用側は、元 PDF の font 判定結果に関係なく常にその 1 つの font が使われ、**v0.4.4 までと完全に同じ挙動**を維持します
+- **`sans` / `serif` はそれぞれ独立に、1 文書につき 1 回だけ埋め込まれます。** 同じ PDF に明朝系の置換箇所と Gothic 系の置換箇所が両方あっても、`FontFile2` は 2 つだけ（`sans` 用と `serif` 用）で、ページの `/Resources` に付与する resource 名も衝突しません。`save()` → 開き直し → 再度 `setFallbackFonts()` の順で編集を続けた場合も、既に埋め込まれている font はそれぞれ再利用されます（判定は `setFallbackFont()` と同じく font program の SHA-256）
+- **`FALLBACK_FONT_ALREADY_IN_USE` / `FALLBACK_FONT_INVALID` は `sans`・`serif` それぞれ独立に判定します。** 片方が既に置換に使われていても、まだ使っていないもう片方だけを別 font に差し替えることができます
+- **glyph 幅計測・`TJ` adjustment・overflow 判定・word/character spacing・writing mode・multi-run 安全判定・save → reopen・fail closed・atomic replacement は、どちらの fallback font を選んだ場合も一切変わりません。** 選ばれた font から実際の glyph 幅を取得し、`setFallbackFont()` 単体のときと同じ安全性判定を通します。「明朝なら幅が近いはず」といった推測は行いません
+- 動作確認には [BIZ UDMincho](https://github.com/googlefonts/morisawa-biz-ud-mincho)（SIL Open Font License 1.1）を使用しています。engine には同梱していません
+- **今回は PoC です。** Windows システム font の取得、Local Font Access API、font 名による判定、太字・斜体・weight・stretch に応じた font 切替、複数の明朝/Gothic font からの選択は対象外です
 
 #### fallback font で置換できる構造
 

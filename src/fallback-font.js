@@ -249,9 +249,17 @@ export function glyphsFromToUnicode(fallback, mappings) {
   return glyphs;
 }
 
-/** A /Font resource name the given font dictionary does not already use. */
-export function freeResourceName(fontDictionary) {
+/**
+ * A /Font resource name the given font dictionary does not already use. `reserved` is
+ * additional names to avoid beyond what `fontDictionary` itself holds -- names another
+ * fallback font already claimed on this same page in this same save, which the page's own
+ * (not yet rewritten) /Font dictionary text cannot yet know about. See registerFallbackResource()
+ * in pdf-document.js, which is what lets two different fallback fonts share one page without
+ * colliding on the name given to either.
+ */
+export function freeResourceName(fontDictionary, reserved = []) {
   const taken = new Set([...fontDictionary.matchAll(/\/([^\s/<>{}[\]()]+)/g)].map((match) => match[1]));
+  for (const name of reserved) taken.add(name);
   for (let suffix = 0; ; suffix += 1) {
     const name = suffix ? `ILPFallback${suffix}` : "ILPFallback";
     if (!taken.has(name)) return name;

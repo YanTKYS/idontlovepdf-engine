@@ -283,8 +283,30 @@ export class PdfTextEditor {
    * with `FALLBACK_FONT_ALREADY_IN_USE` if this editor has already written text with a
    * fallback font -- that text holds glyph ids of that font, so it cannot be exchanged.
    * Setting a different font before the first replacement is fine.
+   *
+   * Equivalent to `setFallbackFonts({ sans: fontBytes })`: it registers the "sans" role,
+   * which is what every fallback replacement uses unless setFallbackFonts() has also
+   * registered a "serif" font and the source text's own font is read as serif -- so a
+   * caller that only ever calls this sees exactly the same behaviour as before
+   * setFallbackFonts() existed, regardless of the source document's fonts.
    */
   setFallbackFont(fontBytes: ArrayBuffer | Uint8Array): Promise<this>;
+
+  /**
+   * Supplies more than one fallback font, so a replacement can be drawn in whichever looks
+   * closer to the source text's own font: `serif` for a run whose own font's FontDescriptor
+   * states it is serif, `sans` for everything else a fallback font is needed for (a
+   * sans-serif source font, or one this cannot confidently classify). At least one of
+   * `sans`/`serif` is required. Which font a given replacement actually uses is decided
+   * per match, from the source run's own font -- never chosen by the caller.
+   *
+   * Both fonts may end up embedded in the same document, each once however many
+   * replacements use it. Rejects the same way setFallbackFont() does -- `FALLBACK_FONT_INVALID`
+   * for a non-TrueType font, `FALLBACK_FONT_ALREADY_IN_USE` for a role that has already
+   * written a replacement -- applied per role, so replacing the "sans" font before it has
+   * been used does not disturb an already-used "serif" one, or the reverse.
+   */
+  setFallbackFonts(fonts: { sans?: ArrayBuffer | Uint8Array; serif?: ArrayBuffer | Uint8Array }): Promise<this>;
 
   searchText(query: string, password?: string): Promise<PdfTextMatch[]>;
 

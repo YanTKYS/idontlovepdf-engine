@@ -556,11 +556,12 @@ test("checking a replacement changes nothing, so a later replace still registers
   assert.equal(matches.length, 2);
 
   await editor.replaceTextMatch(matches[0].id, "しょうわ");
-  const snapshot = JSON.stringify([...editor.fallbackEmbedding.resources]);
+  const snapshot = JSON.stringify([...editor.fallbackPageResources].map(([number, names]) => [number, [...names]]));
   const pendingObjects = new Set(editor.pendingObjects.keys());
 
   await editor.checkTextMatchReplacement(matches[1].id, "しょうわ");
-  assert.equal(JSON.stringify([...editor.fallbackEmbedding.resources]), snapshot, "checking must not record the second page as done");
+  const after = JSON.stringify([...editor.fallbackPageResources].map(([number, names]) => [number, [...names]]));
+  assert.equal(after, snapshot, "checking must not record the second page as done");
   assert.deepEqual(new Set(editor.pendingObjects.keys()), pendingObjects, "checking must stage nothing");
 
   await editor.replaceTextMatch(matches[1].id, "しょうわ");
