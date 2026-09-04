@@ -1,7 +1,7 @@
 // Whether a real, published PDF can actually be edited end to end -- not just diagnosed.
 //
 //   node scripts/verify-real-pdf-edit.js <file.pdf> --font <fallback-font.ttf> \
-//     [--search 令和] [--fallback しょ] [--regression 平成] [--out /tmp/edited.pdf]
+//     [--search 令和] [--fallback しょ] [--regression 平成] [--unsafe しょうわ] [--out /tmp/edited.pdf]
 //
 // diagnose-font-metrics.js (v0.4.2) answers "why can this document's font not be measured".
 // This answers the actual Go/No-Go question for v0.4.3: given a real PDF whose /F3 needed
@@ -13,6 +13,12 @@
 // actually succeed, end to end, through the public API -- the same sequence a real caller
 // (idontlovepdf) drives? Nothing here is fixture-only: it is the identical engine surface
 // exercised over the identical bytes a real document ships.
+//
+// v0.4.4 adds a second, opposite question over the same match: does a replacement that
+// would overrun the text after it (--unsafe, default しょうわ -- the exact real-world case
+// that showed up as しょうわ drawn over the following 8 in 22550.pdf under v0.4.3) get
+// refused before anything is written, rather than producing an edited file with characters
+// drawn on top of each other? See docs/release-notes.md's v0.4.4 entry for the arithmetic.
 //
 // It reads the given PDF, edits an in-memory copy, and (optionally, via --out) writes the
 // edited copy to disk for an independent tool (qpdf, pdfminer.six, a browser) to open in a
@@ -31,7 +37,7 @@ const optionOf = (name, fallback) => {
 };
 
 if (!file) {
-  console.error("usage: node scripts/verify-real-pdf-edit.js <file.pdf> --font <fallback-font.ttf> [--search 令和] [--fallback しょ] [--regression 平成] [--out <edited.pdf>]");
+  console.error("usage: node scripts/verify-real-pdf-edit.js <file.pdf> --font <fallback-font.ttf> [--search 令和] [--fallback しょ] [--regression 平成] [--unsafe しょうわ] [--out <edited.pdf>]");
   process.exit(2);
 }
 
@@ -44,6 +50,7 @@ if (!fontPath) {
 const searchQuery = optionOf("search", "令和");
 const fallbackReplacement = optionOf("fallback", "しょ");
 const regressionReplacement = optionOf("regression", "平成");
+const unsafeReplacement = optionOf("unsafe", "しょうわ");
 const outPath = optionOf("out", null);
 
 const originalBytes = new Uint8Array(readFileSync(file));
@@ -118,6 +125,29 @@ if (remaining.length !== matches.length - 1) {
   fail(`expected ${matches.length - 1} remaining match(es) of ${JSON.stringify(searchQuery)}, found ${remaining.length}`);
 }
 
+heading(`checkTextMatchReplacement(${JSON.stringify(unsafeReplacement)}) on the same match, original bytes -- must be refused, not written (v0.4.4)`);
+const unsafeEditor = new PdfTextEditor(originalBytes);
+await unsafeEditor.listTextRuns();
+const [unsafeTarget] = await unsafeEditor.searchText(searchQuery);
+await unsafeEditor.setFallbackFont(fontBytes);
+const unsafeCheck = await unsafeEditor.checkTextMatchReplacement(unsafeTarget.id, unsafeReplacement);
+console.log(JSON.stringify(unsafeCheck));
+if (unsafeCheck.allowed) {
+  fail(`checkTextMatchReplacement(${JSON.stringify(unsafeReplacement)}) was allowed -- this is exactly the overlap this version exists to refuse (see docs/release-notes.md's v0.4.4 entry)`);
+} else if (unsafeCheck.code !== "FALLBACK_LAYOUT_UNSUPPORTED" || unsafeCheck.unsafeReason !== "fallback-replacement-overflows-slot") {
+  console.log(`note: refused as expected, but for a different reason than the overflow check (code=${unsafeCheck.code}, unsafeReason=${unsafeCheck.unsafeReason ?? "(none)"}) -- this document's structure may not exercise the overflow path for this text`);
+} else {
+  console.log(`refused as expected: replacementAdvance=${unsafeCheck.diagnostics?.replacementAdvance} availableAdvance=${unsafeCheck.diagnostics?.availableAdvance}`);
+}
+await unsafeEditor.replaceTextMatch(unsafeTarget.id, unsafeReplacement).then(
+  () => fail(`replaceTextMatch(${JSON.stringify(unsafeReplacement)}) did not throw, even though checkTextMatchReplacement() refused it`),
+  (error) => console.log(`replaceTextMatch() rejected as expected: ${error.code} (${error.unsafeReason ?? error.message})`)
+);
+const unsafeSaved = await unsafeEditor.save();
+const unsafeUntouched = unsafeSaved.length === originalBytes.length && unsafeSaved.every((byte, index) => byte === originalBytes[index]);
+console.log(`document unchanged after the refused replacement: ${unsafeUntouched}`);
+if (!unsafeUntouched) fail(`save() after the refused ${JSON.stringify(unsafeReplacement)} replacement did not return the original bytes unchanged`);
+
 heading(`regression: the same match, 令和-style replacement -> ${JSON.stringify(regressionReplacement)} (independent editor instance, original bytes)`);
 const regressionEditor = new PdfTextEditor(originalBytes);
 await regressionEditor.listTextRuns();
@@ -145,6 +175,8 @@ const summary = {
   matchesBefore: matches.length,
   matchesAfterFallbackEdit: remaining.length,
   fallbackCheck,
+  unsafeCheck,
+  unsafeReplacementUntouchedDocument: unsafeUntouched,
   regressionCheck,
   incrementalUpdate: isIncrementalUpdate
 };

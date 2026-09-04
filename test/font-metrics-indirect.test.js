@@ -128,9 +128,9 @@ test("measures a CID font whose /W and /DW are indirect objects, and keeps what 
 
   const { saved, reopened, before, after, stream } = await replaceAndMeasure(pdf, "令和", "しょ", "fallback-font");
 
-  // 令和 was 1000 + 950 wide; しょ is 1000 + 1000, so the array is pulled back by 50 --
-  // exactly the arithmetic the direct-/W fixture in fallback-font-tj.test.js does.
-  assert.match(stream, /\/F3 36 Tf \[50 -50 <000300040005>\] TJ/);
+  // 令和 and しょ are both exactly 1000 + 1000 wide, so no correction is needed -- exactly
+  // the arithmetic the direct-/W fixture in fallback-font-tj.test.js does.
+  assert.match(stream, /\/F3 36 Tf \[-50 <000300040005>\] TJ/);
   const trailing = (drawn) => drawn.filter((glyph) => glyph.font === "F3" && glyph.code >= 0x0003).map((glyph) => glyph.x);
   assert.deepEqual(trailing(after), trailing(before), "every glyph after the match must be drawn where it was");
 
@@ -167,7 +167,7 @@ test("measures a CID font whose /DescendantFonts array is itself an indirect obj
     extraObjects: ["11 0 obj\n[7 0 R]\nendobj\n"]
   });
   const { stream, before, after } = await replaceAndMeasure(pdf, "令和", "しょ", "fallback-font");
-  assert.match(stream, /\/F3 36 Tf \[50 -50 <000300040005>\] TJ/);
+  assert.match(stream, /\/F3 36 Tf \[-50 <000300040005>\] TJ/);
   const trailing = (drawn) => drawn.filter((glyph) => glyph.font === "F3" && glyph.code >= 0x0003).map((glyph) => glyph.x);
   assert.deepEqual(trailing(after), trailing(before));
 });
@@ -175,22 +175,22 @@ test("measures a CID font whose /DescendantFonts array is itself an indirect obj
 test("measures a CID font whose /Encoding name is itself an indirect object", { skip }, async () => {
   const pdf = makeCidPdf({ encoding: "/Encoding 11 0 R", extraObjects: ["11 0 obj\n/Identity-H\nendobj\n"] });
   const { stream, before, after } = await replaceAndMeasure(pdf, "令和", "しょ", "fallback-font");
-  assert.match(stream, /\/F3 36 Tf \[50 -50 <000300040005>\] TJ/);
+  assert.match(stream, /\/F3 36 Tf \[-50 <000300040005>\] TJ/);
   const trailing = (drawn) => drawn.filter((glyph) => glyph.font === "F3" && glyph.code >= 0x0003).map((glyph) => glyph.x);
   assert.deepEqual(trailing(after), trailing(before));
 });
 
 test("reads an indirect /DW written as a real number, not just an integer", { skip }, async () => {
   // A PDF number is plain decimal, and a real is as legal as an integer wherever a number
-  // is expected. 和 is left out of /W here, so its width is /DW: 999.5, making the whole
-  // match 1999.5 wide against しょ's 2000 -- an adjustment of 0.5, which has to be written
+  // is expected. 和 is left out of /W here, so its width is /DW: 1000.5, making the whole
+  // match 2000.5 wide against しょ's 2000 -- an adjustment of -0.5, which has to be written
   // as such rather than the file being refused for stating a width with a decimal point.
   const pdf = makeCidPdf({
     widthObject: "9 0 obj\n[1 [1000] 3 [500] 4 [1000] 5 [1000]]\nendobj\n",
-    defaultWidthObject: "10 0 obj\n999.5\nendobj\n"
+    defaultWidthObject: "10 0 obj\n1000.5\nendobj\n"
   });
   const { stream, before, after } = await replaceAndMeasure(pdf, "令和", "しょ", "fallback-font");
-  assert.match(stream, /\/F3 36 Tf \[0.5 -50 <000300040005>\] TJ/);
+  assert.match(stream, /\/F3 36 Tf \[-0.5 -50 <000300040005>\] TJ/);
   const trailing = (drawn) => drawn.filter((glyph) => glyph.font === "F3" && glyph.code >= 0x0003).map((glyph) => glyph.x);
   assert.deepEqual(trailing(after), trailing(before), "every glyph after the match must be drawn where it was");
 });
@@ -213,7 +213,7 @@ test("diagnoses the descendant font by the same path the measurement takes", { s
   const width = font.related.find((item) => item.key === "descendant /W");
   assert.ok(width, "the /W object the widths actually come from must be listed");
   assert.equal(width.reference, "9 0 R");
-  assert.match(width.detail, /\[1 \[1000\] 2 \[950\]/);
+  assert.match(width.detail, /\[1 \[1000\] 2 \[1000\]/);
 });
 
 /**
@@ -561,7 +561,9 @@ test("refuses a width no TJ adjustment can express exactly", { skip }, async () 
   // The invariant is `replacement width - adjustment === original width`, checked rather
   // than trusted. A width with more decimals than a PDF number written here can carry back
   // exactly makes it unprovable -- so the replacement is refused, not rounded into place.
-  const pdf = makeCidPdf({ widthObject: "9 0 obj\n[1 [1000] 2 [950.1234567] 3 [500] 4 [1000] 5 [1000]]\nendobj\n" });
+  // 令 is widened to 1050 here (令和 = 2000.1234567, comfortably past しょ's 2000) so this
+  // exercises the "not representable" refusal specifically, not the v0.4.4 overflow check.
+  const pdf = makeCidPdf({ widthObject: "9 0 obj\n[1 [1050] 2 [950.1234567] 3 [500] 4 [1000] 5 [1000]]\nendobj\n" });
   const editor = new PdfTextEditor(pdf);
   await editor.setFallbackFont(fontBytes);
   const [match] = await editor.searchText("令和");

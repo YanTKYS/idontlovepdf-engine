@@ -8,7 +8,10 @@ name: Diagnose real PDF font metrics
 # Beyond diagnosis, this also runs an actual edit (search -> fallback font ->
 # check -> replace -> save -> reopen -> search again) against the fetched PDF
 # when `run_edit_test` is true, and verifies the result with tools that share
-# no code with this engine (pdfminer.six, qpdf, Chromium). The PDF itself is
+# no code with this engine (pdfminer.six, qpdf, Chromium). It also checks
+# (v0.4.4) that `unsafe_replacement` -- wide enough, in the fallback font, to
+# overrun the text after the match -- is REFUSED before anything is written,
+# and that the document is byte-for-byte unchanged afterwards. The PDF itself is
 # never committed, uploaded as a workflow artifact, cached, or otherwise kept
 # past the job -- everything happens on the runner's own ephemeral disk, and
 # this workflow adds no network access to the engine's runtime, only to this
@@ -41,6 +44,10 @@ on:
         description: "Replacement text expected to work through the document's own font, as a regression check (edit test only)"
         required: true
         default: "平成"
+      unsafe_replacement:
+        description: "Replacement text expected to be REFUSED (v0.4.4): wider, via the fallback font, than the text it would replace, so it would overrun the following text -- must not be written (edit test only)"
+        required: true
+        default: "しょうわ"
 
 jobs:
   diagnose:
@@ -110,6 +117,7 @@ jobs:
           DIAG_TEXT: ${{ inputs.text }}
           FALLBACK_TEXT: ${{ inputs.fallback_replacement }}
           REGRESSION_TEXT: ${{ inputs.regression_replacement }}
+          UNSAFE_TEXT: ${{ inputs.unsafe_replacement }}
         run: |
           set -euo pipefail
           edited="$RUNNER_TEMP/edited.pdf"
@@ -117,6 +125,7 @@ jobs:
           node scripts/verify-real-pdf-edit.js "$PDF_PATH" \
             --font tmp/test-fonts/BIZUDGothic-Regular.ttf \
             --search "$DIAG_TEXT" --fallback "$FALLBACK_TEXT" --regression "$REGRESSION_TEXT" \
+            --unsafe "$UNSAFE_TEXT" \
             --out "$edited"
 
       # An independent reader (pdfminer.six shares no code with src/) confirms the text

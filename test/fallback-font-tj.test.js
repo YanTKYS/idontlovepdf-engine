@@ -124,8 +124,9 @@ test("replaces text drawn by TJ and leaves what follows exactly where it was", {
   assert.equal(latin1.decode(saved).match(/\/FontFile2/g).length, 1);
   // The kern the PDF asked for is still written exactly once, and still where it was.
   assert.equal(stream.match(/-50/g).length, 1);
-  // 令和 was 1000 + 950 wide; しょ is 1000 + 1000, so the array is pulled back by 50.
-  assert.match(stream, /\/FJP 36 Tf \[50 -50 <000300040005>\] TJ/);
+  // 令和 and しょ are both exactly 1000 + 1000 wide, so no correction is needed -- a zero
+  // adjustment is not written at all, and only the document's own -50 kern survives.
+  assert.match(stream, /\/FJP 36 Tf \[-50 <000300040005>\] TJ/);
 });
 
 test("proves the fixture's own premises: 令和 is writable in the document's font, しょ is not", { skip }, async () => {
@@ -171,6 +172,16 @@ test("keeps every TJ adjustment exactly as the PDF wrote it", { skip }, async ()
   // which are removed with the text they separated and folded into the one adjustment the
   // rewrite writes instead. Either way nothing after the match may move, which is checked
   // for every case at the end of the loop.
+  //
+  // Replaces with "ab" (2 x 500 = 1000 units) rather than しょ (2000): this loop is about
+  // which adjustment survives, not the overflow-safety check of v0.4.4 (see
+  // test/fallback-font-overflow.test.js for that), and several shapes here spend part of
+  // 令和's own 2000 units on an interior kern before the replacement is even measured
+  // against what remains -- narrow enough to fit regardless. Two characters, the same
+  // count as 令和 itself: a *different* count, with the non-zero interior adjustment some
+  // of these cases have, is refused before the fallback font is ever reached (see
+  // MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED / variableLengthObstacle() in
+  // src/pdf-document.js) -- a pre-existing, unrelated rule this loop is not testing.
   const cases = [
     // The match spans two operands with a kern between them.
     { operators: `[${glyphs("令")} 120 ${glyphs("和")}] TJ ${glyphs("平成")} Tj`, kept: [], consumed: ["120"] },
@@ -194,7 +205,7 @@ test("keeps every TJ adjustment exactly as the PDF wrote it", { skip }, async ()
     { operators: `[${glyphs("申請")} -10 ${glyphs("令和")}] TJ ${glyphs("平成")} Tj`, kept: ["-10"], consumed: [] }
   ];
   for (const { operators, kept, consumed } of cases) {
-    const { before, after, stream } = await replaceAndMeasure(body(operators), "令和", "しょ", null);
+    const { before, after, stream } = await replaceAndMeasure(body(operators), "令和", "ab", null);
     // Everything after the `Td`, so the fixture's own text-position operands are never
     // mistaken for adjustments.
     const written = stream.slice(stream.indexOf(" Td ") + 4);
@@ -239,24 +250,68 @@ test("keeps the text after the match in place under Tc, Tw, Tz and any font size
 
 test("draws the rest of the match's own operand back in the document's own font", { skip }, async () => {
   // The prefix and suffix around a partial match stay in the document's font, and the
-  // suffix stays where it was -- it is text drawn after the match like any other.
-  const { runs, stream, before, after } = await replaceAndMeasure(body(`[${glyphs("申請令和です")}] TJ`), "令和", "しょうわ", "fallback-font-partial");
-  assert.deepEqual(runs, ["申請", "しょうわ", "です"]);
+  // suffix stays where it was -- it is text drawn after the match like any other. Same
+  // length as 令和 (2000 units, equal to the slot exactly) so this is about the
+  // prefix/suffix mechanics, not the overflow-safety check -- see the "しょうわ" case in
+  // "refuses a TJ replacement that would overrun the text after it" below for that.
+  const { runs, stream, before, after } = await replaceAndMeasure(body(`[${glyphs("申請令和です")}] TJ`), "令和", "しょ", "fallback-font-partial");
+  assert.deepEqual(runs, ["申請", "しょ", "です"]);
   // The document's own font is re-stated after the fallback, and the suffix drawn in it.
-  assert.match(stream, /\/ILPFallback [\d.]+ Tf \[<[0-9a-f]+>\] TJ \/FJP [\d.]+ Tf \[[-\d]+ <000a000b>\] TJ/);
+  // No adjustment number is written: 令和 and しょ are exactly the same width.
+  assert.match(stream, /\/ILPFallback [\d.]+ Tf \[<[0-9a-f]+>\] TJ \/FJP [\d.]+ Tf \[<000a000b>\] TJ/);
   const trailing = (drawn) => drawn.filter((glyph) => glyph.font === "FJP" && glyph.code >= 0x000a).map((glyph) => glyph.x);
   assert.deepEqual(trailing(after), trailing(before), "です must not move");
 });
 
-test("keeps text drawn after the whole TJ operator in place too", { skip }, async () => {
+test("keeps text drawn after the whole TJ operator in place too, as long as it fits", { skip }, async () => {
   // v0.4.0 refused this outright (FALLBACK_FOLLOWING_TEXT_POSITION_UNSAFE) because a Tj
-  // rewrite has no way to put the following text back. A TJ rewrite does.
+  // rewrite has no way to put the following text back. A TJ rewrite does -- but only up
+  // to the width 令和 actually had (2000 units): しょ (2000) fits exactly, たいしょう (5000)
+  // does not, and would be drawn over the 8年度 that follows in the next operator (v0.4.4).
   for (const operators of [
     `[${glyphs("令和")}] TJ ${glyphs("8年度")} Tj`,
     `[${glyphs("令和")}] TJ [${glyphs("8年度")}] TJ`
   ]) {
-    const { before, after } = await replaceAndMeasure(body(operators), "令和", "しょうわ", "fallback-font");
+    const { before, after } = await replaceAndMeasure(body(operators), "令和", "しょ", "fallback-font");
     assert.equal(positionOf(after, 0x0003), positionOf(before, 0x0003), `8年度 moved, in: ${operators}`);
+  }
+});
+
+test("refuses a TJ replacement that would overrun the text after it, even across operators", { skip }, async () => {
+  // The real-world case this version exists for: 令和 -> しょうわ. Widening the match from
+  // 2000 to 4000 glyph-space units cannot be fixed by any adjustment, because the
+  // adjustment only moves where 8年度 STARTS -- it cannot undraw しょうわ's own glyphs from
+  // the space that move reclaims. Refused before anything is written, whether the
+  // following text sits in the same TJ array, a later Tj, or a later TJ.
+  // A trailing TJ number changes availableAdvance itself (see
+  // test/fallback-font-overflow.test.js's dedicated coverage for that); these three stay
+  // free of one so every case shares the same 2000-unit availableAdvance, isolating what
+  // this test is actually about -- that refusal follows the match regardless of which
+  // operator draws the following text.
+  for (const operators of [
+    `[${glyphs("令和")} ${glyphs("8年度")}] TJ`,
+    `[${glyphs("令和")}] TJ ${glyphs("8年度")} Tj`,
+    `[${glyphs("令和")}] TJ [${glyphs("8年度")}] TJ`
+  ]) {
+    const content = body(operators);
+    const original = makePdf(content);
+    const editor = await editorFor(content);
+    const [match] = await editor.searchText("令和");
+    const verdict = await editor.checkTextMatchReplacement(match.id, "しょうわ");
+    assert.equal(verdict.allowed, false, `should have been refused, in: ${operators}`);
+    assert.equal(verdict.code, "FALLBACK_LAYOUT_UNSUPPORTED", `for: ${operators}`);
+    assert.equal(verdict.unsafeReason, "fallback-replacement-overflows-slot", `for: ${operators}`);
+    assert.deepEqual(verdict.diagnostics, { replacementAdvance: 4000, availableAdvance: 2000 }, `for: ${operators}`);
+
+    await assert.rejects(editor.replaceTextMatch(match.id, "しょうわ"), (error) => {
+      assert.equal(error.code, "FALLBACK_LAYOUT_UNSUPPORTED");
+      assert.equal(error.unsafeReason, "fallback-replacement-overflows-slot");
+      return true;
+    });
+    assert.equal(editor.pending.size, 0);
+    assert.equal(editor.pendingObjects.size, 0);
+    assert.equal(editor.pendingStreams.size, 0);
+    assert.deepEqual(await editor.save(), original, `the document must be untouched, in: ${operators}`);
   }
 });
 

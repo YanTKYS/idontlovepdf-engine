@@ -122,8 +122,9 @@ test("measures a CID font whose /DescendantFonts array element is an inline dict
 
   const { saved, reopened, before, after, stream } = await replaceAndMeasure(pdf, "令和", "しょ", "fallback-font");
 
-  // Same arithmetic as the indirect-/W fixture: 令和 is 1000 + 950, しょ is 1000 + 1000.
-  assert.match(stream, /\/F3 36 Tf \[50 -50 <000300040005>\] TJ/);
+  // Same arithmetic as the indirect-/W fixture: 令和 and しょ are both 1000 + 1000, so no
+  // correction is needed.
+  assert.match(stream, /\/F3 36 Tf \[-50 <000300040005>\] TJ/);
   const trailing = (drawn) => drawn.filter((glyph) => glyph.font === "F3" && glyph.code >= 0x0003).map((glyph) => glyph.x);
   assert.deepEqual(trailing(after), trailing(before), "every glyph after the match must be drawn where it was -- checked against the independent text-advance simulator, not the engine's own arithmetic");
 

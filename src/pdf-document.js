@@ -150,8 +150,11 @@ const REPLACEMENT_MODE = {
  */
 const POSITION_SAFE_AFTER = new Set(["end-of-text-object", "repositioned"]);
 
-function refusal(code, reason, unsafeReason) {
-  return unsafeReason ? { allowed: false, code, reason, unsafeReason } : { allowed: false, code, reason };
+function refusal(code, reason, unsafeReason, diagnostics) {
+  const result = { allowed: false, code, reason };
+  if (unsafeReason) result.unsafeReason = unsafeReason;
+  if (diagnostics) result.diagnostics = diagnostics;
+  return result;
 }
 
 /**
@@ -464,6 +467,27 @@ function splitRunOperand(editor, entry, run) {
  * entries the fallback font is embedded with, so both sides are the numbers that will
  * actually be in the file. Where they cannot be had exactly, this refuses.
  *
+ * Keeping the following text at `advance(original)` is necessary but not sufficient: `n`
+ * can always be chosen to land the following text exactly there, however wide the
+ * replacement is, because `n` only ever moves where the NEXT string starts. It says
+ * nothing about whether the replacement's own glyphs -- drawn at their natural width,
+ * with no `n` applied to them -- already reach past that point (v0.4.4; this is what let
+ * `令和 -> しょうわ` through in v0.4.3, drawn over the `8` that followed it). So before `n`
+ * is computed, `replacementWidth` (`W_replacement`) is compared against `availableAdvance`
+ * -- the exact advance the original text had from the start of the match to wherever the
+ * next unmoved glyph actually starts. `width - between` (`W_original` minus the same `K`
+ * the adjustment arithmetic below uses) is only part of that: it is where the match's OWN
+ * text ended, and a further `TJ` number can sit between there and the next glyph -- in
+ * this match's own tail (`[(match) 50 (next)] TJ`) or at the very start of a later `TJ`'s
+ * array (`[(match)] TJ [50 (next)] TJ`). `availableAdvance` also subtracts that gap, read
+ * from the next run's own `displacement` (scanTextRuns(), src/content-stream.js) -- the
+ * running total of numbers the scanner already accumulates towards whatever string
+ * collects them next, reused here rather than parsed a second way. A replacement wider
+ * than `availableAdvance` is refused: nothing here moves the following text further away,
+ * shrinks the replacement, or reflows anything to make room. When no following text-
+ * showing operand can be found at all (the content stream ends inside the open text
+ * object), the replacement is refused rather than assuming the gap is zero.
+ *
  * When nothing at all is drawn from the end of the match -- no elements after it, no suffix
  * in its own operand, and an `ET`/`BT`/`Td`/`TD`/`Tm`/`T*` next -- no adjustment is needed
  * or written, and no metrics are required: that is the same situation the `Tj` rewrite has
@@ -572,6 +596,58 @@ function planTextArrayRewrite(editor, pieces, glyphs, fallback) {
       );
     }
     const replacementWidth = glyphs.reduce((sum, glyph) => sum + glyphSpaceWidth(fallback, glyph.advanceWidth), 0);
+    // availableAdvance is "how far the original text advanced from the start of the match
+    // to where the next unmoved text actually begins". `width - between` is only part of
+    // that: it is where the match's OWN text ended, not where the next glyph starts, and
+    // those two differ whenever a TJ number sits between them -- in the same array's tail
+    // (`[(match) 50 (next)] TJ`), or at the very start of a later `TJ`'s own array
+    // (`[(match)] TJ [50 (next)] TJ`). Missing that term let a match's own trailing
+    // adjustment mask an overflow entirely: `[(令和) 50 (8年度)] TJ` measured availableAdvance
+    // as 2000 (令和's own width) when 8年度 actually starts at 1950, and a 2000-wide
+    // replacement was let through onto the 50 units of 8年度 it would be drawn over.
+    //
+    // That gap is exactly the next run's own `displacement` -- the running total of PDF
+    // numbers scanTextRuns() (src/content-stream.js) accumulates towards whatever string
+    // collects them next, reset to 0 by any operator that consumes a pending number as
+    // its OWN operand instead (`Tc`, `rg`, and -- critically -- `Tf`'s own font size).
+    // That reset is what keeps this exact whether the run's `joinBefore` reads
+    // "tj-array", "adjacent-operator", or "state-change": a font restore between a
+    // fallback replacement and the following text -- `/Fallback size Tf [...] TJ
+    // /Original size Tf [50 (next)] TJ`, exactly what this engine's own TJ rewrite
+    // writes, and so exactly what re-editing an already-rewritten match reopens into --
+    // is a `joinBefore` "state-change" (a font switch, like any other operator between
+    // two text-showing ones, marks the boundary unclean) yet the "50" is still read
+    // correctly, because `displacement` does not depend on that classification at all.
+    // When the match's own run still has a suffix (a partial match with more of the same
+    // operand after it, e.g. 令和 inside 申請令和です), that suffix -- not the next run --
+    // is what follows immediately, at zero gap, unaffected by any later displacement, so
+    // this is skipped for it.
+    let followingAdjustment = 0;
+    if (suffix === "") {
+      const nextRun = stream.runs[Number(lastEntry.runId.split(":")[1]) + 1];
+      if (!nextRun) {
+        // Something in this text flow depends on this position (that is why this branch
+        // runs at all), but no following text-showing operand could be found at all --
+        // this content stream ends inside the open text object, and whatever continues
+        // it (perhaps a later content stream of the same page) is not something this can
+        // see. Nothing is estimated, so this replacement is refused.
+        return refusal(
+          "FALLBACK_LAYOUT_UNSUPPORTED",
+          "Text is drawn after this match, but this document does not state exactly how far away it starts, so whether the replacement would be drawn over it cannot be established. Nothing is estimated, so this replacement is refused.",
+          "fallback-replacement-slot-unknown"
+        );
+      }
+      followingAdjustment = nextRun.displacement;
+    }
+    const availableAdvance = width - between - followingAdjustment;
+    if (replacementWidth > availableAdvance) {
+      return refusal(
+        "FALLBACK_LAYOUT_UNSUPPORTED",
+        `This replacement would be ${replacementWidth} glyph-space units wide in the fallback font, but only ${availableAdvance} units are available before text that must keep its position -- so the replacement's own glyphs would be drawn over that text. Nothing is moved, shrunk, or reflowed to make room; a shorter replacement is written normally.`,
+        "fallback-replacement-overflows-slot",
+        { replacementAdvance: replacementWidth, availableAdvance }
+      );
+    }
     const value = replacementWidth - width + between;
     const formatted = formatAdjustment(value);
     // The invariant the whole rewrite rests on, checked rather than trusted: what the
@@ -1034,6 +1110,7 @@ function planError(plan) {
   error.code = plan.code;
   if (plan.unsafeReason) error.unsafeReason = plan.unsafeReason;
   if (plan.characters?.length) error.characters = plan.characters;
+  if (plan.diagnostics) error.diagnostics = plan.diagnostics;
   if (plan.cause) error.cause = plan.cause;
   return error;
 }
@@ -1538,6 +1615,9 @@ export class PdfTextEditor {
       // The characters no available font can write, so a caller can name them to a user
       // without reading the message or knowing anything about CMaps.
       if (plan.characters?.length) result.characters = plan.characters;
+      // The two widths a "fallback-replacement-overflows-slot" unsafeReason was measured
+      // from, so a caller diagnosing the refusal can see them without parsing `reason`.
+      if (plan.diagnostics) result.diagnostics = plan.diagnostics;
       return result;
     }
     return { allowed: true, mode: plan.mode };

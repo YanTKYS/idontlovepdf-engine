@@ -128,8 +128,10 @@ async function tjFlowInPage({ indirectWidths = false } = {}) {
   const encode = (value) => new TextEncoder().encode(value);
 
   // 令和8年度, drawn as one TJ array. The font knows those five characters and no others,
-  // and its widths are not all 1000 -- 和 is 950 and 8 is 500 -- so the rewrite has to do
-  // the arithmetic rather than assume full-width glyphs.
+  // and its widths are not all 1000 -- 8 is 500 -- so the rewrite has to do the arithmetic
+  // rather than assume full-width glyphs. 令 and 和 are both 1000: the real fallback font
+  // draws every kanji/kana it has at exactly that width, so a narrower combined width here
+  // would fail the overflow-safety check below for a reason unrelated to what it tests.
   const cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
     + "5 beginbfchar\n<0001> <4EE4>\n<0002> <548C>\n<0003> <0038>\n<0004> <5E74>\n<0005> <5EA6>\nendbfchar\nendcmap\nend end";
   const content = "BT /FJP 28 Tf 20 60 Td [<00010002> -50 <000300040005>] TJ ET";
@@ -145,10 +147,10 @@ async function tjFlowInPage({ indirectWidths = false } = {}) {
       + " /FontDescriptor 8 0 R"
       // v0.4.2: the same widths, written the way a real PDF writer writes a long array --
       // as indirect objects of their own rather than values inside the font dictionary.
-      + (indirectWidths ? " /DW 9 0 R /W 10 0 R" : " /DW 1000 /W [1 [1000] 2 [950] 3 [500] 4 [1000] 5 [1000]]")
+      + (indirectWidths ? " /DW 9 0 R /W 10 0 R" : " /DW 1000 /W [1 [1000] 2 [1000] 3 [500] 4 [1000] 5 [1000]]")
       + " /CIDToGIDMap /Identity >>\nendobj\n",
     "8 0 obj\n<< /Type /FontDescriptor /FontName /ABCDEF+Doc /Flags 4 /FontBBox [0 -200 1000 800] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >>\nendobj\n",
-    ...(indirectWidths ? ["9 0 obj\n1000\nendobj\n", "10 0 obj\n[1 [1000] 2 [950] 3 [500] 4 [1000] 5 [1000]]\nendobj\n"] : [])
+    ...(indirectWidths ? ["9 0 obj\n1000\nendobj\n", "10 0 obj\n[1 [1000] 2 [1000] 3 [500] 4 [1000] 5 [1000]]\nendobj\n"] : [])
   ];
   let source = "%PDF-1.4\n";
   const offsets = [];
@@ -202,9 +204,9 @@ test("keeps the text after a TJ match in place, in a browser, and opens in Chrom
     assert.equal(result.found, 1);
     assert.equal(result.gone, 0);
     assert.equal(result.year, 1, "8年度 must still be there, and still searchable");
-    // 令和 was 1000 + 950 glyph-space units wide and しょ is 1000 + 1000, so the array is
-    // pulled back by exactly 50 -- and the document's own -50 kern is still written once.
-    assert.match(result.rewritten, /\/ILPFallback 28 Tf \[<[0-9a-f]+>\] TJ \/FJP 28 Tf \[50 -50 <000300040005>\] TJ/);
+    // 令和 and しょ are both exactly 1000 + 1000 glyph-space units wide, so no correction is
+    // written -- only the document's own -50 kern.
+    assert.match(result.rewritten, /\/ILPFallback 28 Tf \[<[0-9a-f]+>\] TJ \/FJP 28 Tf \[-50 <000300040005>\] TJ/);
 
     state.saved = result.saved;
     const viewer = await browser.newPage({ viewport: { width: 660, height: 240 } });
@@ -246,7 +248,7 @@ test("measures a font whose widths are indirect objects, in a browser, and opens
     assert.equal(result.found, 1);
     assert.equal(result.gone, 0);
     assert.equal(result.year, 1);
-    assert.match(result.rewritten, /\/ILPFallback 28 Tf \[<[0-9a-f]+>\] TJ \/FJP 28 Tf \[50 -50 <000300040005>\] TJ/);
+    assert.match(result.rewritten, /\/ILPFallback 28 Tf \[<[0-9a-f]+>\] TJ \/FJP 28 Tf \[-50 <000300040005>\] TJ/);
 
     state.saved = result.saved;
     const viewer = await browser.newPage({ viewport: { width: 660, height: 240 } });
