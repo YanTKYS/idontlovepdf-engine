@@ -337,3 +337,54 @@ test("a single setFallbackFonts({ sans, serif }) call naming both roles is all-o
   });
   assert.ok(!editor.fallbackFonts.has("serif"), "serif must not have been registered when the same call's sans was refused");
 });
+
+/* ------------------------------------------------ "sans" and "serif" must be distinct */
+
+test("refuses the same font program for both sans and serif", { skip }, async () => {
+  // The bug this guards: registerFallbackResource()'s page/Font bookkeeping recognizes an
+  // already-registered font by digest alone, shared across roles, while each role still
+  // gets its own Type0/CIDFont/ToUnicode object numbers and its own glyph set. Two roles
+  // sharing one program would let the second role's page registration silently reuse the
+  // first role's page/Font entry while writing descendant-font objects nothing points to --
+  // so glyphs only the second role's replacement needed would be missing from the /W and
+  // ToUnicode the page actually reads through.
+  const editor = new PdfTextEditor(makePdf(REIWA, { flags: FLAGS.serif }));
+  await assert.rejects(editor.setFallbackFonts({ sans: sansBytes, serif: sansBytes }), (error) => {
+    assert.equal(error.code, "FALLBACK_FONT_INVALID");
+    return true;
+  });
+  assert.equal(editor.fallbackFonts.size, 0, "nothing may have been registered");
+});
+
+test("refuses registering the same font program for the other role in a later call", { skip }, async () => {
+  const editor = new PdfTextEditor(makePdf(REIWA, { flags: FLAGS.serif }));
+  await editor.setFallbackFonts({ sans: sansBytes });
+  await assert.rejects(editor.setFallbackFonts({ serif: sansBytes }), (error) => {
+    assert.equal(error.code, "FALLBACK_FONT_INVALID");
+    return true;
+  });
+  assert.ok(!editor.fallbackFonts.has("serif"), "serif must not have been registered");
+
+  // And the reverse order: overwriting "sans" (not yet used) with the digest "serif"
+  // already carries must be refused too, leaving the original "sans" font in place.
+  const other = new PdfTextEditor(makePdf(REIWA, { flags: FLAGS.serif }));
+  await other.setFallbackFonts({ sans: sansBytes, serif: serifBytes });
+  const sansDigestBefore = other.fallbackFonts.get("sans").digest;
+  await assert.rejects(other.setFallbackFont(serifBytes), (error) => {
+    assert.equal(error.code, "FALLBACK_FONT_INVALID");
+    return true;
+  });
+  assert.equal(other.fallbackFonts.get("sans").digest, sansDigestBefore, "the original sans font must be untouched by the refused call");
+});
+
+test("distinct BIZ UDGothic / BIZ UDMincho fonts still register and work as before", { skip }, async () => {
+  const editor = new PdfTextEditor(makePdf(REIWA, { flags: FLAGS.serif }));
+  await editor.setFallbackFonts({ sans: sansBytes, serif: serifBytes });
+  const [match] = await editor.searchText("令和");
+  const diagnosis = await diagnoseFallbackFontSelection(editor, match.id);
+  assert.equal(diagnosis.classification, "serif");
+  assert.equal(diagnosis.selectedRole, "serif");
+  await editor.replaceTextMatch(match.id, "しょ");
+  const saved = await editor.save();
+  assert.match(latin1.decode(saved), /\/BaseFont\s*\/BIZUDMincho-Regular/);
+});

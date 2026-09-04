@@ -1464,10 +1464,45 @@ async function parseFallbackFontForRole(fontBytes) {
   return fallback;
 }
 
+/**
+ * Refuses `code: "FALLBACK_FONT_INVALID"` when the font that would end up registered for
+ * "sans" and the one for "serif" are the same program (same SHA-256 digest) -- checked
+ * across both `entries` (parsed fonts this call is about to register) and whatever is
+ * already registered on `editor`, so registering "serif" separately with a digest a
+ * previously-registered "sans" already has (or the reverse) is refused too, not just the
+ * same-call case.
+ *
+ * Two roles sharing one program would collide in registerFallbackResource()'s page/Font
+ * bookkeeping (`editor.fallbackPageResources`, keyed `pageResourcesObjectNumber ->
+ * Map(fontDigest -> resourceName)` and shared across every role), which recognizes an
+ * already-registered entry by digest alone -- while planFallbackReplacement() still gives
+ * each role its own Type0/CIDFont/ToUnicode object numbers and its own glyph set
+ * (`editor.fallbackEmbeddings`, keyed by role). The second role registered on a page the
+ * first already touched would find the first role's page/Font entry already there (same
+ * digest) and reuse its resource name and Type0 reference there, while separately building
+ * its own, differently-numbered descendant font and ToUnicode CMap that nothing in the
+ * saved file would ever be made to point to -- so glyphs the second role's replacement
+ * added would be missing from the /W and ToUnicode the page actually reads through.
+ * Rejected here, before either role is ever registered, rather than silently produced.
+ */
+function assertFallbackDigestsDistinct(editor, entries) {
+  const digestOf = (role) => entries.find((entry) => entry[0] === role)?.[1]?.digest ?? editor.fallbackFonts.get(role)?.digest;
+  const sans = digestOf("sans");
+  const serif = digestOf("serif");
+  if (sans && serif && sans === serif) {
+    throw searchError(
+      "FALLBACK_FONT_INVALID",
+      "The \"sans\" and \"serif\" fallback fonts are byte-for-byte the same program; each role must be a distinct font. Two roles sharing one font program would collide in this document's fallback page/resource bookkeeping (see registerFallbackResource() in src/pdf-document.js) -- pass two different font programs, or setFallbackFont() alone if one font is really all that is needed."
+    );
+  }
+}
+
 /** Parses, fingerprints, and registers one fallback font under one role ("sans" or "serif"). */
 async function setFallbackFontForRole(editor, role, fontBytes) {
   ensureFallbackRoleAvailable(editor, role);
-  editor.fallbackFonts.set(role, await parseFallbackFontForRole(fontBytes));
+  const fallback = await parseFallbackFontForRole(fontBytes);
+  assertFallbackDigestsDistinct(editor, [[role, fallback]]);
+  editor.fallbackFonts.set(role, fallback);
 }
 
 /**
@@ -1798,6 +1833,10 @@ export class PdfTextEditor {
     for (const [role] of entries) ensureFallbackRoleAvailable(this, role);
     const parsed = [];
     for (const [role, bytes] of entries) parsed.push([role, await parseFallbackFontForRole(bytes)]);
+    // "sans" and "serif" must be distinct programs -- see assertFallbackDigestsDistinct()
+    // for what breaks otherwise. Checked after parsing (fingerprinting needs the parse) but
+    // still before anything is registered, so this stays all-or-nothing too.
+    assertFallbackDigestsDistinct(this, parsed);
     for (const [role, fallback] of parsed) this.fallbackFonts.set(role, fallback);
     return this;
   }
