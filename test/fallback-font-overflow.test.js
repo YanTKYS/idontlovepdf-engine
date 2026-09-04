@@ -111,7 +111,7 @@ test("refuses a replacement wider than the slot it would occupy", { skip }, asyn
   assert.equal(editor.pending.size, 0);
   assert.equal(editor.pendingObjects.size, 0);
   assert.equal(editor.pendingStreams.size, 0);
-  assert.equal(editor.fallbackEmbedding, null, "no font embedding may have been recorded");
+  assert.equal(editor.fallbackEmbeddings.size, 0, "no font embedding may have been recorded");
   assert.deepEqual(await editor.save(), original, "the document must be byte-for-byte untouched, including no embedded font");
 });
 

@@ -1,6 +1,6 @@
 {
   "name": "@idontlovepdf/engine",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "Offline, browser-native engine for replacing text in existing PDF content streams",
   "type": "module",
   "main": "src/index.js",
