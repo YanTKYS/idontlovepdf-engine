@@ -230,7 +230,7 @@ match の終端から**何も描画されない**場合（match が列の末尾�
 
 このケースでは `8年度` の開始位置は正しく元の位置に戻りますが、`しょうわ` 自身の描画がその位置を超えて `8` に重なります。v0.4.3 まではこれを `allowed: true` として通していました（実 PDF `令和 → しょうわ` で実際に確認された不具合です）。v0.4.4 では、上の adjustment 計算で既に得ている 2 つの数値
 
-- `availableAdvance` — 置換開始位置から、同一 text flow 上で位置を維持すべき最初の後続文字が始まる位置までの advance（`元の match の合計幅 - match 内部の adjustment 合計`。上の `n` の式の一部としてすでに計算済みの値です）
+- `availableAdvance` — 置換開始位置から、同一 text flow 上で位置を維持すべき最初の後続文字が実際に描画される位置までの advance。`元の match の合計幅 - match 内部の adjustment 合計`（上の `n` の式の一部としてすでに計算済みの値）だけでは不十分です。それは match 自身が終わる位置であって、後続文字が始まる位置ではありません。両者は、match の直後（同じ配列の tail、`[(match) 50 (next)] TJ`）または後続の別の `TJ` の先頭（`[(match)] TJ [50 (next)] TJ`）に adjustment 数値がある場合にずれます。`availableAdvance` はこのずれも既存の scanner が run ごとに持つ数値（後続 run 自身の displacement）から差し引きます。後続文字がどこにあるか特定できない場合（対象範囲の直後で content stream が終わっている等）は、0 とみなさず拒否します
 - `replacementAdvance` — fallback font で置換文字列を自然に描画したときの advance（`glyphSpaceWidth()` の合計。同じくすでに計算済みの値です）
 
 を比較し、
@@ -254,6 +254,7 @@ replacementAdvance > availableAdvance
 - match の operand 間に `Tc` / `Tw` / `Tz` / `Tr` / 色指定 / marked content などがある（異なる text state で描画されているものを 1 つとして描き直すことになるため）→ `FALLBACK_MULTI_RUN_UNSUPPORTED`
 - 配列の外に数値が書かれている等、対象範囲を `[`・`]`・string・数値・`TJ` だけの列として読み切れない（配列外の数値は reader が字送りとして扱わないため、字送りとみなすと位置がずれる）→ `FALLBACK_LAYOUT_UNSUPPORTED`
 - 置換文字列自身が後続文字の位置まで描画されてしまう（上記）→ `FALLBACK_LAYOUT_UNSUPPORTED`（`unsafeReason: "fallback-replacement-overflows-slot"`）
+- 後続文字が実際にどこから描画されるか特定できない（対象範囲の直後で content stream が終わっている等）→ `FALLBACK_LAYOUT_UNSUPPORTED`（`unsafeReason: "fallback-replacement-slot-unknown"`）
 - 縦書き font / writing mode 不明 → `FALLBACK_WRITING_MODE_UNSUPPORTED`（v0.4.0 と同じ）
 - match が `Tj` と `TJ` にまたがる → `FALLBACK_OPERATOR_UNSUPPORTED`
 

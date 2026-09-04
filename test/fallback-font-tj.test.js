@@ -283,8 +283,13 @@ test("refuses a TJ replacement that would overrun the text after it, even across
   // adjustment only moves where 8年度 STARTS -- it cannot undraw しょうわ's own glyphs from
   // the space that move reclaims. Refused before anything is written, whether the
   // following text sits in the same TJ array, a later Tj, or a later TJ.
+  // A trailing TJ number changes availableAdvance itself (see
+  // test/fallback-font-overflow.test.js's dedicated coverage for that); these three stay
+  // free of one so every case shares the same 2000-unit availableAdvance, isolating what
+  // this test is actually about -- that refusal follows the match regardless of which
+  // operator draws the following text.
   for (const operators of [
-    `[${glyphs("令和")} -50 ${glyphs("8年度")}] TJ`,
+    `[${glyphs("令和")} ${glyphs("8年度")}] TJ`,
     `[${glyphs("令和")}] TJ ${glyphs("8年度")} Tj`,
     `[${glyphs("令和")}] TJ [${glyphs("8年度")}] TJ`
   ]) {

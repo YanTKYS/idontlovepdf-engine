@@ -58,11 +58,16 @@ async function editorFor(content) {
 
 /* --------------------------------------------------------------- A, B, C: narrow/equal/wide */
 
+// These three (A/B/C) isolate the width comparison itself: 8年度 follows via a separate
+// Tj with no TJ number anywhere, so availableAdvance is exactly 令和's own width (2000),
+// with no tail or cross-operator displacement to fold in (that interaction is E's job,
+// below, and test/fallback-font-tj.test.js's headline fixture -- which does carry a
+// trailing kern -- covers the realistic shape).
 test("allows a replacement narrower than the slot it would occupy", { skip }, async () => {
   // 令和 is 2000 units wide (availableAdvance); "abc" is 500 x 3 = 1500 in the fallback
   // font (replacementAdvance) -- narrower, so the existing TJ adjustment simply leaves a
   // gap before 8年度, exactly as it always has.
-  const editor = await editorFor(body(`[${glyphs("令和")} -50 ${glyphs("8年度")}] TJ`));
+  const editor = await editorFor(body(`[${glyphs("令和")}] TJ ${glyphs("8年度")} Tj`));
   const [match] = await editor.searchText("令和");
   const verdict = await editor.checkTextMatchReplacement(match.id, "abc");
   assert.deepEqual(verdict, { allowed: true, mode: "fallback-font" });
@@ -73,7 +78,7 @@ test("allows a replacement narrower than the slot it would occupy", { skip }, as
 test("allows a replacement exactly as wide as the slot it would occupy", { skip }, async () => {
   // しょ is 1000 x 2 = 2000 in the fallback font -- exactly availableAdvance. Equal is
   // safe (no floating-point tolerance needed: both sides are the same integer).
-  const editor = await editorFor(body(`[${glyphs("令和")} -50 ${glyphs("8年度")}] TJ`));
+  const editor = await editorFor(body(`[${glyphs("令和")}] TJ ${glyphs("8年度")} Tj`));
   const [match] = await editor.searchText("令和");
   const verdict = await editor.checkTextMatchReplacement(match.id, "しょ");
   assert.deepEqual(verdict, { allowed: true, mode: "fallback-font" });
@@ -84,7 +89,7 @@ test("allows a replacement exactly as wide as the slot it would occupy", { skip 
 test("refuses a replacement wider than the slot it would occupy", { skip }, async () => {
   // しょうわ is 1000 x 4 = 4000 -- double availableAdvance (2000). This is the exact shape
   // of the reported bug: しょうわ drawn over 8年度. Refused before anything is written.
-  const content = body(`[${glyphs("令和")} -50 ${glyphs("8年度")}] TJ`);
+  const content = body(`[${glyphs("令和")}] TJ ${glyphs("8年度")} Tj`);
   const original = makePdf(content);
   const editor = await editorFor(content);
   const [match] = await editor.searchText("令和");
@@ -158,7 +163,10 @@ test("measures availableAdvance from the real following-text position, not just 
     { k: "-500", availableAdvance: 2500, allowed: true }
   ];
   for (const { k, availableAdvance, allowed } of cases) {
-    const content = body(`[${glyphs("令")} ${k} ${glyphs("和")} -50 ${glyphs("8年度")}] TJ`);
+    // 8年度 follows via a separate Tj with no TJ number of its own, so K (between 令 and
+    // 和, inside the match) is the only thing this loop varies -- isolating "between" from
+    // the tail/cross-operator displacement the next test covers.
+    const content = body(`[${glyphs("令")} ${k} ${glyphs("和")}] TJ ${glyphs("8年度")} Tj`);
     const original = makePdf(content);
     const editor = await editorFor(content);
     const [match] = await editor.searchText("令和");
@@ -174,4 +182,82 @@ test("measures availableAdvance from the real following-text position, not just 
       assert.deepEqual(await editor.save(), original, `K=${k}: the document must be untouched`);
     }
   }
+});
+
+/* ---------------------------------------------------- F: the trailing-adjustment blind spot */
+
+test("counts the adjustment between the match's own end and the following text, not just the match's own width", { skip }, async () => {
+  // The gap this specifically exists for: a TJ number sitting AFTER the whole match, either
+  // in the same array's tail (`[(令和) 50 (8年度)] TJ`) or at the very start of a later TJ's
+  // own array (`[(令和)] TJ [50 (8年度)] TJ`). That number moves where 8年度 actually starts
+  // -- 令和's own width (2000) is only where 令和 itself ends -- so leaving it out of
+  // availableAdvance lets a same-width replacement (しょ, 2000) through onto a slot a
+  // positive adjustment has actually narrowed to 1950, undetected because the replacement
+  // is measured as merely "equal", never "wider".
+  const cases = [
+    // +50 pulls 8年度 left: it really starts at 2000 - 50 = 1950, which しょ (2000) overruns.
+    { operators: `[${glyphs("令和")} 50 ${glyphs("8年度")}] TJ`, availableAdvance: 1950, allowed: false },
+    // -50 pushes 8年度 right: it starts at 2000 - (-50) = 2050, comfortably past しょ.
+    { operators: `[${glyphs("令和")} -50 ${glyphs("8年度")}] TJ`, availableAdvance: 2050, allowed: true },
+    // The same two shapes, with the leading number at the start of a LATER TJ's own array
+    // instead of the same array's tail -- the cross-operator case.
+    { operators: `[${glyphs("令和")}] TJ [50 ${glyphs("8年度")}] TJ`, availableAdvance: 1950, allowed: false },
+    { operators: `[${glyphs("令和")}] TJ [-50 ${glyphs("8年度")}] TJ`, availableAdvance: 2050, allowed: true }
+  ];
+  for (const { operators, availableAdvance, allowed } of cases) {
+    const content = body(operators);
+    const original = makePdf(content);
+    const editor = await editorFor(content);
+    const [match] = await editor.searchText("令和");
+    const verdict = await editor.checkTextMatchReplacement(match.id, "しょ");
+    assert.equal(verdict.allowed, allowed, `${operators}: ${JSON.stringify(verdict)}`);
+    if (allowed) {
+      await editor.replaceTextMatch(match.id, "しょ");
+      const saved = await editor.save();
+      // 8年度 must actually still be there, drawn through the original font, and the
+      // adjustment that moves it must be exactly what the PDF wrote, moved but never
+      // altered: proof this isn't "allowed" by coincidence.
+      assert.deepEqual((await new PdfTextEditor(saved).listTextRuns()).map((run) => run.text), ["しょ", "8年度"]);
+    } else {
+      assert.equal(verdict.unsafeReason, "fallback-replacement-overflows-slot", operators);
+      assert.deepEqual(verdict.diagnostics, { replacementAdvance: 2000, availableAdvance }, operators);
+      await assert.rejects(editor.replaceTextMatch(match.id, "しょ"), (error) => {
+        assert.equal(error.code, "FALLBACK_LAYOUT_UNSUPPORTED");
+        assert.equal(error.unsafeReason, "fallback-replacement-overflows-slot");
+        return true;
+      });
+      assert.equal(editor.pending.size, 0);
+      assert.equal(editor.pendingObjects.size, 0);
+      assert.equal(editor.pendingStreams.size, 0);
+      assert.deepEqual(await editor.save(), original, `${operators}: the document must be untouched`);
+    }
+  }
+});
+
+test("keeps re-editing an already-rewritten fallback match safe (the font-restore Tf is not an unknown gap)", { skip }, async () => {
+  // planTextArrayRewrite()'s own output is exactly the shape that made the trailing-
+  // adjustment fix easy to get subtly wrong: `/Fallback Tf [...] TJ /Original Tf [50
+  // (next)] TJ`. The Tf that restores the original font between the replacement and the
+  // following text is, like any operator, a scanTextRuns() "state-change" boundary -- so a
+  // fix that refused whenever it could not read a plain "tj-array"/"adjacent-operator"
+  // join would refuse to re-edit this engine's own prior output, even when the trailing
+  // number is right there in the bytes. This is 令和 -> しょ inside `[(令和) 50 (8年度)] TJ`
+  // (the availableAdvance=1950 case above), saved, reopened, and edited again.
+  const content = body(`[${glyphs("令和")} 50 ${glyphs("8年度")}] TJ`);
+  const editor = await editorFor(content);
+  const [match] = await editor.searchText("令和");
+  assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "abc"), { allowed: true, mode: "fallback-font" });
+  await editor.replaceTextMatch(match.id, "abc");
+  const saved = await editor.save();
+
+  const reopened = new PdfTextEditor(saved);
+  await reopened.setFallbackFont(fontBytes);
+  const [again] = await reopened.searchText("abc");
+  // "de" is exactly as wide as "abc" (2 x 500), so this is squarely a re-measurement of
+  // the rewritten stream, not a second overflow case.
+  const verdict = await reopened.checkTextMatchReplacement(again.id, "de");
+  assert.deepEqual(verdict, { allowed: true, mode: "fallback-font" });
+  await reopened.replaceTextMatch(again.id, "de");
+  const twice = await reopened.save();
+  assert.deepEqual((await new PdfTextEditor(twice).listTextRuns()).map((run) => run.text), ["de", "8年度"]);
 });

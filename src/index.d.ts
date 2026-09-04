@@ -83,9 +83,10 @@ export type PdfTextEditorErrorCode =
   /** The match's runs are not simply adjacent, so they cannot be redrawn as one piece. */
   | "FALLBACK_MULTI_RUN_UNSUPPORTED"
   /**
-   * The page's structure leaves nowhere safe to put, or to reach, the fallback font --
-   * or (see `"fallback-replacement-overflows-slot"` below) the replacement itself would
-   * be drawn wider than the space the following text's position leaves for it.
+   * The page's structure leaves nowhere safe to put, or to reach, the fallback font -- or
+   * (see `"fallback-replacement-overflows-slot"` / `"fallback-replacement-slot-unknown"`
+   * below) the replacement itself would be, or might be, drawn wider than the space the
+   * following text's position leaves for it.
    */
   | "FALLBACK_LAYOUT_UNSUPPORTED"
   /**
@@ -166,7 +167,15 @@ export type TextMatchReplacementObstacle =
    * own glyphs from the space that adjustment reclaims. See `diagnostics` on the same
    * refusal for the two widths (in PDF glyph-space units) that were compared.
    */
-  | "fallback-replacement-overflows-slot";
+  | "fallback-replacement-overflows-slot"
+  /**
+   * A `TJ`-drawn match has text after it whose position must be kept, but exactly how far
+   * away that text starts could not be established -- the content stream ends inside the
+   * open text object right after the match, with nothing further to measure against.
+   * Nothing is estimated, so the replacement is refused rather than assuming the gap is
+   * zero.
+   */
+  | "fallback-replacement-slot-unknown";
 
 /**
  * Why a font's glyph widths could not be established exactly. Secondary detail alongside
