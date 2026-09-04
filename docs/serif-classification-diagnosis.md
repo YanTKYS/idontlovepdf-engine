@@ -146,14 +146,76 @@ program 自身の標準 metadata、3. 判定不能なら `unknown` → BIZ UDGot
 bit 無し → `sans`、FontDescriptor 無し → `unknown`）は `test/fallback-font-
 classification.test.js` が既に確認済みで、今回変更していません。
 
-## 実 PDF での最終確認
+## 実 PDF での最終確認（確認済み・v0.5.1）
 
 `.github/workflows/diagnose-real-pdf.yml`（既存の manual workflow。新規 workflow は
 追加していません）に、Serif/Sans 分類診断のステップ（`scripts/diagnose-font-
 classification.js`、常時実行）を追加し、`run_edit_test: true` の編集 smoke test
 （`scripts/verify-real-pdf-edit.js`）を `--serif-font`（BIZ UDMincho）対応へ拡張しました。
-このセッションからは `22550.pdf` を直接取得できないため、実行結果は GitHub Actions 上での
-確認が必要です。実行方法・実際の結果は本ファイル末尾（または PR の説明）に追記します。
+このセッションからは `22550.pdf` を直接取得できないため（`www.city.itoman.lg.jp` は
+このセッションの egress policy で拒否されます）、GitHub Actions 上（GitHub-hosted
+runner はこのホストへ到達できます）で実行し、結果を確認しました。
+
+**実行**: `Diagnose real PDF font metrics` workflow を `run_edit_test: true`・
+`text: 令和`・`font: F3` で実行（run ID
+[33887555829](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/33887555829)、
+branch `claude/biz-ud-gothic-diagnosis-stbt7a`、commit `ac0f723`）。
+
+**`scripts/diagnose-font-classification.js` の出力**（`22550.pdf` の `/F3`、実測）:
+
+```text
+sourceFontResource: /F3
+subtype: /CIDFontType2
+descendantFonts: inline dictionary, no object of its own
+fontDescriptor:
+  form: inline
+  object: (none)
+  fontName: /CIDFont+F3
+flags:
+  value: 6
+  serifBit: true
+embeddedFont:
+  present: true
+  type: FontFile2
+classification: serif
+classificationReason: serif-flag-set
+```
+
+**確定した原因**: `/Flags` の値は `6`（Symbolic (4) + Serif (2)）で、Serif bit は
+実際に立っていました。v0.5.0 が `unknown`（→ BIZ UDゴシック）へ落ちていたのは `/Flags`
+の意味づけの問題ではなく、`/FontDescriptor` 自身が inline dictionary で書かれていたため
+到達できていなかったことだけが原因です。上の「原因が確定しました」の節で述べた
+inline `/FontDescriptor` 対応により、この値へ正しく到達できるようになりました。
+
+**編集 smoke test**（`scripts/verify-real-pdf-edit.js --serif-font`、`22550.pdf`
+本体・`令和8年度` の該当箇所、実測）:
+
+- `diagnoseFallbackFontSelection()`: `classification: "serif"`, `reason:
+  "serif-flag-set"`, `fontDescriptor.form: "inline"`, `flags: { value: 6, serifBit:
+  true }`, `selectedRole: "serif"`
+- `令和 → しょ`: `checkTextMatchReplacement()` → `{ allowed: true, mode:
+  "fallback-font-multi-run" }` → `replaceTextMatch()` → `save()` → 保存後 4,562,587
+  bytes（元 615,690 bytes、+3,946,897 bytes）→ 埋め込まれた fallback font の
+  `BaseFont` は **`BIZUDMincho-Regular`**（`BIZUDGothic` は埋め込まれていません）
+- 保存後 reopen → `searchText("しょ")` 1 件、`searchText("令和")` 33 件
+  （34 → 33、置換した 1 件分だけ減少）
+- 後続テキスト（`8年度 糸満市放...`）の描画位置を pdfminer.six（engine と無関係な実装）
+  で独立に確認 → `dx=0.0000 dy=0.0000`（置換前後で位置が変わっていません）
+- `qpdf --check` は置換前・置換後どちらも exit code 0（構造エラーなし）
+- 置換後の PDF は Chromium 本体の PDF viewer（Playwright 経由）で page error 0 件で開けました
+- `令和 → 平成`（既存 font 経路、regression）: `{ allowed: true, mode: "same-length"
+  }` で成功。fallback font を経由しないため embed は発生しません
+- `令和 → しょうわ`（BIZ UD明朝自身の実 glyph 幅で再判定、v0.4.4 の安全判定）:
+  `{ allowed: false, code: "FALLBACK_LAYOUT_UNSUPPORTED", unsafeReason:
+  "fallback-replacement-overflows-slot", diagnostics: { replacementAdvance: 4000,
+  availableAdvance: 2250 } }` で **拒否**されました（BIZ UD明朝で描画すると後続の `8`
+  まで届いてしまうため）。`replaceTextMatch()` も同じ理由で reject され、document は
+  変更されていません。v0.4.4 で確立した安全判定は、選ばれた fallback font が
+  BIZ UDGothic から BIZ UD明朝へ変わっても、そのまま機能しています
+
+**Go**: `22550.pdf` の実構造から Gothic が選ばれていた理由を確定し、最小 fix を実装、
+実 PDF に対して修正後 `serif` 判定・BIZ UD明朝の選択・埋め込み・save/reopen・
+後続テキスト位置維持・既存安全判定の維持のすべてを確認しました。
 
 ## font subsetting について（対象外）
 
