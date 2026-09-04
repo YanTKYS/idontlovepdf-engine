@@ -160,8 +160,22 @@ export function identityEncode(glyphs) {
  *
  * `glyphs` is every glyph drawn through this font so far, keyed by glyph id, so the
  * widths and the ToUnicode CMap grow to cover each new replacement.
+ *
+ * `serif` decides one bit of the FontDescriptor this writes: /Flags's Serif bit (PDF
+ * 32000-1:2008, 9.8.2, Table 123, bit 2 = value 2), which is what lets
+ * font-classification.js read this very font back the same way it classified it going in.
+ * Without this, a document that embedded BIZ UD明朝 for a serif source font would, on
+ * reopen, classify BIZ UD明朝's own FontDescriptor as "sans" (no Serif bit) -- so editing
+ * further text drawn in the fallback font itself (searching its own replaced text and
+ * replacing again) would silently switch to BIZ UDゴシック instead of reusing BIZ UD明朝.
+ * Nothing else about the descriptor depends on `serif`, and the symbolic bit (4) is set
+ * either way: both fallback fonts are still embedded as ordinary symbolic TrueType
+ * programs, not as fonts standing in for the document's own standard encoding.
  */
-export async function buildFallbackFontObjects(fallback, numbers, glyphs, { programAlreadyEmbedded = false } = {}) {
+const FALLBACK_FLAGS_SYMBOLIC = 4;
+const FALLBACK_FLAGS_SERIF = 2;
+
+export async function buildFallbackFontObjects(fallback, numbers, glyphs, { programAlreadyEmbedded = false, serif = false } = {}) {
   const { font } = fallback;
   const scale = (value) => Math.round((value * PDF_UNITS_PER_EM) / fallback.unitsPerEm);
   const head = font.tables.head ?? {};
@@ -218,7 +232,7 @@ end`;
     }],
     descendant,
     [numbers.descriptor, {
-      dictionary: `<< /Type /FontDescriptor /FontName /${name} /Flags 4`
+      dictionary: `<< /Type /FontDescriptor /FontName /${name} /Flags ${FALLBACK_FLAGS_SYMBOLIC | (serif ? FALLBACK_FLAGS_SERIF : 0)}`
         + ` /FontBBox [${scale(head.xMin ?? 0)} ${scale(head.yMin ?? 0)} ${scale(head.xMax ?? 0)} ${scale(head.yMax ?? 0)}]`
         + ` /ItalicAngle 0 /Ascent ${scale(font.ascender)} /Descent ${scale(font.descender)}`
         + ` /CapHeight ${scale(os2.sCapHeight ?? font.ascender)} /StemV 80`

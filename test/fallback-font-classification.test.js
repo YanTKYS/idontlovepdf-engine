@@ -131,6 +131,38 @@ test("a serif source font selects BIZ UD明朝, and only BIZ UD明朝 is embedde
   assert.ok(!text.includes("BIZUDGothic"), "BIZ UDゴシック must not have been embedded for an all-serif document");
 });
 
+test("BIZ UD明朝's own embedded FontDescriptor still classifies as serif after save/reopen, and is reused", { skip }, async () => {
+  // The regression this guards: buildFallbackFontObjects() writes a FontDescriptor for the
+  // fallback font it embeds, and that FontDescriptor is itself read by classifyFontResource()
+  // the next time this engine looks at that font resource -- including when the "source
+  // font" of a later edit is text this engine itself already wrote in BIZ UD明朝. If that
+  // descriptor did not carry the Serif bit, a document edited a second time after save/
+  // reopen would silently drop back to BIZ UDゴシック for text that is, by then, already
+  // drawn in BIZ UD明朝 -- defeating the whole point of choosing it in the first place.
+  const editor = new PdfTextEditor(makePdf(REIWA, { flags: FLAGS.serif }));
+  await editor.setFallbackFonts({ sans: sansBytes, serif: serifBytes });
+  const [firstMatch] = await editor.searchText("令和");
+  await editor.replaceTextMatch(firstMatch.id, "しょ");
+  const saved = await editor.save();
+
+  const reopened = new PdfTextEditor(saved);
+  await reopened.setFallbackFonts({ sans: sansBytes, serif: serifBytes });
+  const [match] = await reopened.searchText("しょ");
+  assert.ok(match, "the reopened document must still contain しょ, drawn in the embedded BIZ UD明朝");
+
+  const diagnosis = await diagnoseFallbackFontSelection(reopened, match.id);
+  assert.equal(diagnosis.classification, "serif", "BIZ UD明朝's own FontDescriptor must classify as serif, not sans");
+  assert.equal(diagnosis.selectedRole, "serif");
+
+  await reopened.replaceTextMatch(match.id, "しょうわ");
+  const twice = await reopened.save();
+
+  assert.equal(fontFile2Count(twice), 1, "still only BIZ UD明朝 -- BIZ UDゴシック must never have been embedded");
+  assert.equal(embeddedDigests(twice).size, 1);
+  const final = new PdfTextEditor(twice);
+  assert.equal((await final.searchText("しょうわ")).length, 1);
+});
+
 /* ----------------------------------------------------------------------- sans fixture */
 
 test("a sans-serif source font selects BIZ UDゴシック, and only BIZ UDゴシック is embedded", { skip }, async () => {
@@ -266,4 +298,42 @@ test("registers a second fallback font on a page the first already touched, with
 
   const reopened = new PdfTextEditor(saved);
   assert.deepEqual(new Set((await reopened.listTextRuns()).map((run) => run.text)), new Set(["しょ", "たいしょう"]));
+});
+
+/* --------------------------------------------------- "sans" must be registered first */
+
+test("refuses setFallbackFonts({ serif }) alone -- serif has nothing to fall back to without sans", { skip }, async () => {
+  // The bug this guards: without this check, a document whose own font is read as "sans"
+  // or "unknown" would have nothing registered for selectFallbackFont() to fall back to,
+  // and would end up drawn in the serif font instead -- the opposite of the documented
+  // "unknown/sans always falls back to sans" behaviour.
+  const editor = new PdfTextEditor(makePdf(REIWA, { flags: FLAGS.sans }));
+  await assert.rejects(editor.setFallbackFonts({ serif: serifBytes }), (error) => {
+    assert.equal(error.code, "FALLBACK_FONT_INVALID");
+    return true;
+  });
+  assert.equal(editor.fallbackFonts.size, 0, "nothing may have been registered");
+
+  // Registering sans first (or together) makes it work.
+  await editor.setFallbackFonts({ sans: sansBytes });
+  await editor.setFallbackFonts({ serif: serifBytes });
+  const [match] = await editor.searchText("令和");
+  const diagnosis = await diagnoseFallbackFontSelection(editor, match.id);
+  assert.equal(diagnosis.classification, "sans");
+  assert.equal(diagnosis.selectedRole, "sans", "a sans-classified source font must still use sans, not the newly-registered serif");
+});
+
+test("a single setFallbackFonts({ sans, serif }) call naming both roles is all-or-nothing", { skip }, async () => {
+  const editor = new PdfTextEditor(makePdf(REIWA, { flags: FLAGS.serif }));
+  await editor.setFallbackFonts({ sans: sansBytes });
+  const [match] = await editor.searchText("令和");
+  await editor.replaceTextMatch(match.id, "しょ");
+
+  // "sans" is already in use; the whole call must be refused, including "serif", which
+  // has not been used yet and would otherwise have been registered on its own.
+  await assert.rejects(editor.setFallbackFonts({ sans: sansBytes, serif: serifBytes }), (error) => {
+    assert.equal(error.code, "FALLBACK_FONT_ALREADY_IN_USE");
+    return true;
+  });
+  assert.ok(!editor.fallbackFonts.has("serif"), "serif must not have been registered when the same call's sans was refused");
 });

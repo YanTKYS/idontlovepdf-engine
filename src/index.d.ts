@@ -296,15 +296,22 @@ export class PdfTextEditor {
    * Supplies more than one fallback font, so a replacement can be drawn in whichever looks
    * closer to the source text's own font: `serif` for a run whose own font's FontDescriptor
    * states it is serif, `sans` for everything else a fallback font is needed for (a
-   * sans-serif source font, or one this cannot confidently classify). At least one of
-   * `sans`/`serif` is required. Which font a given replacement actually uses is decided
-   * per match, from the source run's own font -- never chosen by the caller.
+   * sans-serif source font, or one this cannot confidently classify). Which font a given
+   * replacement actually uses is decided per match, from the source run's own font -- never
+   * chosen by the caller.
+   *
+   * `sans` must be registered before `serif` can be used -- either in this same call, or by
+   * an earlier one (a prior setFallbackFont() call also satisfies this, since it registers
+   * `sans`). Rejected with `FALLBACK_FONT_INVALID` otherwise: without a `sans` font, `serif`
+   * would have nothing to fall back to for the "sans"/"unknown" text it is not meant to
+   * draw.
    *
    * Both fonts may end up embedded in the same document, each once however many
    * replacements use it. Rejects the same way setFallbackFont() does -- `FALLBACK_FONT_INVALID`
    * for a non-TrueType font, `FALLBACK_FONT_ALREADY_IN_USE` for a role that has already
    * written a replacement -- applied per role, so replacing the "sans" font before it has
-   * been used does not disturb an already-used "serif" one, or the reverse.
+   * been used does not disturb an already-used "serif" one, or the reverse. A call naming
+   * both roles is all-or-nothing: if either is refused, neither is registered.
    */
   setFallbackFonts(fonts: { sans?: ArrayBuffer | Uint8Array; serif?: ArrayBuffer | Uint8Array }): Promise<this>;
 

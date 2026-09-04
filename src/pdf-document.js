@@ -760,15 +760,19 @@ function buildTextArrayEdit(editor, pieces, array, glyphs, resourceName, replace
  * only ever called setFallbackFont() behaving exactly as before this existed: with only
  * "sans" ever registered, every match routes to it regardless of classification.
  *
- * Never returns null when `editor.fallbackFonts` is non-empty, which is the only condition
- * planTextMatchReplacement() calls this under.
+ * Relies on an invariant enforced at registration time (see setFallbackFonts()): "sans" is
+ * registered before, or together with, "serif" -- never "serif" alone. So whenever
+ * `editor.fallbackFonts` is non-empty (the only condition planTextMatchReplacement() calls
+ * this under), "sans" is always in it, and the "sans"/"unknown" branch below never has to
+ * fall through to "serif" for lack of anything else -- which would silently draw sans-
+ * classified or unclassifiable text in a serif-looking font, the opposite of the v0.4.4
+ * fallback this exists to preserve.
  */
 function selectFallbackFont(editor, classification) {
   if (classification === "serif" && editor.fallbackFonts.has("serif")) {
     return { role: "serif", fallback: editor.fallbackFonts.get("serif") };
   }
-  if (editor.fallbackFonts.has("sans")) return { role: "sans", fallback: editor.fallbackFonts.get("sans") };
-  return { role: "serif", fallback: editor.fallbackFonts.get("serif") };
+  return { role: "sans", fallback: editor.fallbackFonts.get("sans") };
 }
 
 /**
@@ -974,7 +978,7 @@ async function planFallbackReplacement(editor, match, replacement) {
       ? REPLACEMENT_MODE.fallbackFont
       : REPLACEMENT_MODE.fallbackFontPartial);
 
-  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, embedded.glyphs, { programAlreadyEmbedded: embedded.programAlreadyEmbedded })) {
+  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, embedded.glyphs, { programAlreadyEmbedded: embedded.programAlreadyEmbedded, serif: role === "serif" })) {
     objects.set(number, object);
   }
   return {
@@ -1434,26 +1438,36 @@ export async function diagnoseFontMetrics(editor) {
 }
 
 /**
- * Parses, fingerprints, and registers one fallback font under one role ("sans" or
- * "serif"), shared by setFallbackFont() (always "sans") and setFallbackFonts(). Refuses
- * `code: "FALLBACK_FONT_ALREADY_IN_USE"` once that role has written a replacement -- text
- * already written holds glyph ids of that role's font, and another font's ids mean
+ * Throws `code: "FALLBACK_FONT_ALREADY_IN_USE"` once `role` has written a replacement --
+ * text already written holds glyph ids of that role's font, and another font's ids mean
  * different glyphs, so swapping it would silently turn text already written into the wrong
  * characters. Setting a role again before its first replacement is fine, exactly as
- * setFallbackFont() has always allowed for its one font.
+ * setFallbackFont() has always allowed for its one font. Split out from
+ * setFallbackFontForRole() so setFallbackFonts() can check every role it is about to touch
+ * before parsing any of them -- see there for why.
  */
-async function setFallbackFontForRole(editor, role, fontBytes) {
+function ensureFallbackRoleAvailable(editor, role) {
   if (editor.fallbackEmbeddings.has(role)) {
     throw searchError(
       "FALLBACK_FONT_ALREADY_IN_USE",
       `This editor has already written text with the "${role}" fallback font; that text holds glyph ids of that font, so it cannot be exchanged for another. Save and reopen to start again with a different font.`
     );
   }
+}
+
+/** Parses and fingerprints one fallback font, without touching the editor. */
+async function parseFallbackFontForRole(fontBytes) {
   const fallback = parseFallbackFont(fontBytes);
   // Hashed once, here, so a later session can tell whether a font already embedded in the
   // document is this exact program rather than merely one of the same name and size.
   fallback.digest = await fingerprintFont(fallback.bytes);
-  editor.fallbackFonts.set(role, fallback);
+  return fallback;
+}
+
+/** Parses, fingerprints, and registers one fallback font under one role ("sans" or "serif"). */
+async function setFallbackFontForRole(editor, role, fontBytes) {
+  ensureFallbackRoleAvailable(editor, role);
+  editor.fallbackFonts.set(role, await parseFallbackFontForRole(fontBytes));
 }
 
 /**
@@ -1734,14 +1748,21 @@ export class PdfTextEditor {
    * sans-serif-looking one -- reducing how visually different a replacement looks from the
    * document's own type, which setFallbackFont()'s single font cannot do for both at once.
    *
-   * `fonts` is `{ sans?, serif? }`; at least one of the two is required. Which role a given
-   * match actually uses is never up to the caller: it is decided per match, from the source
-   * run's own font, by planFallbackReplacement() in pdf-document.js (see
-   * font-classification.js for how a font is read as "serif", "sans", or "unknown"). A
-   * "serif" source font uses the "serif" fallback only when one has been supplied here;
-   * "sans", "unknown", and "serif" with no serif fallback registered all use "sans" --
-   * exactly the font setFallbackFont() alone would have used for everything, so a document
-   * this cannot confidently classify never behaves worse than v0.4.4 did.
+   * `fonts` is `{ sans?, serif? }`. Which role a given match actually uses is never up to
+   * the caller: it is decided per match, from the source run's own font, by
+   * planFallbackReplacement() in pdf-document.js (see font-classification.js for how a font
+   * is read as "serif", "sans", or "unknown"). A "serif" source font uses the "serif"
+   * fallback only when one has been supplied; "sans", "unknown", and "serif" with no serif
+   * fallback registered all use "sans" -- exactly the font setFallbackFont() alone would
+   * have used for everything, so a document this cannot confidently classify never behaves
+   * worse than v0.4.4 did.
+   *
+   * **"sans" must be registered before "serif" can be used** -- either in this same call, or
+   * by an earlier one (including a prior setFallbackFont(), which registers "sans"). Without
+   * it, "serif" would have no font to fall back to for the "sans"/"unknown" text it is not
+   * meant to draw, and would end up drawing everything in the serif font instead -- silently
+   * contradicting the fallback this whole design exists to preserve. Rejected up front with
+   * `code: "FALLBACK_FONT_INVALID"` rather than left to draw the wrong font later.
    *
    * Both fonts may be embedded in the same document, each once however many replacements
    * use it, and a page needing both gets both without either colliding on resource name.
@@ -1761,7 +1782,23 @@ export class PdfTextEditor {
       throw searchError("FALLBACK_FONT_INVALID", `setFallbackFonts() only accepts "sans" and "serif" roles, not "${badRole[0]}"`);
     }
     if (!entries.length) throw searchError("FALLBACK_FONT_INVALID", "setFallbackFonts() requires at least one of { sans, serif }");
-    for (const [role, bytes] of entries) await setFallbackFontForRole(this, role, bytes);
+    // "serif" must never be usable without "sans" registered -- see selectFallbackFont(),
+    // which relies on this as an invariant rather than re-checking it on every match.
+    const registersSans = entries.some(([role]) => role === "sans");
+    if (!registersSans && !this.fallbackFonts.has("sans")) {
+      throw searchError(
+        "FALLBACK_FONT_INVALID",
+        "setFallbackFonts() requires a \"sans\" font to be registered (in this call or an earlier one) before \"serif\" can be used: \"sans\"/\"unknown\" source text always falls back to \"sans\", so a document with no \"sans\" font would have nothing to fall back to."
+      );
+    }
+    // All-or-nothing: every role this call touches is checked before any of them is parsed,
+    // and none is registered until all have parsed successfully -- so a request naming both
+    // roles never ends up with one applied and the other refused (an already-used role, or
+    // invalid bytes for either, leaves this editor exactly as it was).
+    for (const [role] of entries) ensureFallbackRoleAvailable(this, role);
+    const parsed = [];
+    for (const [role, bytes] of entries) parsed.push([role, await parseFallbackFontForRole(bytes)]);
+    for (const [role, fallback] of parsed) this.fallbackFonts.set(role, fallback);
     return this;
   }
 
