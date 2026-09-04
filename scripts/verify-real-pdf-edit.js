@@ -1,14 +1,15 @@
 // Whether a real, published PDF can actually be edited end to end -- not just diagnosed.
 //
-//   node scripts/verify-real-pdf-edit.js <file.pdf> --font <fallback-font.ttf> \
+//   node scripts/verify-real-pdf-edit.js <file.pdf> --font <sans-fallback-font.ttf> \
+//     [--serif-font <serif-fallback-font.ttf>] \
 //     [--search 令和] [--fallback しょ] [--regression 平成] [--unsafe しょうわ] [--out /tmp/edited.pdf]
 //
 // diagnose-font-metrics.js (v0.4.2) answers "why can this document's font not be measured".
 // This answers the actual Go/No-Go question for v0.4.3: given a real PDF whose /F3 needed
 // the inline-/DescendantFonts-dictionary fix, does
 //
-//   listTextRuns() -> searchText() -> setFallbackFont() -> checkTextMatchReplacement()
-//   -> replaceTextMatch() -> save() -> reopen -> searchText()
+//   listTextRuns() -> searchText() -> setFallbackFont()/setFallbackFonts()
+//   -> checkTextMatchReplacement() -> replaceTextMatch() -> save() -> reopen -> searchText()
 //
 // actually succeed, end to end, through the public API -- the same sequence a real caller
 // (idontlovepdf) drives? Nothing here is fixture-only: it is the identical engine surface
@@ -20,6 +21,15 @@
 // refused before anything is written, rather than producing an edited file with characters
 // drawn on top of each other? See docs/release-notes.md's v0.4.4 entry for the arithmetic.
 //
+// v0.5.1 adds --serif-font: when given, both fallback roles are registered via
+// setFallbackFonts({ sans, serif }) (v0.5.0), and diagnoseFallbackFontSelection() is printed
+// for the match before anything is replaced, so this answers not just "did the fallback
+// replacement succeed" but "did it pick the fallback font this document's own FontDescriptor
+// actually calls for" -- see docs/serif-classification-diagnosis.md for why that answer was
+// wrong for 22550.pdf under v0.5.0. Without --serif-font, behaviour is unchanged from v0.4.4:
+// a single setFallbackFont() call, routing every fallback replacement through it regardless
+// of classification.
+//
 // It reads the given PDF, edits an in-memory copy, and (optionally, via --out) writes the
 // edited copy to disk for an independent tool (qpdf, pdfminer.six, a browser) to open in a
 // later CI step. It never fetches anything itself, and the source PDF this is pointed at is
@@ -28,6 +38,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 
 import { PdfTextEditor } from "../src/index.js";
+import { diagnoseFallbackFontSelection } from "../src/pdf-document.js";
 
 const args = process.argv.slice(2);
 const file = args.find((argument) => !argument.startsWith("--"));
@@ -37,15 +48,16 @@ const optionOf = (name, fallback) => {
 };
 
 if (!file) {
-  console.error("usage: node scripts/verify-real-pdf-edit.js <file.pdf> --font <fallback-font.ttf> [--search 令和] [--fallback しょ] [--regression 平成] [--unsafe しょうわ] [--out <edited.pdf>]");
+  console.error("usage: node scripts/verify-real-pdf-edit.js <file.pdf> --font <sans-fallback-font.ttf> [--serif-font <serif-fallback-font.ttf>] [--search 令和] [--fallback しょ] [--regression 平成] [--unsafe しょうわ] [--out <edited.pdf>]");
   process.exit(2);
 }
 
 const fontPath = optionOf("font", null);
 if (!fontPath) {
-  console.error("--font <fallback-font.ttf> is required (the fallback font used to write text the document's own font cannot).");
+  console.error("--font <sans-fallback-font.ttf> is required (the fallback font used to write text the document's own font cannot).");
   process.exit(2);
 }
+const serifFontPath = optionOf("serif-font", null);
 
 const searchQuery = optionOf("search", "令和");
 const fallbackReplacement = optionOf("fallback", "しょ");
@@ -55,6 +67,13 @@ const outPath = optionOf("out", null);
 
 const originalBytes = new Uint8Array(readFileSync(file));
 const fontBytes = new Uint8Array(readFileSync(fontPath));
+const serifFontBytes = serifFontPath ? new Uint8Array(readFileSync(serifFontPath)) : null;
+
+/** setFallbackFonts({sans, serif}) when a serif font was given (v0.5.0+), else the v0.4.x single-font setFallbackFont(). */
+async function registerFallbackFonts(editor) {
+  if (serifFontBytes) await editor.setFallbackFonts({ sans: fontBytes, serif: serifFontBytes });
+  else await editor.setFallbackFont(fontBytes);
+}
 
 let failed = false;
 const fail = (message) => {
@@ -79,9 +98,18 @@ if (!matches.length) {
 const target = matches[0];
 console.log(`editing the first match: id=${target.id} text=${JSON.stringify(target.text)} before=${JSON.stringify(target.before)} after=${JSON.stringify(target.after)} font=${target.fontName}`);
 
-heading("setFallbackFont()");
-await editor.setFallbackFont(fontBytes);
-console.log(`fallback font loaded (${fontBytes.length} bytes)`);
+heading(serifFontBytes ? "setFallbackFonts({ sans, serif })" : "setFallbackFont()");
+await registerFallbackFonts(editor);
+console.log(`fallback font(s) loaded (sans: ${fontBytes.length} bytes${serifFontBytes ? `, serif: ${serifFontBytes.length} bytes` : ""})`);
+
+if (serifFontBytes) {
+  heading("diagnoseFallbackFontSelection() -- why this match picked the fallback font it did (v0.5.1)");
+  const diagnosis = await diagnoseFallbackFontSelection(editor, target.id);
+  console.log(JSON.stringify(diagnosis, (key, value) => (key === "text" ? (value ? `${value.length} chars` : value) : value), 2));
+  if (diagnosis.classification === "unknown") {
+    console.log(`note: classification is "unknown" (reason: ${diagnosis.reason}) -- this document's own FontDescriptor does not state Serif/Sans plainly enough to read, so the sans role is used, exactly as v0.4.4 always did`);
+  }
+}
 
 heading(`checkTextMatchReplacement(${JSON.stringify(fallbackReplacement)}) -- the fallback replacement this exists to prove`);
 const fallbackCheck = await editor.checkTextMatchReplacement(target.id, fallbackReplacement);
@@ -98,11 +126,21 @@ if (fallbackCheck.mode !== "fallback-font") {
 heading(`replaceTextMatch(${JSON.stringify(fallbackReplacement)}) -> save()`);
 await editor.replaceTextMatch(target.id, fallbackReplacement);
 const saved = await editor.save();
-console.log(`saved: ${saved.length} bytes (original was ${originalBytes.length})`);
+console.log(`saved: ${saved.length} bytes (original was ${originalBytes.length}, +${saved.length - originalBytes.length} bytes)`);
 const isIncrementalUpdate = saved.length >= originalBytes.length
   && saved.subarray(0, originalBytes.length).every((byte, index) => byte === originalBytes[index]);
 console.log(`incremental update (original bytes preserved as a prefix): ${isIncrementalUpdate}`);
 if (!isIncrementalUpdate) fail("the saved file's head is not byte-identical to the original -- this should be an incremental update");
+
+if (serifFontBytes) {
+  // Which of the two fallback fonts actually got embedded -- the real-world symptom this
+  // whole diagnosis exists for (see docs/serif-classification-diagnosis.md): a serif-looking
+  // document ending up with BIZ UDゴシック embedded instead of BIZ UD明朝.
+  const savedText = new TextDecoder("latin1").decode(saved);
+  const embeddedMincho = /\/BaseFont\s*\/BIZUDMincho-Regular/.test(savedText);
+  const embeddedGothic = /\/BaseFont\s*\/BIZUDGothic-Regular/.test(savedText);
+  console.log(`embedded fallback font BaseFont: ${embeddedMincho ? "BIZUDMincho-Regular" : embeddedGothic ? "BIZUDGothic-Regular" : "(neither found)"}`);
+}
 
 if (outPath) {
   writeFileSync(outPath, saved);
@@ -129,7 +167,7 @@ heading(`checkTextMatchReplacement(${JSON.stringify(unsafeReplacement)}) on the 
 const unsafeEditor = new PdfTextEditor(originalBytes);
 await unsafeEditor.listTextRuns();
 const [unsafeTarget] = await unsafeEditor.searchText(searchQuery);
-await unsafeEditor.setFallbackFont(fontBytes);
+await registerFallbackFonts(unsafeEditor);
 const unsafeCheck = await unsafeEditor.checkTextMatchReplacement(unsafeTarget.id, unsafeReplacement);
 console.log(JSON.stringify(unsafeCheck));
 if (unsafeCheck.allowed) {

@@ -1,6 +1,6 @@
 import { encodeHex, encodeLiteral, parseTextArrayRegion, replaceTextRuns, scanTextRuns } from "./content-stream.js";
 import { FALLBACK_FONT_MARKER, buildFallbackFontObjects, fingerprintFont, freeResourceName, glyphSpaceWidth, glyphsFor, glyphsFromToUnicode, identityEncode, parseFallbackFont } from "./fallback-font.js";
-import { classifyFontResource } from "./font-classification.js";
+import { classifyFontResourceDetailed } from "./font-classification.js";
 import { describeFontWidths, measureCodes, resolveDescendantFont } from "./font-metrics.js";
 import { decodeWithCMap, encodeWithCMap, parseToUnicodeCMap } from "./cmap.js";
 import { summarizeEncryption } from "./encryption.js";
@@ -1292,6 +1292,12 @@ async function loadFontMaps(resources, structure, security) {
   // selectFallbackFont() in planFallbackReplacement()) looks this up by the source run's
   // font name exactly as it looks up fontModes and fontWidths.
   const classifications = new Map();
+  // The same classification, plus which FontDescriptor/Flags reason produced it and what
+  // FontDescriptor (if any) was reached -- see classifyFontResourceDetailed(). Kept
+  // alongside `classifications` (never used for anything but developer diagnostics --
+  // diagnoseFallbackFontSelection() below) rather than replacing it, so every existing
+  // caller of the plain string still reads exactly the same map it always has.
+  const classificationDetails = new Map();
   // A font dictionary can itself be compressed (a common PDF-writer optimization);
   // its own /ToUnicode target, however, is always a stream, and streams are never
   // stored in an Object Stream (PDF spec 7.5.7), so that lookup stays on the
@@ -1300,7 +1306,9 @@ async function loadFontMaps(resources, structure, security) {
     const font = await structure.resolveObject(fontReference, security, decryptStreamBytes);
     const resolve = (target) => structure.resolveObject(target, security, decryptStreamBytes);
     modes.set(name, writingModeOf(font.dictionary, structure));
-    classifications.set(name, await classifyFontResource(font.dictionary, resolve));
+    const detail = await classifyFontResourceDetailed(font.dictionary, resolve);
+    classifications.set(name, detail.classification);
+    classificationDetails.set(name, detail);
     // The widths a reader positions this font's text with, when they can be read exactly.
     // Only the TJ fallback rewrite needs them, and only when it has to keep following text
     // where it is; null here simply means that rewrite refuses (see loadFontWidths()).
@@ -1312,7 +1320,7 @@ async function loadFontMaps(resources, structure, security) {
     const cmapObject = structure.object(toUnicode);
     result.set(name, parseToUnicodeCMap(await decodeStream(cmapObject, "ToUnicode stream", security)));
   }
-  return { maps: result, modes, widths, widthReasons, classifications };
+  return { maps: result, modes, widths, widthReasons, classifications, classificationDetails };
 }
 
 /**
@@ -1514,6 +1522,14 @@ async function setFallbackFontForRole(editor, role, fontBytes) {
  * real document's fallback font choice can be explained without guessing from the saved
  * file. Never throws for a refusal -- it reports what checkTextMatchReplacement() would
  * decide, without deciding anything itself.
+ *
+ * `reason`, `fontDescriptor` and `flags` (v0.5.1) are the same detail
+ * classifyFontResourceDetailed() (font-classification.js) already computed while this
+ * stream's fonts were loaded -- see fontClassificationDetails in loadFontMaps() -- surfaced
+ * here rather than re-derived, so this can never disagree with the classification that was
+ * actually used. `reason` is one of CLASSIFICATION_REASONS (font-classification.js);
+ * `fontDescriptor.form` is "indirect", "inline", or null when none was reached at all;
+ * `flags.value`/`flags.serifBit` are null whenever /Flags could not be read as a number.
  */
 export async function diagnoseFallbackFontSelection(editor, matchId) {
   await editor.listTextRuns();
@@ -1522,11 +1538,16 @@ export async function diagnoseFallbackFontSelection(editor, matchId) {
   const pieces = scannedRuns(editor, match.span);
   if (pieces.some(({ run }) => !run)) return { code: "MATCH_STALE" };
   const sourceFontName = pieces[0].run.fontName;
-  const classification = pieces[0].stream.fontClassifications?.get(sourceFontName) ?? "unknown";
+  const detail = pieces[0].stream.fontClassificationDetails?.get(sourceFontName);
+  const classification = detail?.classification ?? pieces[0].stream.fontClassifications?.get(sourceFontName) ?? "unknown";
+  const reason = detail?.reason ?? null;
+  const fontDescriptor = detail?.fontDescriptor ?? { form: null, object: null, text: null };
+  const flags = detail?.flags ?? { value: null, serifBit: null };
   const availableRoles = [...editor.fallbackFonts.keys()];
-  if (!availableRoles.length) return { sourceFontName, classification, selectedRole: null, availableRoles };
+  const base = { sourceFontName, classification, reason, fontDescriptor, flags, availableRoles };
+  if (!availableRoles.length) return { ...base, selectedRole: null };
   const { role } = selectFallbackFont(editor, classification);
-  return { sourceFontName, classification, selectedRole: role, availableRoles };
+  return { ...base, selectedRole: role };
 }
 
 export class PdfTextEditor {
@@ -1636,7 +1657,8 @@ export class PdfTextEditor {
           this.streams.push({
             object, decoded, runs, resources,
             fontMaps: fonts.maps, fontModes: fonts.modes, fontWidths: fonts.widths,
-            fontWidthReasons: fonts.widthReasons, fontClassifications: fonts.classifications
+            fontWidthReasons: fonts.widthReasons, fontClassifications: fonts.classifications,
+            fontClassificationDetails: fonts.classificationDetails
           });
         }
       }

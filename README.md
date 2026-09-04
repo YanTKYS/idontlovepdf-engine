@@ -190,6 +190,7 @@ await editor.setFallbackFonts({
 - **glyph 幅計測・`TJ` adjustment・overflow 判定・word/character spacing・writing mode・multi-run 安全判定・save → reopen・fail closed・atomic replacement は、どちらの fallback font を選んだ場合も一切変わりません。** 選ばれた font から実際の glyph 幅を取得し、`setFallbackFont()` 単体のときと同じ安全性判定を通します。「明朝なら幅が近いはず」といった推測は行いません
 - 動作確認には [BIZ UDMincho](https://github.com/googlefonts/morisawa-biz-ud-mincho)（SIL Open Font License 1.1）を使用しています。engine には同梱していません
 - **今回は PoC です。** Windows システム font の取得、Local Font Access API、font 名による判定、太字・斜体・weight・stretch に応じた font 切替、複数の明朝/Gothic font からの選択は対象外です
+- **v0.5.1: `/FontDescriptor` が inline dictionary（`/FontDescriptor << ... >>`）として書かれている場合も読みます。** v0.5.0 は `/FontDescriptor N G R` の indirect reference のみ対応しており、inline の場合は「`/FontDescriptor` が無い」場合と区別できず `unknown`（→ `sans`）に落ちていました。これは実 PDF（`22550.pdf`）で確認された制約です。詳細は [docs/serif-classification-diagnosis.md](docs/serif-classification-diagnosis.md) を参照してください。`/Flags` の意味づけ自体は変更していません
 
 #### fallback font で置換できる構造
 
