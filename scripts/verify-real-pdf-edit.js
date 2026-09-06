@@ -275,7 +275,10 @@ if (!regressionCheck.allowed) {
   if (!foundRegression.length) fail(`${JSON.stringify(regressionReplacement)} was not found after reopening (regression check)`);
   // Item 14 of the subsetting PoC: when the document's own font can already write the
   // replacement, neither fallback font is embedded at all, and the file stays small.
-  const noFallbackEmbedded = !/\/FontFile2/.test(new TextDecoder("latin1").decode(regressionSaved));
+  // Checked via this engine's own marker (see FALLBACK_FONT_MARKER, src/fallback-font.js),
+  // not a bare /FontFile2 search -- a real document like this one already embeds its own
+  // fonts, so /FontFile2 is present in originalBytes regardless of anything this edit did.
+  const noFallbackEmbedded = !/\/ILPFallbackFont\s*</.test(new TextDecoder("latin1").decode(regressionSaved));
   console.log(`no fallback font embedded for an own-font replacement: ${noFallbackEmbedded} (+${regressionSaved.length - originalBytes.length} bytes)`);
   if (!noFallbackEmbedded) fail(`${JSON.stringify(regressionReplacement)} unexpectedly embedded a fallback font -- it should have been written through the document's own font`);
 }
