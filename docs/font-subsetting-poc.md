@@ -156,15 +156,15 @@ subsetter。
 glyph 数が増えても大部分は「他の全テーブル (cmap 等) のベースコスト」であり、
 glyph 自体の追加コストは 1 glyph あたり数十〜百数十 byte 程度に留まる。
 
-### `22550.pdf` (`令和 → しょ`) 相当のケース
+### `22550.pdf` 実ファイルでの結果
 
 ローカル開発環境からは `www.city.itoman.lg.jp` へ到達できない (別記録
-`docs/descendant-font-diagnosis.md` と同じ egress 制限) ため、同一構造・同一文字集合の
-fixture PDF で engine 経由の save/reopen フローを再現し、`scripts/verify-real-pdf-edit.js`
-+ `scripts/verify-real-pdf-font-subset.py` (fontTools / FreeType / MuPDF) で検証した。
-実 `22550.pdf` 自体の最終確認は `.github/workflows/diagnose-real-pdf.yml`
-(`run_edit_test: true`) の GitHub-hosted runner 実行で行う (item 18/19 のとおり、
-新しい workflow は追加せず既存 workflow を拡張)。
+`docs/descendant-font-diagnosis.md` と同じ egress 制限) ため、実ファイルでの検証は
+`.github/workflows/diagnose-real-pdf.yml`（`run_edit_test: true`、GitHub-hosted runner、
+新しい workflow は追加せず既存 workflow を拡張）で実行した
+([run 34008513349](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34008513349))。
+ローカルでは同一構造・同一文字集合の fixture PDF で engine 経由の save/reopen フローを
+事前に再現・検証している。
 
 v0.5.1 baseline (既知):
 
@@ -174,23 +174,45 @@ full-font embedding: 4,562,587 bytes
 increase:            +3,946,897 bytes
 ```
 
-fixture 相当 (`令和 → しょ`, BIZ UDGothic, sans 側) での実測:
+`22550.pdf` 実ファイルでの v0.6.0 実測 (1回目 `令和 → しょ`, BIZ UD明朝, serif 側
+-- `/F3` は Serif bit が立っており `diagnoseFallbackFontSelection()` が
+`classification: "serif"` / `selectedRole: "serif"` を正しく選択):
 
 ```text
-original:  1,359 bytes (合成 fixture; 実ファイルのバイト数ではない)
-saved:     183,147 bytes
-increase:  +181,788 bytes
-embedding: subset (417,620 / 4,667,376 bytes, 91.1% smaller)
+original:  615,690 bytes
+saved:     802,131 bytes
+increase:  +186,441 bytes
+embedding: subset (417,824 / 6,153,932 bytes, 93.2% smaller than the whole program)
+mode:      fallback-font-multi-run (実PDFの構造上、複数 run にまたがる一致)
 ```
 
-font 単体の deflate 済み subset サイズ (184KB 前後) が実質的な増加量の大部分を
-占めており、`22550.pdf` 本体でも同程度の増加量 (対 baseline **95%以上の削減**、
-目標の80%を大きく上回る) になる見込み。実ファイルでの最終数値は
-GitHub Actions 実行結果を参照。
+**v0.5.1 baseline 比で 95.3% 削減**（3,946,897 → 186,441 bytes）。目標の
+80%削減を大きく上回り、追加容量500KB以下という stretch goal も達成した
+(186KB)。`checkTextMatchReplacement("しょうわ")` は `availableAdvance: 2250` /
+`replacementAdvance: 4000` で `FALLBACK_LAYOUT_UNSUPPORTED`
+(`fallback-replacement-overflows-slot`) として引き続き拒否され (v0.4.4 の
+fail-closed safety は無変更)、`令和 → 平成` は fallback font を一切使わず
+(`mode: "same-length"`) 元 font 経由で成功した。
 
-### save → reopen → glyph 追加 (item 11, 最重要回帰)
+### save → reopen → glyph 追加 (item 11, 最重要回帰) -- `22550.pdf` 実ファイルで確認
 
-fixture で `しょ` → (save → reopen) → `たい` (2文字、同じ配置に収まる文字数) を実行:
+1回目 (`令和 → しょ`, 上記) → save → reopen → 2回目 (`しょ → たい`) を実行:
+
+```text
+1st save:  802,131 bytes (+186,441 bytes)
+2nd save:  988,674 bytes (+186,543 bytes, 前回 save からの増分)
+embedded fallback font digest: 1種類のみ (両方とも同一 source font として認識・拡張)
+2回目 reopen 後:
+  searchText("たい") -> 1件
+  searchText("しょ") -> 0件 (2回目の置換で上書きされたため; 破損ではなく意図通り)
+  searchText("令和") -> 33件 (34件中1件を置換; 元の baseline どおり)
+```
+
+以前 fixture で確認していたのと同じ結果を実 `22550.pdf` でも再現した:
+同じ fallback font (BIZ UD明朝) が2回の save にわたり正しく認識・拡張され、
+別 font として重複埋め込みされることはない。
+
+fixture での事前検証時の save → reopen → glyph 追加 (参考、BIZ UDGothic, sans 側):
 
 ```text
 1st save: +181,788 bytes (subset: 2 requested / 3 included glyphs, 417,620 bytes)
