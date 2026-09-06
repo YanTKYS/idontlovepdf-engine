@@ -652,6 +652,82 @@ test("embeds only a glyph subset across repeated save and reopen cycles, not the
   assert.deepEqual(await reopened.searchText("令和"), []);
 });
 
+test("extends the SAME subset for a second, untouched location, rather than adopting failing silently and starting a second fallback font family", { skip }, async () => {
+  // The test above edits the same location twice, which cannot tell "the existing subset
+  // was correctly extended" apart from "adoption silently failed and a second, disconnected
+  // Type0/CIDFont/FontDescriptor/FontFile2 family was created alongside the first, still
+  // reachable only because the second edit happens to overwrite the first's own text". Two
+  // separate locations, the first left untouched by the second edit, is what actually
+  // proves adoptExistingFallbackFont() re-attaches to the font already in the file --
+  // review found exactly this bug in the first version of this PoC: a name-only secondary
+  // check on /BaseFont that a subset's tag prefix defeated, and a null fontFile object
+  // number that made a real re-attachment impossible even once that check was fixed.
+  const twoLocations = `BT /FJP 36 Tf 20 60 Td ${glyphs("令和")} Tj ET BT /FJP 36 Tf 20 100 Td ${glyphs("令和")} Tj ET`;
+  const original = makePdf(twoLocations);
+
+  const first = new PdfTextEditor(original);
+  await first.setFallbackFont(fontBytes);
+  const initialMatches = await first.searchText("令和");
+  assert.equal(initialMatches.length, 2, "the fixture must contain two separate 令和 occurrences");
+  await first.replaceTextMatch(initialMatches[0].id, "しょ");
+  const saved = await first.save();
+
+  const second = new PdfTextEditor(saved);
+  await second.setFallbackFont(fontBytes);
+  // The first location is deliberately left alone: only the second location (still 令和) is edited.
+  const [remaining] = await second.searchText("令和");
+  assert.ok(remaining, "the second location must still read 令和 -- only the first was touched");
+  await second.replaceTextMatch(remaining.id, "めいじ");
+  const twice = await second.save();
+  const twiceText = latin1.decode(twice);
+
+  // One fallback font family throughout: one marker digest, and (critically) one Type0
+  // object *number* -- not a second Type0/CIDFont/FontDescriptor/FontFile2 family reachable
+  // only via a second page resource. /FontFile2 legitimately appears more than once in the
+  // raw bytes (an incremental update never erases a superseded object's old bytes), but
+  // that must be the SAME object number redefined, which the live xref-resolved object
+  // graph below is what actually proves.
+  const digests = new Set([...twiceText.matchAll(/\/ILPFallbackFont\s*<\s*([0-9a-fA-F]+)\s*>/g)].map((entry) => entry[1].toLowerCase()));
+  assert.equal(digests.size, 1, "must still be one fallback font, not two");
+
+  const reopened = new PdfTextEditor(twice);
+  await reopened.listTextRuns(); // parses the xref before any direct document.resolveObject() call below
+  const doc = reopened.document;
+  // Every /Font resource entry naming a fallback font must point at the SAME Type0 object
+  // number -- resolved through the live xref, so an object superseded by the incremental
+  // update in `twice` is not mistaken for a second, still-live family. (Both locations
+  // share one page/Resources here, so registerFallbackResource() would in any case reuse
+  // one resource name for one digest -- the object-number check below, walking the actual
+  // FontDescriptor/FontFile2 chain, is what catches a silently-failed adoption.)
+  const type0Numbers = new Set();
+  for (const match of twiceText.matchAll(/\/(ILPFallback\d*)\s+(\d+)\s+0\s+R/g)) type0Numbers.add(Number(match[2]));
+  assert.equal(type0Numbers.size, 1, `expected every fallback /Font resource entry to name the same Type0 object, found ${[...type0Numbers]}`);
+  const [type0Number] = type0Numbers;
+  const type0Object = await doc.resolveObject({ number: type0Number, generation: 0 }, reopened.security, undefined);
+  assert.match(type0Object.dictionary, /\/Subtype\s*\/Type0/);
+
+  const cidFontNumber = Number(type0Object.dictionary.match(/\/DescendantFonts\s*\[\s*(\d+)\s+0\s+R/)?.[1]);
+  const cidFontObject = await doc.resolveObject({ number: cidFontNumber, generation: 0 }, reopened.security, undefined);
+  const descriptorNumber = Number(cidFontObject.dictionary.match(/\/FontDescriptor\s+(\d+)\s+0\s+R/)?.[1]);
+  const descriptorObject = await doc.resolveObject({ number: descriptorNumber, generation: 0 }, reopened.security, undefined);
+  const fontFileNumber = Number(descriptorObject.dictionary.match(/\/FontFile2\s+(\d+)\s+0\s+R/)?.[1]);
+  assert.ok(Number.isInteger(fontFileNumber), "the live FontDescriptor must resolve to a real /FontFile2 object");
+
+  // That live FontFile2 object number must be the SAME one the first save already
+  // allocated -- i.e. redefined via the incremental update, not a fresh object appended
+  // for the second save. (If adoption had silently failed, the second save would have
+  // allocated a brand new object entirely, always different from the first save's.)
+  const savedText = latin1.decode(saved);
+  const firstSaveFontFileNumbers = [...savedText.matchAll(/(\d+) 0 obj\n<< \/Length \d+ \/Length1 \d+ \/Filter \/FlateDecode >>/g)].map((entry) => Number(entry[1]));
+  assert.equal(firstSaveFontFileNumbers.length, 1, "the first save must have embedded exactly one FontFile2 object");
+  assert.equal(fontFileNumber, firstSaveFontFileNumbers[0], "the second save must redefine the SAME FontFile2 object the first save created, not allocate a new one");
+
+  await reopened.listTextRuns();
+  assert.equal((await reopened.searchText("しょ")).length, 1, "the first location's own replacement must not have been disturbed by the second save");
+  assert.equal((await reopened.searchText("めいじ")).length, 1, "the second location's replacement must be present too");
+  assert.deepEqual(await reopened.searchText("令和"), []);
+});
+
 test("adopts an embedded font only when it is the same program byte for byte", { skip }, async () => {
   // Writing into a font already in the document means resolving new glyph ids against the
   // font supplied now, so the two have to be the same program. A name and a size do not

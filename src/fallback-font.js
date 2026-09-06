@@ -225,7 +225,7 @@ function subsetTag(digestHex) {
   return bytes.map((byte) => String.fromCharCode(65 + (byte % 26))).join("");
 }
 
-export async function buildFallbackFontObjects(fallback, numbers, glyphs, { programAlreadyEmbedded = false, serif = false } = {}) {
+export async function buildFallbackFontObjects(fallback, numbers, glyphs, { programAlreadyEmbedded = false, priorEmbeddingIsFullFont = false, serif = false } = {}) {
   const { font } = fallback;
   const scale = (value) => Math.round((value * PDF_UNITS_PER_EM) / fallback.unitsPerEm);
   const head = font.tables.head ?? {};
@@ -295,13 +295,18 @@ end`;
   fallback.lastEmbedding = { mode: embeddingMode, subset: subsetDiagnostics, reason: fallback.subset.reason };
 
   // Rewritten whenever the embedded program itself needs to change: always for a subset
-  // (it grows with `glyphs`, see above), or the first time for a full font -- once a full
-  // font is embedded it already contains every glyph the font has, so no later call ever
-  // has anything to add to it. `programAlreadyEmbedded` is true both when this session
-  // built it earlier and when a previous session did (see adoptExistingFallbackFont() in
-  // pdf-document.js); either way "first time" means the FontFile2 object this fallback font
-  // uses does not exist yet at all.
-  const mustRewriteFontFile = embeddingMode === "subset" || !programAlreadyEmbedded;
+  // (it grows with `glyphs`, see above); for a full font, only when there either isn't one
+  // there yet (`!programAlreadyEmbedded`) or what IS there isn't actually the whole font
+  // (`!priorEmbeddingIsFullFont` -- a subset this call is downgrading away from, because a
+  // subset build just failed at runtime, see the catch block above). A full font, once
+  // truly embedded, already contains every glyph the font has, so no later call ever has
+  // anything to add to it -- but a *subset* being replaced by a full font absolutely does,
+  // and skipping that rewrite would leave /W and ToUnicode naming a glyph the still-
+  // small, still-partial program on disk has no outline for. `programAlreadyEmbedded` is
+  // true both when this session built the current program earlier and when a previous
+  // session did (see adoptExistingFallbackFont() in pdf-document.js); either way "nothing
+  // there yet" means the FontFile2 object this fallback font uses does not exist at all.
+  const mustRewriteFontFile = embeddingMode === "subset" || !programAlreadyEmbedded || !priorEmbeddingIsFullFont;
   if (!mustRewriteFontFile) return new Map([descendant, unicodeMap]);
 
   const fontData = embeddingMode === "full-font" ? (fallback.compressed ??= await deflate(fontBytes)) : await deflate(fontBytes);

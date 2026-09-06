@@ -162,33 +162,64 @@ function readCompositeComponents(glyfBytes, glyphStart, glyphEnd) {
  * Every glyph id `requested` needs to render correctly: the requested ids themselves, glyph
  * 0 (`.notdef` -- required to exist by the TrueType spec, and the glyph a reader falls back
  * to for a code it cannot otherwise resolve), and every component a composite glyph in that
- * set references, expanded recursively (a component can itself be composite). An
- * already-visited id is never re-expanded, which is what keeps a cyclic or self-referencing
- * composite (malformed, but not this function's job to reject outright) from looping
- * forever -- it is included once, like any other glyph, and whatever is wrong with its own
- * outline is exactly what the original font already had.
+ * set references, expanded recursively (a component can itself be composite).
+ *
+ * A glyph reached a second time by a *different* path (two composites sharing one
+ * component -- a diamond, not a cycle, and common in real fonts) is only ever expanded
+ * once. A glyph that is its own ancestor in the *current* path (a true cyclic composite
+ * reference: malformed, but real fonts have shipped with exactly this) is not silently
+ * absorbed -- it throws, so the caller falls back to full-font embedding rather than
+ * embedding a subset built from a reference graph this function could not actually resolve.
+ * Tracked with an explicit stack (not the JS call stack) precisely so that distinction --
+ * "still being expanded" vs. "already finished" -- has somewhere to live; recursion depth
+ * would otherwise be whatever a font's own composite nesting happens to be.
  */
 function expandGlyphSet(glyfBytes, offsets, numGlyphs, requested) {
-  const keep = new Set([0]);
-  const queue = [...requested];
-  while (queue.length) {
-    const gid = queue.pop();
-    if (keep.has(gid)) continue;
+  const view = new DataView(glyfBytes.buffer, glyfBytes.byteOffset, glyfBytes.byteLength);
+  const state = new Map(); // gid -> "visiting" (on the current path) | "done" (fully expanded)
+  const keep = new Set();
+
+  const componentsOf = (gid) => {
     if (!Number.isInteger(gid) || gid < 0 || gid >= numGlyphs) {
       throw new FontSubsetError("FONT_SUBSET_INVALID", `Glyph id ${gid} is out of range for a font with ${numGlyphs} glyphs`);
     }
-    keep.add(gid);
     const start = offsets[gid];
     const end = offsets[gid + 1];
     if (end < start || end > glyfBytes.length) {
       throw new FontSubsetError("FONT_SUBSET_INVALID", `Glyph ${gid} has an invalid loca range`);
     }
-    if (end === start) continue; // No outline (e.g. space) -- nothing to recurse into.
-    const numberOfContours = new DataView(glyfBytes.buffer, glyfBytes.byteOffset, glyfBytes.byteLength).getInt16(start);
-    if (numberOfContours < 0) {
-      for (const component of readCompositeComponents(glyfBytes, start, end)) queue.push(component);
+    if (end === start) return []; // No outline (e.g. space) -- nothing to recurse into.
+    return view.getInt16(start) < 0 ? readCompositeComponents(glyfBytes, start, end) : [];
+  };
+
+  const visit = (root) => {
+    if (state.get(root) === "done") return;
+    const stack = [{ gid: root, components: null, index: 0 }];
+    state.set(root, "visiting");
+    while (stack.length) {
+      const frame = stack[stack.length - 1];
+      frame.components ??= componentsOf(frame.gid);
+      if (frame.index < frame.components.length) {
+        const child = frame.components[frame.index];
+        frame.index += 1;
+        const childState = state.get(child);
+        if (childState === "visiting") {
+          throw new FontSubsetError("FONT_SUBSET_INVALID", `Glyph ${child} is part of a cyclic composite reference (reached again from glyph ${frame.gid})`);
+        }
+        if (childState !== "done") {
+          state.set(child, "visiting");
+          stack.push({ gid: child, components: null, index: 0 });
+        }
+        continue;
+      }
+      state.set(frame.gid, "done");
+      keep.add(frame.gid);
+      stack.pop();
     }
-  }
+  };
+
+  for (const gid of requested) visit(gid);
+  visit(0);
   return keep;
 }
 

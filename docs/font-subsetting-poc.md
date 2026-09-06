@@ -26,8 +26,12 @@
   (`"sans"` / `"serif"`) に独立管理されており、font program が同一でないことを
   `assertFallbackDigestsDistinct()` が保証している。
 
-この時点で、**「GID を変えない sparse subset」を選べば、save → reopen の認識ロジックに
-一切手を入れずに済む** ことが分かった (`adoptExistingFallbackFont()` は無変更)。
+この時点で、**「GID を変えない sparse subset」を選べば、save → reopen の認識ロジック
+(digest マーカーによる同一性判定、ToUnicode からの既存 glyph 集合読み戻し) 自体は
+書き直さずに済む** ことが分かった。ただし後述 (§3・レビュー指摘) のとおり、
+`adoptExistingFallbackFont()` は **完全に無変更では済まなかった** ---
+`/BaseFont` の secondary check と、既存 `/FontFile2` object 番号の回収の2点は
+subset 対応のため実際に修正が必要だった。
 
 ## 2. 既存 OSS の調査と不採用の理由
 
@@ -62,7 +66,11 @@ subsetter。
   ので、**未使用 glyph も GID としては消えない** (中身が空になるだけ)。
 * composite glyph の component は raw `glyf` バイト列を自前でパース
   (`readCompositeComponents()`) し、再帰的に必要 glyph 集合へ展開
-  (`expandGlyphSet()`)。循環参照は「訪問済みならスキップ」で安全に停止する。
+  (`expandGlyphSet()`)。2つの composite が同じ component を共有する場合 (diamond)
+  は正しく1回だけ展開するが、真の循環参照 (ある glyph が自分自身を composite
+  経由で再度参照する) は `FONT_SUBSET_INVALID` として例外を投げ、安全に
+  full-font embedding へフォールバックする (「訪問中」と「展開済み」を明示的な
+  stack で区別することで判定)。
 * `.notdef` (GID 0) は常に含める。
 * table checksum と `head.checkSumAdjustment` は TrueType 仕様どおりに再計算
   (`writeSfnt()`)。`head` 自身の directory checksum は
@@ -87,9 +95,19 @@ subsetter。
 
 * `/CIDToGIDMap /Identity` は不変。
 * `glyphsFor()` / `glyphsFromToUnicode()` は無変更。
-* `adoptExistingFallbackFont()` は **完全に無変更** — 既存の「source font digest で
-  fallback font を認識する」仕組みがそのまま、subset の GID 集合を読み戻す仕組みとして
-  機能する。
+* `adoptExistingFallbackFont()` の「source font digest で fallback font を認識する」
+  というマーカー判定ロジック自体は無変更で成立する。ただし **初回実装では実際には
+  正しく動いていなかった** ---
+  PR レビューで指摘・修正した2点は以下のとおり (§コードレビューで見つかった不具合):
+  1. `/BaseFont` の secondary check が subset tag prefix (`ABCDEF+`) を
+     考慮しておらず、subset 対応 font は digest が一致してもこの check で
+     弾かれ、**adopt が一度も成立していなかった**。
+  2. adopt 成功時に返す `numbers.fontFile` が `null` のままで、既存の
+     `/FontFile2` object を実際に書き直す先が失われていた。
+  
+  この2点を修正し、`/BaseFont` の secondary check を prefix 許容にした上で、
+  既存 FontDescriptor から `/FontFile2 N 0 R` を実際に解決して
+  `numbers.fontFile` に渡すようにした。
 
 ## 4. subset の再構築タイミングと fingerprint の分離
 
@@ -118,6 +136,26 @@ subsetter。
 経路にフォールバックする。判定は `fallback.subset = { supported, reason }` に保持され、
 `diagnoseFallbackFontEmbedding()` (developer diagnostics、非公開 API) で
 `embedding.mode` (`"subset"` / `"full-font"`) と理由を確認できる。
+
+**subset → full-font への降格時、既存 `/FontFile2` を必ず書き直す。** 初回実装では
+「`programAlreadyEmbedded` が true なら以後 `/FontFile2` を触らない」という
+v0.5.1 由来の判定をそのまま流用しており、既に subset が embed 済みの状態で
+subset 生成が実行時に失敗し full-font へ降格する場合に、**古い (小さい) subset の
+ままの `/FontFile2` を残しつつ `/W`・ToUnicode だけ新 glyph を含む状態へ
+更新してしまう** 不具合があった (PR レビューで指摘)。「現在 live な
+`/FontFile2` が実際に full font かどうか」を `priorEmbeddingIsFullFont` として
+追跡し (adopt 時は既存 `/FontFile2` 自身の `/Length1` を `fallback.bytes.length`
+と比較して判定、同一セッション内は前回呼び出しの `fallback.lastEmbedding.mode`
+から判定)、`full-font へ降格 && 既存が subset だった` 場合は必ず `/FontFile2` を
+書き直すよう修正した。
+
+**composite の循環参照は例外として扱う (item 6 の要件どおり)。** 初回実装は
+「訪問済みならスキップ」という緩い判定で無限ループこそ避けていたが、真の循環
+(ある glyph が composite 経由で自分自身を再度参照する) を検出して拒否しては
+いなかった。「訪問中」と「展開済み」を明示的な stack で区別する実装へ修正し、
+循環を検出した場合は `FONT_SUBSET_INVALID` を投げて安全に full-font embedding へ
+フォールバックするようにした (二つの composite が同じ component を共有する
+diamond 依存は、循環ではないため引き続き正しく1回だけ展開される)。
 
 ## 6. 複数 glyph・複数 role の扱い
 
@@ -194,28 +232,74 @@ mode:      fallback-font-multi-run (実PDFの構造上、複数 run にまたが
 fail-closed safety は無変更)、`令和 → 平成` は fallback font を一切使わず
 (`mode: "same-length"`) 元 font 経由で成功した。
 
-### save → reopen → glyph 追加 (item 11, 最重要回帰) -- `22550.pdf` 実ファイルで確認
+### save → reopen → glyph 追加 (item 11, 最重要回帰) -- コードレビューで発覚した不具合と再検証
 
-1回目 (`令和 → しょ`, 上記) → save → reopen → 2回目 (`しょ → たい`) を実行:
+初回の実 `22550.pdf` 検証 ([run 34008785037](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34008785037)) は、
+2回目の編集を **1回目と同じ場所** (`しょ` を検索して `たい` へ再置換) に対して
+行っていた。これは PR レビューで明確に指摘された盲点で、この方法では
+「既存 subset を正しく拡張できている」ことと「adopt が実は失敗しており、
+同じ場所を上書きしたことで偶然2つ目の (孤立した) fallback font 系列が
+見えなくなっているだけ」の2つを区別できない。
+
+実際、レビューはコードを直接指摘した:
+
+1. `adoptExistingFallbackFont()` の `/BaseFont` secondary check が
+   subset tag prefix (`ABCDEF+`) を考慮しておらず、subset 対応 font は
+   digest が一致してもこの check で弾かれ、**adopt が一度も成立していなかった**。
+2. adopt 成功時に返す `numbers.fontFile` が `null` のままで、既存の
+   `/FontFile2` object を実際に書き直す先が失われていた。
+
+この2点により、v0.6.0 の初回実装は「reopen 後にglyph集合をunionして、
+別font resourceとして重複埋め込みしない」という **今回の最重要要件を
+実際には満たしていなかった**。1回目の save で FontFile2 が1つ、2回目の save
+後で FontFile2 が計6つ (実測ログにそのまま出ていた) という数字自体は
+このバグの兆候だったが、検証スクリプト側が「同じ場所を上書きする」設計
+だったために見逃していた。
+
+**修正内容:**
+
+* `/BaseFont` の secondary check を、subset tag prefix を許容する正規表現へ変更。
+* `adoptExistingFallbackFont()` が既存 FontDescriptor から `/FontFile2 N 0 R`
+  を実際に解決し、`numbers.fontFile` として返すよう修正。
+* `priorEmbeddingIsFullFont` (adopt 時は既存 `/FontFile2` 自身の `/Length1` と
+  `fallback.bytes.length` を比較して判定) を追加し、「subset → full-font へ
+  降格する際は既存 `/FontFile2` を必ず書き直す」ことを保証。
+
+**修正後、`scripts/verify-real-pdf-edit.js` 自体も、2回目の編集を
+「1回目とは別の、未編集のまま残っている `令和` 出現箇所」に対して行うよう
+書き直した** (`--second-fallback` は同じ場所を上書きしない)。あわせて、
+2回目 save 後の live Type0/FontFile2 object 番号が **1回目 save が作成した
+object 番号と同一である** (新規 object を割り当てていない) ことを、
+実際に xref を辿って直接検証するチェックを追加した — これがまさに
+今回のバグを検出できるはずだった検証である。
+
+`test/fallback-font.test.js` にも、同じ観点の合成 fixture テスト
+(`extends the SAME subset for a second, untouched location, ...`) を追加した。
+このテストは **修正前のコードに対して意図的に実行し、実際に失敗することを
+確認済み** (`found 7,12` — 2つの異なる Type0 object 番号が検出された)。
+
+修正後、ローカルの複数箇所 fixture (3箇所の `令和`、うち1箇所を1回目・
+別の1箇所を2回目に置換) で再検証した結果:
 
 ```text
-1st save:  802,131 bytes (+186,441 bytes)
-2nd save:  988,674 bytes (+186,543 bytes, 前回 save からの増分)
-embedded fallback font digest: 1種類のみ (両方とも同一 source font として認識・拡張)
-2回目 reopen 後:
-  searchText("たい") -> 1件
-  searchText("しょ") -> 0件 (2回目の置換で上書きされたため; 破損ではなく意図通り)
-  searchText("令和") -> 33件 (34件中1件を置換; 元の baseline どおり)
+live Type0 object number(s) named by a fallback /Font resource entry: 単一
+first save's own FontFile2 object number: 単一
+second save's LIVE FontFile2 object number: 1回目と同一の object 番号
+qpdf --check: exit code 0
+fontTools (strict): 1 font program のみ検出、checksum 検証通過
+MuPDF page text: "しょ8年度\nたい8年度\n令和8年度\n"
+  (1回目の置換・2回目の置換・未編集の3箇所目、いずれも正しく共存)
 ```
 
-以前 fixture で確認していたのと同じ結果を実 `22550.pdf` でも再現した:
-同じ fallback font (BIZ UD明朝) が2回の save にわたり正しく認識・拡張され、
-別 font として重複埋め込みされることはない。
+実 `22550.pdf` に対する修正後の再検証結果は、後続の実行結果セクションに
+追記する (§実行結果参照)。
 
-### `22550.pdf` での独立検証 (item 19、全項目 success)
+### `22550.pdf` での独立検証 (item 19、初回 run 34008785037 の結果)
 
-`22550.pdf` に対する GitHub Actions 実行では、engine 自身のテストとは無関係な
-以下のツール・確認をすべて実施し、いずれも問題を検出しなかった:
+初回の実 `22550.pdf` 検証 (2回目編集が同じ場所への上書きだった時点) では、
+engine 自身のテストとは無関係な以下のツール・確認を実施し、いずれも
+「ファイルとして壊れていない」ことは確認できていた
+(ただし上記のとおり「fallback font が1系統だけか」は検証できていなかった):
 
 * **pdfminer.six**（座標比較）: `令和 → しょ` の直後に続く `8年度` の描画位置が
   `dx=0.0000 dy=0.0000`（tolerance 1.0）と、完全に不動であることを確認。
@@ -223,35 +307,14 @@ embedded fallback font digest: 1種類のみ (両方とも同一 source font と
   exit code 0（構造エラーなし）。
 * **Chromium 自身の PDF viewer**: 1回目・2回目とも編集後ファイルを
   エラーなく開けることを確認（page error 0）。
-* **fontTools (`checkChecksums=2`, strict)**: 1回目 save 後の PDF に埋め込まれた
-  **全 5 font program**（`22550.pdf` が元々持っていた 4 font 含む）と、
-  2回目 save 後の **全 6 font program** を、それぞれ独立に checksum 検証。
-  今回 subset 化した BIZ UD明朝 (417,824 bytes → 417,976 bytes へ拡張) も含め、
-  すべて strict checksum を通過。
-* **FreeType**: 同じく全 font program をロードし、正しく解析できることを確認
-  （subset 化した font は sample 200 glyph 中 1 glyph のみ outline を持つことも
-  確認 — sparse subset が実際に機能している証拠）。
+* **fontTools (`checkChecksums=2`, strict) / FreeType**: 埋め込まれた
+  全 font program (1回目5個・2回目6個 -- この「6個」自体がバグの兆候
+  だったことは前述のとおり) を独立に checksum 検証、いずれも通過。
 * **MuPDF (PyMuPDF)**: 編集後 PDF をレンダリングし、ページテキストとして
-  1回目は `"しょ8 年度\n糸満市放課後児童クラブ運営事業者\n..."`、2回目は
-  `"たい8 年度\n..."` を正しく抽出。別実装 (MuPDF) が engine の埋め込んだ
-  subset font から実際に「しょ」「たい」という文字を読み取れることを確認した。
+  「しょ」「たい」をそれぞれ正しく抽出。
 
-fixture での事前検証時の save → reopen → glyph 追加 (参考、BIZ UDGothic, sans 側):
-
-```text
-1st save: +181,788 bytes (subset: 2 requested / 3 included glyphs, 417,620 bytes)
-2nd save: +181,943 bytes (subset は 417,732 bytes へ拡張)
-/FontFile2 の出現回数: 2 (save ごとに1回、subset が育つため)
-埋め込み font の digest: 1種類のみ (両方とも同じ source font として認識・拡張)
-2回目 reopen 後:
-  searchText("たい")  -> 1件
-  searchText("しょ")  -> 0件 (2回目の置換で上書きされたため; 破損ではなく意図通り)
-```
-
-fontTools (`checkChecksums=2`, strict) と FreeType (`freetype-py`) で両方の
-subset font を独立検証し、いずれも正常にロードできることを確認した
-(`scripts/verify-real-pdf-font-subset.py`)。qpdf `--check` も両方の保存後ファイルで
-exit code 0。
+これらは修正後の再実行でも維持されるべき結果であり、上記の
+object 番号レベルの検証を追加した上で再実行する。
 
 ## 8. bundle size
 
@@ -260,16 +323,23 @@ exit code 0。
 
 ```text
 変更前: 531.5 KB
-変更後: 543.0 KB (+11.8 KB, +2.2%)
+変更後: 545.4 KB (+13.9 KB, +2.6%)
 ```
 
 ## 9. テスト
 
 * `test/font-subset.test.js` (新規): planFontSubsetSupport の判定、composite 展開・
-  循環参照・範囲外 glyph・重複 glyph・.notdef・checksum 再構築 (合成 font)、
+  循環参照の拒否・diamond 依存 (循環ではない共有 component) の正しい展開・
+  範囲外 glyph・重複 glyph・.notdef・checksum 再構築 (合成 font)、
   実 font での GID 不変性・subset 拡張の非破壊性・80%以上の削減・2/10/50/100 glyph
   の計測、`buildFallbackFontObjects()` の subset/full-font 分岐と実行時
-  フォールバック。
+  フォールバック (runtime downgrade 時の `/FontFile2` 再書き込みを含む)。
+* `test/fallback-font.test.js` (新規テスト): 1回目と2回目で **別の箇所** を
+  編集し、live な Type0/CIDFont/FontDescriptor/FontFile2 object 番号が
+  2回の save で同一であること (別 font resource として重複埋め込みされて
+  いないこと) を、実際に xref を辿って直接検証する。修正前のコードに対して
+  実行し、実際に失敗する (`found 7,12` のように2つの異なる Type0 object 番号
+  が検出される) ことを確認済み。
 * 既存 `test/fallback-font*.test.js` / `test/font-classification-diagnosis.test.js`:
   「font program は1回だけ embed される」という v0.5.1 の assertion を
   「save ごとに subset が育つ (小さい増分)」という新しい前提へ更新。BaseFont の
@@ -296,14 +366,23 @@ exit code 0。
 
 ## 11. Go / No-Go
 
-**Go (v0.6.0 候補)。**
+**Go (v0.6.0 候補)。** ただし PR レビューで、初回実装が「save → reopen → 別箇所への
+追加編集で、既存 subset を正しく拡張し、別 font resource として重複埋め込みしない」
+という最重要要件を実際には満たしていなかったことが判明し、修正した (§save →
+reopen → glyph 追加を参照)。この修正がなければ **No-Go** だった。
 
-* BIZ UDゴシック/明朝ともに subset 生成成功、GID 不変、composite 依存を正しく解決。
+* BIZ UDゴシック/明朝ともに subset 生成成功、GID 不変、composite 依存 (diamond)
+  を正しく解決し、真の循環参照は `FONT_SUBSET_INVALID` として拒否する。
 * checksum は TrueType 仕様どおり再構築し、fontTools (strict) / FreeType /
-  MuPDF (PyMuPDF) の独立実装で検証済み。
-* save → reopen → glyph 追加で、最初に書いた fallback 文字を壊さないことを
-  fixture で確認 (実 `22550.pdf` は GitHub Actions 実行で最終確認)。
+  MuPDF (PyMuPDF) の独立実装で検証済み (この過程で checksum 再構築自体の
+  実装バグも1件発見・修正した)。
+* save → reopen → **別箇所への** glyph 追加で、最初に書いた fallback 文字を
+  壊さず、live な Type0/FontFile2 object 番号が2回の save で同一である
+  (別 font resource として重複埋め込みしていない) ことを、修正後のコードに
+  対して直接検証した (合成 fixture テスト、実 `22550.pdf` 相当のローカル
+  複数箇所 fixture の両方で確認済み；実 `22550.pdf` そのものでの
+  最終確認は GitHub Actions 再実行結果を参照)。
 * Serif/Sans 双方が独立して subset 化され、v0.5.1 の自動選択・fail-closed 安全性
   (`FALLBACK_LAYOUT_UNSUPPORTED` 等) は無変更。
-* bundle size 増加は +11.8KB (+2.2%) と小さく、新規外部依存もなし。
-* 削減率は実測で 91〜95% 前後 (目標の80%を大きく上回る)。
+* bundle size 増加は +13.9KB (+2.6%) と小さく、新規外部依存もなし。
+* 削減率は実測で 91〜95% 前後 (目標の80%を大きく上回る、1回目 save 単体の値)。

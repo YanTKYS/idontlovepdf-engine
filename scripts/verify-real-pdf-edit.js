@@ -186,21 +186,25 @@ if (remaining.length !== matches.length - 1) {
   fail(`expected ${matches.length - 1} remaining match(es) of ${JSON.stringify(searchQuery)}, found ${remaining.length}`);
 }
 
-heading(`second round: reopen -> setFallbackFonts() again -> ${JSON.stringify(fallbackReplacement)} -> ${JSON.stringify(secondFallbackReplacement)} -> save() -> reopen (v0.6.0 subsetting PoC, item 11)`);
-console.log("this is the central regression this PoC exists for: a second, separate save must extend the same font's subset, not corrupt the first save's glyphs, and not embed the font a second time");
+heading(`second round: reopen -> setFallbackFonts() again -> a DIFFERENT ${JSON.stringify(searchQuery)} occurrence -> ${JSON.stringify(secondFallbackReplacement)} -> save() -> reopen (v0.6.0 subsetting PoC, item 11)`);
+console.log(`this is the central regression this PoC exists for: a second, separate save, editing a location the first save never touched, must extend the same font's subset -- not corrupt the first save's ${JSON.stringify(fallbackReplacement)}, and not embed the font a second time. Editing the same location twice (as an earlier version of this script did) cannot tell "extended" apart from "silently started a second, disconnected fallback font family that happens to overwrite the first" -- only a second, untouched location can.`);
 let secondEditedBytes = null;
 {
   const round2 = new PdfTextEditor(saved);
   await round2.listTextRuns();
   await registerFallbackFonts(round2);
-  const [round2Target] = await round2.searchText(fallbackReplacement);
+  // One of the *remaining* 令和 occurrences (`remaining`, computed above) -- deliberately
+  // not a fresh search for fallbackReplacement, which would find the location the first
+  // save already edited and edit it a second time.
+  const round2Matches = await round2.searchText(searchQuery);
+  const round2Target = round2Matches[0];
   if (!round2Target) {
-    fail(`${JSON.stringify(fallbackReplacement)} was not found in the reopened document for the second edit`);
+    fail(`no remaining ${JSON.stringify(searchQuery)} occurrence was found for the second, separate edit`);
   } else {
     const round2Check = await round2.checkTextMatchReplacement(round2Target.id, secondFallbackReplacement);
     console.log(JSON.stringify(round2Check));
     if (!round2Check.allowed) {
-      console.log(`note: ${JSON.stringify(secondFallbackReplacement)} was refused (${round2Check.code}) -- this document's layout may not have room for it here; the save/reopen/extend claim is still checked by the engine's own test suite (test/fallback-font*.test.js) regardless`);
+      console.log(`note: ${JSON.stringify(secondFallbackReplacement)} was refused (${round2Check.code}) -- this document's layout may not have room for it at this particular location; the save/reopen/extend claim is still checked by the engine's own test suite (test/fallback-font.test.js) regardless`);
     } else {
       await round2.replaceTextMatch(round2Target.id, secondFallbackReplacement);
       const twice = await round2.save();
@@ -219,12 +223,42 @@ let secondEditedBytes = null;
       const foundSecond = await reopenedTwice.searchText(secondFallbackReplacement);
       console.log(`searchText(${JSON.stringify(secondFallbackReplacement)}) on the twice-reopened document: ${foundSecond.length} match(es)`);
       if (!foundSecond.length) fail(`${JSON.stringify(secondFallbackReplacement)} was not found after the second save/reopen`);
-      const stillGoneFirst = await reopenedTwice.searchText(fallbackReplacement);
-      // The first replacement's own text no longer appears as such (it was itself replaced
-      // by the second edit) -- what matters is that the second edit's own glyphs are
-      // correct and searchable, proving the extended subset did not corrupt anything the
-      // first save wrote it depends on the same underlying font glyphs.
-      console.log(`searchText(${JSON.stringify(fallbackReplacement)}) on the twice-reopened document: ${stillGoneFirst.length} match(es) (expected 0 -- it was itself replaced)`);
+      const stillFirst = await reopenedTwice.searchText(fallbackReplacement);
+      // Unlike editing the same location twice, the first save's own replacement is a
+      // completely separate piece of text from the second edit's target -- it must still
+      // be there, unchanged, proving the second save's subset growth did not disturb it.
+      console.log(`searchText(${JSON.stringify(fallbackReplacement)}) on the twice-reopened document: ${stillFirst.length} match(es) (expected 1 -- the first location, untouched by the second edit)`);
+      if (stillFirst.length !== 1) fail(`expected the first save's own ${JSON.stringify(fallbackReplacement)} to still be there, untouched, found ${stillFirst.length} match(es)`);
+
+      // One fallback font family throughout, not two: every /Font resource entry naming a
+      // fallback font must resolve (through the live xref) to the SAME Type0 object, whose
+      // FontDescriptor/FontFile2 chain must be the SAME FontFile2 object the first save
+      // already created -- redefined by the second save's incremental update, not a fresh
+      // object allocated alongside it. This is exactly the check that would have caught the
+      // adoptExistingFallbackFont() bug review found in this PoC's first version (a name-
+      // only /BaseFont check the subset-tag prefix defeated, and a null fontFile object
+      // number that made real re-attachment impossible even once that check was fixed).
+      const type0Numbers = new Set([...twiceText.matchAll(/\/(ILPFallback\d*)\s+(\d+)\s+0\s+R/g)].map((entry) => Number(entry[2])));
+      console.log(`live Type0 object number(s) named by a fallback /Font resource entry: ${[...type0Numbers]}`);
+      if (type0Numbers.size !== 1) {
+        fail(`expected every fallback /Font resource entry to name the same Type0 object, found ${[...type0Numbers]} -- this is exactly the "second, disconnected fallback font family" bug`);
+      } else {
+        const doc = reopenedTwice.document;
+        const [type0Number] = type0Numbers;
+        const type0Object = await doc.resolveObject({ number: type0Number, generation: 0 }, reopenedTwice.security, undefined);
+        const cidFontNumber = Number(type0Object.dictionary.match(/\/DescendantFonts\s*\[\s*(\d+)\s+0\s+R/)?.[1]);
+        const cidFontObject = cidFontNumber ? await doc.resolveObject({ number: cidFontNumber, generation: 0 }, reopenedTwice.security, undefined) : null;
+        const descriptorNumber = cidFontObject ? Number(cidFontObject.dictionary.match(/\/FontDescriptor\s+(\d+)\s+0\s+R/)?.[1]) : null;
+        const descriptorObject = descriptorNumber ? await doc.resolveObject({ number: descriptorNumber, generation: 0 }, reopenedTwice.security, undefined) : null;
+        const liveFontFileNumber = descriptorObject ? Number(descriptorObject.dictionary.match(/\/FontFile2\s+(\d+)\s+0\s+R/)?.[1]) : null;
+
+        const savedText = new TextDecoder("latin1").decode(saved);
+        const firstSaveFontFileNumbers = [...savedText.matchAll(/(\d+) 0 obj\n<< \/Length \d+ \/Length1 \d+ \/Filter \/FlateDecode >>/g)].map((entry) => Number(entry[1]));
+        console.log(`first save's own FontFile2 object number(s): ${firstSaveFontFileNumbers}; second save's LIVE FontFile2 object number: ${liveFontFileNumber}`);
+        if (firstSaveFontFileNumbers.length !== 1 || liveFontFileNumber !== firstSaveFontFileNumbers[0]) {
+          fail(`the second save's live FontFile2 (object ${liveFontFileNumber}) must be the SAME object the first save created (${firstSaveFontFileNumbers.join(", ") || "none found"}), not a freshly allocated one`);
+        }
+      }
 
       if (outSecondPath) {
         writeFileSync(outSecondPath, twice);

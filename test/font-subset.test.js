@@ -258,10 +258,22 @@ test("buildSparseSubsetFont: a multi-component composite pulls in every componen
   assert.deepEqual([...includedGlyphs].sort((x, y) => x - y), [0, 1, 2, 6]);
 });
 
-test("buildSparseSubsetFont: a cyclic composite reference terminates and includes both glyphs", () => {
+test("buildSparseSubsetFont: a cyclic composite reference is refused, not silently absorbed", () => {
+  // Glyph 4 -> component 5 -> component 4: a true cycle, not the shared-component diamond
+  // the next test covers. This must fail closed (FontSubsetError, caught by
+  // buildFallbackFontObjects() and turned into a full-font-embedding fallback -- see
+  // src/fallback-font.js), not terminate quietly and embed a subset built from a reference
+  // graph this function could not actually resolve.
   const font = buildMinimalFont(SYNTHETIC_GLYPHS);
-  const { includedGlyphs } = buildSparseSubsetFont(font, [4]);
-  assert.deepEqual([...includedGlyphs].sort((x, y) => x - y), [0, 4, 5]);
+  assert.throws(() => buildSparseSubsetFont(font, [4]), FontSubsetError);
+});
+
+test("buildSparseSubsetFont: two composites sharing one component (a diamond, not a cycle) both succeed", () => {
+  // gid 3 = composite(1) and gid 6 = composite(1, 2): both depend on gid 1, reached by two
+  // different paths -- this must NOT be mistaken for a cycle.
+  const font = buildMinimalFont(SYNTHETIC_GLYPHS);
+  const { includedGlyphs } = buildSparseSubsetFont(font, [3, 6]);
+  assert.deepEqual([...includedGlyphs].sort((x, y) => x - y), [0, 1, 2, 3, 6]);
 });
 
 test("buildSparseSubsetFont: an out-of-range glyph id is refused, not silently dropped or embedded as garbage", () => {
