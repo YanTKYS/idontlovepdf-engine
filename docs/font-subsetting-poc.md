@@ -338,8 +338,61 @@ MuPDF page text: "しょ8年度\nたい8年度\n令和8年度\n"
 修正後のローカル検証 (合成 fixture で、意図的に「たい」を文書自身の font
 へ追加して、実 `22550.pdf` と同じ状況を再現): preflight が正しく `たい`
 を** skip し**、`ゐゑ` を選んで fallback 経由での2回目編集に成功することを
-確認した (`subset grew from 417620 to 418244 bytes (+624)`)。実
-`22550.pdf` に対する最終的な再実行結果は、次のセクションに追記する。
+確認した (`subset grew from 417620 to 418244 bytes (+624)`)。
+
+### `22550.pdf` 実ファイルでの最終確認 (false positive 修正後)
+
+[run 34014242061](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34014242061)
+(全ステップ success)。preflight が `22550.pdf` 上で実際に選んだ組み合わせと
+結果:
+
+```text
+2nd round preflight: "ゐゑ" (2回目とは別の令和出現箇所)
+checkTextMatchReplacement: {"allowed":true,"mode":"fallback-font-multi-run"}
+  -- 今度こそ実際に fallback font 経路 (mode が "fallback-font" で開始)
+
+diagnoseFallbackFontEmbedding() (2回目, save 前):
+  embedding.mode: "subset"
+  requestedGlyphs: 4, includedGlyphs: 5
+  subsetBytes: 417,824 -> 418,664 (+840 bytes, 1回目より厳密に増加)
+
+2nd save: 988,747 bytes (1回目 802,131 bytes から +186,616 bytes)
+live Type0 object number: 72 (1回目と同一)
+live FontFile2 object number: 75 (1回目と同一)
+live FontFile2 /Length1: 418,664 (1回目の 417,824 から実際に増加)
+distinct fallback font digest: 1種類のみ
+```
+
+今回は「fallback font を実際に経由した」ことを `mode` で確認した上での
+結果であり、2回目 save の増分 (+186,616 bytes) は前回の false positive
+(+902 bytes) とは異なり、**新しい glyph を含む subset を deflate し直した
+本物のコスト**を反映している (§10 のとおり、baseline table を含む subset
+全体を毎回再 deflate する設計のため、新 glyph 自体のコストは僅かでも
+増分自体は full-font 再 deflate 相当の規模になる)。
+
+**独立検証 (item 19、全項目 success)**:
+
+* **pdfminer.six**（座標比較）: `令和 → しょ` の直後に続く `8年度` の描画位置が
+  `dx=0.0000 dy=0.0000`（tolerance 1.0）。
+* **qpdf `--check`**: 元ファイル・1回目 save 後・2回目 save 後のいずれも
+  exit code 0。
+* **Chromium 自身の PDF viewer**: 1回目・2回目とも編集後ファイルをエラーなく
+  開けることを確認（page error 0）。
+* **fontTools (`checkChecksums=2`, strict) / FreeType**: 1回目・2回目 save
+  後、いずれも **全 5 font program**（`22550.pdf` 元々の4つ + BIZ UD明朝
+  subset 1つ、object 番号は共通のまま）を独立に checksum 検証、すべて通過。
+  2回目の font program #5 は `418,664` decoded bytes（1回目は `417,824`）で、
+  **同じ object 番号のまま中身が実際に大きくなっている**ことを確認できた。
+* **MuPDF (PyMuPDF)**: 1回目 save 後は `"しょ8 年度\n...令和8 年8 月\n"`、
+  2回目 save 後は `"しょ8 年度\n...ゐゑ8 年8 月\n"` を正しく抽出。
+  **1回目の置換 (しょ) が2回目の save でも壊れずに残り**、かつ2回目の
+  置換 (ゐゑ、別の元「令和8 年8 月」箇所) も同時に正しく描画されていることを、
+  engine と無関係な実装 (MuPDF) で確認した。
+
+以上により、「reopen 後に glyph 集合を union して、別 font resource として
+重複埋め込みしない」という最重要要件を、**実際に fallback font 経路を
+経由したことを確認した上で**、実 `22550.pdf` に対して object 番号・
+`/Length1` レベルで確認できた。
 
 ## 8. bundle size
 
@@ -391,30 +444,38 @@ MuPDF page text: "しょ8年度\nたい8年度\n令和8年度\n"
 
 ## 11. Go / No-Go
 
-**実装 (src/) は Go 相当だが、実 `22550.pdf` での save → reopen → 別箇所
-subset 拡張の実地検証は再実行待ち (このドキュメント時点)。**
+**Go (v0.6.0 候補)。**
 
-PR レビューで、初回実装が「save → reopen → 別箇所への追加編集で、既存
-subset を正しく拡張し、別 font resource として重複埋め込みしない」という
-最重要要件を実際には満たしていなかったことが判明し、修正した (この修正が
-なければ **No-Go**、§save → reopen → glyph 追加参照)。
+この結論に至るまでに、PR レビューで2つの重大な問題が指摘され、いずれも
+修正・再検証済みである:
 
-その修正の実 `22550.pdf` 上での検証も、**2度目の PR レビューで別の false
-positive だったと指摘された**: 検証スクリプトの2回目編集が
-`checkTextMatchReplacement()` の結果 `mode` を確認しておらず、`令和 → たい`
-が実際には `22550.pdf` 自身の font で書けてしまい (`mode: "same-length"`)、
-fallback font を一切経由していなかった。object 番号が同一だった・font
-program 数が5個のままだった等の観測は、この場合「そもそも subset を
-拡張する処理が走っていない」ことの帰結であり、拡張が成功した証拠には
-なっていなかった (§前セクション参照)。
+1. **実装バグ**: 初回実装は「save → reopen → 別箇所への追加編集で、既存
+   subset を正しく拡張し、別 font resource として重複埋め込みしない」と
+   いう最重要要件を実際には満たしていなかった (`adoptExistingFallbackFont()`
+   の `/BaseFont` secondary check が subset tag prefix を弾いていた、
+   `numbers.fontFile` が `null` のままだった)。修正した (§3・§5 参照)。
+2. **検証の false positive (2回)**: 実 `22550.pdf` での検証が、1回目は
+   「同じ場所を2回編集する」設計のため、2回目は「2回目の置換が実際に
+   fallback font を経由したか (`mode`) を確認していなかった」ため、
+   2回とも「拡張できた」と誤って報告していた (§前セクション参照)。
+   検証スクリプトを、実際に fallback 経路を通る候補を preflight で選び、
+   subset バイト数・live `/FontFile2` の `/Length1` が実際に増加した
+   ことを直接 assert するよう修正した。
 
-検証スクリプトを、実際に fallback 経路 (`mode` が `fallback-font` で
-始まる) に入る候補文字列を preflight で選ぶよう修正し、ローカルの合成
-fixture (意図的に「たい」を文書自身の font へ追加し、実 `22550.pdf` と
-同じ状況を再現したもの) では、preflight が正しく `たい` を skip して
-`ゐゑ` を選び、subset が実際に拡張されることを確認した。**実
-`22550.pdf` に対するこの修正版検証スクリプトでの最終確認は、次回の
-GitHub Actions 実行結果を待って追記する。**
+**修正後、実 `22550.pdf` に対する最終確認
+([run 34014242061](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34014242061)、
+全ステップ success) で、以下をすべて確認した:**
+
+* `checkTextMatchReplacement()` の `mode` が実際に `fallback-font-multi-run`
+  (fallback font 経路) であったこと。
+* 2回目の subset が 417,824 → 418,664 bytes へ、1回目より厳密に増加したこと。
+* live Type0 object 番号 (72)・live FontFile2 object 番号 (75) が2回の save
+  で同一であり、かつ live FontFile2 の `/Length1` 自体が 417,824 → 418,664
+  へ実際に増加していたこと (object 番号が同じなだけでなく、中身も変化)。
+* 1回目の置換 (しょ) が2回目の save 後も壊れずに残り、2回目の置換 (ゐゑ)
+  と同時に MuPDF で正しく描画・共存すること。
+* qpdf `--check`・pdfminer.six (dx=dy=0)・Chromium・fontTools (strict
+  checksum)・FreeType がすべて成功。
 
 * BIZ UDゴシック/明朝ともに subset 生成成功、GID 不変、composite 依存 (diamond)
   を正しく解決し、真の循環参照は `FONT_SUBSET_INVALID` として拒否する。
@@ -425,8 +486,8 @@ GitHub Actions 実行結果を待って追記する。**
   壊さず、live な Type0/FontFile2 object 番号が2回の save で同一である
   (別 font resource として重複埋め込みしていない) ことを、合成 fixture
   テスト (`test/fallback-font.test.js`、修正前のコードに対しては実際に
-  失敗することも確認済み) で直接検証した。**実 `22550.pdf` でのこの主張の
-  最終確認は上記のとおり再実行待ち。**
+  失敗することも確認済み) と、**実際に fallback 経路を通ったことを
+  確認した上での実 `22550.pdf`** の両方で直接検証した。
 * Serif/Sans 双方が独立して subset 化され、v0.5.1 の自動選択・fail-closed 安全性
   (`FALLBACK_LAYOUT_UNSUPPORTED` 等) は無変更。
 * bundle size 増加は +13.9KB (+2.6%) と小さく、新規外部依存もなし。
