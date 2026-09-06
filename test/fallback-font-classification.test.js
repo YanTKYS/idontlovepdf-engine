@@ -125,7 +125,7 @@ test("a serif source font selects BIZ UD明朝, and only BIZ UD明朝 is embedde
 
   assert.equal(fontFile2Count(saved), 1, "exactly one font program must be embedded");
   const text = latin1.decode(saved);
-  assert.match(text, /\/BaseFont\s*\/BIZUDMincho-Regular/, "BIZ UD明朝 must be the embedded font's BaseFont");
+  assert.match(text, /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDMincho-Regular/, "BIZ UD明朝 must be the embedded font's BaseFont");
   // The Gothic (sans) fallback must never have been touched: no second /FontFile2, and the
   // digest recorded on the one Type0 this wrote is Mincho's, not Gothic's.
   assert.ok(!text.includes("BIZUDGothic"), "BIZ UDゴシック must not have been embedded for an all-serif document");
@@ -157,7 +157,10 @@ test("BIZ UD明朝's own embedded FontDescriptor still classifies as serif after
   await reopened.replaceTextMatch(match.id, "しょうわ");
   const twice = await reopened.save();
 
-  assert.equal(fontFile2Count(twice), 1, "still only BIZ UD明朝 -- BIZ UDゴシック must never have been embedded");
+  // The second save's subset grows to add う/わ, rewriting /FontFile2 once more -- still
+  // only ever BIZ UD明朝 (one digest), never a second font alongside it, and never
+  // BIZ UDゴシック.
+  assert.equal(fontFile2Count(twice), 2, "still only BIZ UD明朝, embedded once per save as its subset grows -- BIZ UDゴシック must never have been embedded");
   assert.equal(embeddedDigests(twice).size, 1);
   const final = new PdfTextEditor(twice);
   assert.equal((await final.searchText("しょうわ")).length, 1);
@@ -183,7 +186,7 @@ test("a sans-serif source font selects BIZ UDゴシック, and only BIZ UDゴシ
 
   assert.equal(fontFile2Count(saved), 1, "exactly one font program must be embedded");
   const text = latin1.decode(saved);
-  assert.match(text, /\/BaseFont\s*\/BIZUDGothic-Regular/);
+  assert.match(text, /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDGothic-Regular/);
   assert.ok(!text.includes("BIZUDMincho"), "BIZ UD明朝 must not have been embedded for an all-sans document");
 });
 
@@ -203,7 +206,7 @@ test("a FontDescriptor-less source font is unknown, and still falls back to BIZ 
   assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "しょ"), { allowed: true, mode: "fallback-font" });
   await editor.replaceTextMatch(match.id, "しょ");
   const saved = await editor.save();
-  assert.match(latin1.decode(saved), /\/BaseFont\s*\/BIZUDGothic-Regular/);
+  assert.match(latin1.decode(saved), /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDGothic-Regular/);
   assert.ok(!latin1.decode(saved).includes("BIZUDMincho"));
 });
 
@@ -222,7 +225,7 @@ test("a caller using only setFallbackFont() is unaffected by classification, exa
 
   await editor.replaceTextMatch(match.id, "しょ");
   const saved = await editor.save();
-  assert.match(latin1.decode(saved), /\/BaseFont\s*\/BIZUDGothic-Regular/);
+  assert.match(latin1.decode(saved), /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDGothic-Regular/);
 });
 
 /* -------------------------------------------------------- serif/sans mixed in one PDF */
@@ -272,8 +275,12 @@ test("a serif run and a sans run in the same document each get their own fallbac
   const [again] = await reopened.searchText("しょ");
   await reopened.replaceTextMatch(again.id, "しょうわ");
   const twice = await reopened.save();
-  assert.equal(fontFile2Count(twice), 2, "reusing both fonts must not embed either again");
-  assert.ok(twice.length - saved.length < 200_000, `reopening and reusing must not re-embed a multi-megabyte font: +${twice.length - saved.length} bytes`);
+  // Only the serif subset grows (う/わ are new; the sans font's own subset is untouched --
+  // no new sans glyphs were drawn), so /FontFile2 gains exactly one more occurrence, not
+  // two, and neither font is embedded as a second, separate copy of itself.
+  assert.equal(fontFile2Count(twice), 3, "reusing both fonts must not embed either as a duplicate -- only the serif subset grows");
+  assert.equal(embeddedDigests(twice).size, 2, "still exactly two fallback font families, not three");
+  assert.ok(twice.length - saved.length < 400_000, `reopening and reusing must not re-embed a multi-megabyte font, only a subset increment: +${twice.length - saved.length} bytes`);
 
   const final = new PdfTextEditor(twice);
   assert.equal((await final.searchText("しょうわ")).length, 1);
@@ -386,5 +393,5 @@ test("distinct BIZ UDGothic / BIZ UDMincho fonts still register and work as befo
   assert.equal(diagnosis.selectedRole, "serif");
   await editor.replaceTextMatch(match.id, "しょ");
   const saved = await editor.save();
-  assert.match(latin1.decode(saved), /\/BaseFont\s*\/BIZUDMincho-Regular/);
+  assert.match(latin1.decode(saved), /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDMincho-Regular/);
 });

@@ -18,6 +18,7 @@
 import opentypeModule from "opentype.js";
 
 import { deflate } from "./flate.js";
+import { buildSparseSubsetFont, planFontSubsetSupport } from "./font-subset.js";
 import { sha256Hex } from "./sha2.js";
 
 const opentype = opentypeModule.default ?? opentypeModule;
@@ -104,6 +105,17 @@ export function parseFallbackFont(bytes) {
   if (font.outlinesFormat !== "truetype") {
     throw fontError("FALLBACK_FONT_INVALID", `The fallback font must have TrueType outlines to be embedded as /FontFile2; this one is ${font.outlinesFormat}`);
   }
+  // Whether buildFallbackFontObjects() can embed only the glyphs actually used (see
+  // src/font-subset.js) rather than the whole program -- decided once, from the font's own
+  // table structure, so a font this subsetter cannot handle falls back to full-font
+  // embedding consistently for the document's whole life rather than depending on which
+  // glyphs a particular edit happens to need. `subset.supported` may later be downgraded to
+  // false at runtime (see buildFallbackFontObjects()) if building an actual subset fails
+  // for a reason this upfront structural check could not see; `subsetNamePrefix` is fixed
+  // here and does not change with that later downgrade, so the BaseFont this font is given
+  // stays the same whether or not embedding ends up falling back to the full program (see
+  // buildFallbackFontObjects() for why that inconsistency is an acceptable, cosmetic one).
+  const subset = planFontSubsetSupport(data);
   return {
     bytes: data,
     font,
@@ -113,8 +125,11 @@ export function parseFallbackFont(bytes) {
     // A PDF name, so anything outside the printable ASCII a name may hold is dropped.
     postScriptName: (font.names.postScriptName?.en ?? "FallbackFont").replace(/[^\x21-\x7e]|[\s()<>[\]{}/%#]/g, "") || "FallbackFont",
     // Deflating the font is the slowest step in a save and the result never changes, so
-    // it is computed once, on first use, and kept.
-    compressed: null
+    // it is computed once, on first use, and kept. Full-font embedding only -- a subset's
+    // bytes change as glyphs are added, so they are never cached across calls.
+    compressed: null,
+    subset,
+    subsetNamePrefixEnabled: subset.supported
   };
 }
 
@@ -154,12 +169,31 @@ export function identityEncode(glyphs) {
  *                       \-> ToUnicode CMap
  *
  * `/CIDToGIDMap /Identity` makes the CID *be* the glyph id, which is what lets a string
- * operand hold glyph ids directly and keeps the mapping trivial to check. The whole font
- * file is embedded -- subsetting is deliberately out of scope, see the release notes --
- * so `/W` lists only the glyphs actually drawn and `/DW` covers the rest.
+ * operand hold glyph ids directly and keeps the mapping trivial to check. When the font
+ * supports it (fallback.subset.supported -- see planFontSubsetSupport()), `/FontFile2` is a
+ * *sparse* subset (src/font-subset.js): every glyph id keeps the meaning it always had, so
+ * `/CIDToGIDMap /Identity` staying exactly as it was is not a coincidence but the reason
+ * this subsetting scheme was chosen -- see the module doc comment on src/font-subset.js.
+ * When it does not (CFF/CFF2 outlines, a variable font, or a structure this subsetter
+ * cannot read), the whole font file is embedded instead, exactly as every version through
+ * v0.5.1 always did. Either way `/W` lists only the glyphs actually drawn and `/DW` covers
+ * the rest -- a subset embeds more than `/W` mentions (composite components; see
+ * expandGlyphSet() in font-subset.js), but never fewer.
  *
  * `glyphs` is every glyph drawn through this font so far, keyed by glyph id, so the
- * widths and the ToUnicode CMap grow to cover each new replacement.
+ * widths, the ToUnicode CMap, and (when subsetting) the embedded program itself grow to
+ * cover each new replacement -- see adoptExistingFallbackFont() in pdf-document.js for
+ * where an existing document's own already-drawn glyphs are read back into this same map
+ * before a new replacement's glyphs are added to it, which is what makes a second save
+ * extend a first save's subset rather than replace it.
+ *
+ * A subset is rebuilt from the *entire* current `glyphs` map on every call, however small
+ * the change -- there is no "did the set actually grow" check. That costs a parse and a
+ * deflate of a few hundred KB on every fallback replacement (see docs/font-subsetting-poc.md
+ * for measurements), which is cheap next to what it buys: the embedded program is always
+ * provably a superset of every glyph id any content stream in the document currently
+ * references, with no bookkeeping anywhere about which glyphs a previous call already
+ * embedded that could fall out of sync with what was actually written.
  *
  * `serif` decides one bit of the FontDescriptor this writes: /Flags's Serif bit (PDF
  * 32000-1:2008, 9.8.2, Table 123, bit 2 = value 2), which is what lets
@@ -175,7 +209,23 @@ export function identityEncode(glyphs) {
 const FALLBACK_FLAGS_SYMBOLIC = 4;
 const FALLBACK_FLAGS_SERIF = 2;
 
-export async function buildFallbackFontObjects(fallback, numbers, glyphs, { programAlreadyEmbedded = false, serif = false } = {}) {
+/**
+ * A subset-font tag in the PDF-conventional `ABCDEF+PostScriptName` shape (PDF 32000-1:2008,
+ * 9.6.4): six uppercase letters, deterministic from the *source* font's digest so it stays
+ * the same across every save this session and every later session that reopens the same
+ * document with the same font -- readers are not required to treat two different tags on
+ * the same underlying program as anything in particular, but keeping it stable avoids
+ * relying on that. It is derived from `fallback.subsetNamePrefixEnabled`, decided once at
+ * parse time, not from whether *this particular* call actually manages to build a subset --
+ * see the note on that field in parseFallbackFont() for why a later, rare runtime fallback
+ * to full-font embedding deliberately does not change it.
+ */
+function subsetTag(digestHex) {
+  const bytes = digestHex.match(/.{2}/g).slice(0, 6).map((pair) => Number.parseInt(pair, 16));
+  return bytes.map((byte) => String.fromCharCode(65 + (byte % 26))).join("");
+}
+
+export async function buildFallbackFontObjects(fallback, numbers, glyphs, { programAlreadyEmbedded = false, priorEmbeddingIsFullFont = false, serif = false } = {}) {
   const { font } = fallback;
   const scale = (value) => Math.round((value * PDF_UNITS_PER_EM) / fallback.unitsPerEm);
   const head = font.tables.head ?? {};
@@ -204,11 +254,12 @@ end
 end`;
 
   const toUnicodeData = encoder.encode(toUnicode);
-  const name = fallback.postScriptName;
+  const name = fallback.subsetNamePrefixEnabled ? `${subsetTag(fallback.digest)}+${fallback.postScriptName}` : fallback.postScriptName;
 
-  // Adding glyphs to a font this document already carries: only the widths and the
-  // ToUnicode CMap change. Rewriting the font program too would append another copy of it
-  // -- megabytes -- on every save.
+  // Adding glyphs to a font this document already carries: the widths and the ToUnicode
+  // CMap always change (this is what grows to cover each new replacement); the font
+  // program itself is rewritten too, whenever it is a subset (see the function doc comment
+  // above), or the first time otherwise.
   const descendant = [numbers.cidFont, {
     dictionary: `<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${name}`
       + ` /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>`
@@ -219,17 +270,54 @@ end`;
     dictionary: `<< /Length ${toUnicodeData.length} >>`,
     data: toUnicodeData
   }];
-  if (programAlreadyEmbedded) return new Map([descendant, unicodeMap]);
 
-  fallback.compressed ??= await deflate(fallback.bytes);
-  const fontData = fallback.compressed;
+  let embeddingMode = "full-font";
+  let fontBytes = fallback.bytes;
+  let subsetDiagnostics = null;
+  if (fallback.subset.supported) {
+    try {
+      const built = buildSparseSubsetFont(fallback.bytes, [...glyphs.keys()]);
+      fontBytes = built.bytes;
+      embeddingMode = "subset";
+      subsetDiagnostics = { requestedGlyphs: glyphs.size, includedGlyphs: built.includedGlyphs.size, subsetBytes: built.bytes.length, fullFontBytes: fallback.bytes.length };
+    } catch (error) {
+      // Never embed a subset that could not be proven correct (composite resolution,
+      // checksum construction, an out-of-range glyph id): fall back to the whole font, as
+      // if this font had never supported subsetting, for the rest of this fallback font's
+      // life -- consistent full-font embedding from here on, not a mix depending on which
+      // call happened to fail. `subsetNamePrefixEnabled` (the BaseFont naming) is left
+      // exactly as it was: it was already written into the Type0 object, potentially in an
+      // earlier call this same session, and cannot un-write itself there -- see the
+      // function's doc comment on subsetTag().
+      fallback.subset = { supported: false, reason: `subset generation failed at runtime: ${error.message}` };
+    }
+  }
+  fallback.lastEmbedding = { mode: embeddingMode, subset: subsetDiagnostics, reason: fallback.subset.reason };
 
-  return new Map([
-    [numbers.type0, {
-      dictionary: `<< /Type /Font /Subtype /Type0 /BaseFont /${name} /Encoding /Identity-H`
-        + ` /DescendantFonts [${numbers.cidFont} 0 R] /ToUnicode ${numbers.toUnicode} 0 R`
-        + ` /${FALLBACK_FONT_MARKER} <${fallback.digest}> >>`
-    }],
+  // Rewritten whenever the embedded program itself needs to change: always for a subset
+  // (it grows with `glyphs`, see above); for a full font, only when there either isn't one
+  // there yet (`!programAlreadyEmbedded`) or what IS there isn't actually the whole font
+  // (`!priorEmbeddingIsFullFont` -- a subset this call is downgrading away from, because a
+  // subset build just failed at runtime, see the catch block above). A full font, once
+  // truly embedded, already contains every glyph the font has, so no later call ever has
+  // anything to add to it -- but a *subset* being replaced by a full font absolutely does,
+  // and skipping that rewrite would leave /W and ToUnicode naming a glyph the still-
+  // small, still-partial program on disk has no outline for. `programAlreadyEmbedded` is
+  // true both when this session built the current program earlier and when a previous
+  // session did (see adoptExistingFallbackFont() in pdf-document.js); either way "nothing
+  // there yet" means the FontFile2 object this fallback font uses does not exist at all.
+  const mustRewriteFontFile = embeddingMode === "subset" || !programAlreadyEmbedded || !priorEmbeddingIsFullFont;
+  if (!mustRewriteFontFile) return new Map([descendant, unicodeMap]);
+
+  const fontData = embeddingMode === "full-font" ? (fallback.compressed ??= await deflate(fontBytes)) : await deflate(fontBytes);
+
+  const type0Entry = [numbers.type0, {
+    dictionary: `<< /Type /Font /Subtype /Type0 /BaseFont /${name} /Encoding /Identity-H`
+      + ` /DescendantFonts [${numbers.cidFont} 0 R] /ToUnicode ${numbers.toUnicode} 0 R`
+      + ` /${FALLBACK_FONT_MARKER} <${fallback.digest}> >>`
+  }];
+
+  const objects = new Map([
     descendant,
     [numbers.descriptor, {
       dictionary: `<< /Type /FontDescriptor /FontName /${name} /Flags ${FALLBACK_FLAGS_SYMBOLIC | (serif ? FALLBACK_FLAGS_SERIF : 0)}`
@@ -239,11 +327,16 @@ end`;
         + ` /FontFile2 ${numbers.fontFile} 0 R >>`
     }],
     [numbers.fontFile, {
-      dictionary: `<< /Length ${fontData.length} /Length1 ${fallback.bytes.length} /Filter /FlateDecode >>`,
+      dictionary: `<< /Length ${fontData.length} /Length1 ${fontBytes.length} /Filter /FlateDecode >>`,
       data: fontData
     }],
     unicodeMap
   ]);
+  // Type0 itself never changes once created (BaseFont, Encoding, the ToUnicode reference,
+  // and the source-font-digest marker are all fixed at first embed) -- only added the one
+  // time the object does not exist yet.
+  if (!programAlreadyEmbedded) objects.set(type0Entry[0], type0Entry[1]);
+  return objects;
 }
 
 /**

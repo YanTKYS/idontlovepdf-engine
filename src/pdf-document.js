@@ -282,6 +282,11 @@ async function registerFallbackResource(editor, digest, type0Number, pageResourc
   return { name, object: { number: holder.number, generation: holder.generation, dictionary } };
 }
 
+/** Escapes a string for literal use inside a `RegExp` -- a PostScript name may contain `.`, `+`, `*`, etc. */
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
  * Finds a copy of this fallback font that a previous session already embedded, so editing
  * a document again adds to it rather than embedding a second copy of the same
@@ -294,6 +299,13 @@ async function registerFallbackResource(editor, digest, type0Number, pageResourc
  * supplied now, so anything but the same program byte for byte could draw the wrong
  * characters. Its existing glyphs are read back from its ToUnicode CMap, and the pages
  * already naming it are recorded, so neither is added twice.
+ *
+ * Also resolves the FontFile2 object number already in use, and whether the program
+ * currently there is the whole font or a subset (compared by its own `/Length1` against
+ * `fallback.bytes.length` -- the file does not otherwise say which it is) -- both needed
+ * by buildFallbackFontObjects() to grow an existing subset in place rather than starting a
+ * second, disconnected one (see the `numbers.fontFile`/`programIsFullFont` fields below and
+ * planFallbackReplacement()'s use of them).
  *
  * Returns null when the document carries no such font. Reads only; the caller decides
  * what to do with it.
@@ -321,8 +333,13 @@ async function adoptExistingFallbackFont(editor, fallback) {
       }
       const marked = type0.dictionary.match(marker);
       if (!marked || marked[1].toLowerCase() !== fallback.digest) continue;
-      // A secondary check only: the digest already settles which program this is.
-      if (!new RegExp(`/BaseFont\\s*/${fallback.postScriptName}\\b`).test(type0.dictionary)) continue;
+      // A secondary check only: the digest already settles which program this is. Tolerant
+      // of an optional subset-tag prefix (`ABCDEF+`, PDF 32000-1:2008 9.6.4): a subset-
+      // supported font is given one (see subsetTag() in fallback-font.js), and this must
+      // still recognise it, or a subset font would never be adopted at all -- every
+      // reopened save would embed a brand new, disconnected Type0/CIDFont/FontFile2 family
+      // instead of extending the one already there.
+      if (!new RegExp(`/BaseFont\\s*/(?:[A-Z]{6}\\+)?${escapeRegExp(fallback.postScriptName)}\\b`).test(type0.dictionary)) continue;
 
       const [cidFontReference] = parseReferenceArray(type0.dictionary, "DescendantFonts");
       const toUnicodeReference = reference(type0.dictionary, "ToUnicode");
@@ -330,6 +347,32 @@ async function adoptExistingFallbackFont(editor, fallback) {
       const cidFont = await editor.document.resolveObject(cidFontReference, editor.security, decryptStreamBytes);
       const descriptorReference = reference(cidFont.dictionary, "FontDescriptor");
       if (!descriptorReference) continue;
+
+      // The existing FontFile2 object number: buildFallbackFontObjects() has to redefine
+      // this exact object (via the next incremental update) to grow a subset, not merely
+      // allocate a fresh one -- a fresh one would leave this program in place, orphaned but
+      // still occupying bytes, alongside a second, unrelated one. Whether it currently holds
+      // the whole font or a subset is read from its own `/Length1`, which is the only place
+      // the file records that distinction. Resolution failures here fail closed: this
+      // candidate is treated as not adoptable (a fresh embed follows, safe but wasteful)
+      // rather than adopted with a guessed-at object number.
+      let descriptorObject;
+      try {
+        descriptorObject = await editor.document.resolveObject(descriptorReference, editor.security, decryptStreamBytes);
+      } catch {
+        continue;
+      }
+      const fontFileReference = reference(descriptorObject.dictionary, "FontFile2");
+      if (!fontFileReference) continue;
+      let programIsFullFont;
+      try {
+        const fontFileObject = await editor.document.resolveObject(fontFileReference, editor.security, decryptStreamBytes);
+        const length1 = Number(fontFileObject.dictionary.match(/\/Length1\s+(\d+)/)?.[1]);
+        if (!Number.isInteger(length1)) continue;
+        programIsFullFont = length1 === fallback.bytes.length;
+      } catch {
+        continue;
+      }
 
       const cmapObject = editor.document.object(toUnicodeReference);
       const glyphs = glyphsFromToUnicode(fallback, parseToUnicodeCMap(await decodeStream(cmapObject, "ToUnicode stream", editor.security)));
@@ -357,9 +400,10 @@ async function adoptExistingFallbackFont(editor, fallback) {
           type0: type0.number,
           cidFont: cidFont.number,
           descriptor: descriptorReference.number,
-          fontFile: null,
+          fontFile: fontFileReference.number,
           toUnicode: toUnicodeReference.number
         },
+        programIsFullFont,
         resources,
         glyphs,
         programAlreadyEmbedded: true
@@ -906,8 +950,16 @@ async function planFallbackReplacement(editor, match, replacement) {
     numbers: base?.numbers ?? { type0: start, cidFont: start + 1, descriptor: start + 2, fontFile: start + 3, toUnicode: start + 4 },
     glyphs: new Map(base?.glyphs),
     // True once the font program is in the file, whether this session put it there or an
-    // earlier one did: from then on only the widths and the ToUnicode CMap are rewritten.
-    programAlreadyEmbedded: Boolean(base)
+    // earlier one did: from then on the widths and the ToUnicode CMap always still grow,
+    // and (see priorEmbeddingIsFullFont below) the font program itself is rewritten too
+    // unless it already, provably, needs nothing added to it.
+    programAlreadyEmbedded: Boolean(base),
+    // Whether the program already in the file (this session's own earlier embed, or one
+    // adoptExistingFallbackFont() found from a previous session) is the whole font, not a
+    // subset -- the only case buildFallbackFontObjects() may skip rewriting /FontFile2 in.
+    // Undefined/false when there is nothing there yet, which is fine: `programAlreadyEmbedded`
+    // being false already forces a rewrite regardless of this value.
+    priorEmbeddingIsFullFont: base?.programIsFullFont ?? false
   };
 
   // Page resource names, shared across every fallback font this document embeds -- not
@@ -978,9 +1030,17 @@ async function planFallbackReplacement(editor, match, replacement) {
       ? REPLACEMENT_MODE.fallbackFont
       : REPLACEMENT_MODE.fallbackFontPartial);
 
-  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, embedded.glyphs, { programAlreadyEmbedded: embedded.programAlreadyEmbedded, serif: role === "serif" })) {
+  for (const [number, object] of await buildFallbackFontObjects(fallback, embedded.numbers, embedded.glyphs, {
+    programAlreadyEmbedded: embedded.programAlreadyEmbedded,
+    priorEmbeddingIsFullFont: embedded.priorEmbeddingIsFullFont,
+    serif: role === "serif"
+  })) {
     objects.set(number, object);
   }
+  // Recorded for the *next* call this session (another replacement before save(), or --
+  // once commitPlan() below persists this into editor.fallbackEmbeddings -- a later save()
+  // in the same editor): whichever mode buildFallbackFontObjects() actually used just now.
+  embedded.priorEmbeddingIsFullFont = fallback.lastEmbedding?.mode === "full-font";
   return {
     allowed: true,
     mode,
@@ -1548,6 +1608,29 @@ export async function diagnoseFallbackFontSelection(editor, matchId) {
   if (!availableRoles.length) return { ...base, selectedRole: null };
   const { role } = selectFallbackFont(editor, classification);
   return { ...base, selectedRole: role };
+}
+
+/**
+ * Developer/test diagnostics only -- not part of the formal public API (see index.js) --
+ * for confirming, after a fallback replacement, whether its font was actually embedded as
+ * a subset (src/font-subset.js) or fell back to the whole program, and how big each was.
+ * Reads `fallback.lastEmbedding`, set by the most recent buildFallbackFontObjects() call for
+ * this role (see there) -- so this reports what was actually embedded, not a guess at it.
+ * Returns `{ code: "NO_SUCH_ROLE" }` for a role that was never registered, and
+ * `{ role, registered: true, embedding: null }` for one that was registered but has not
+ * embedded anything yet (no fallback replacement has used it this session).
+ */
+export function diagnoseFallbackFontEmbedding(editor, role) {
+  const fallback = editor.fallbackFonts.get(role);
+  if (!fallback) return { code: "NO_SUCH_ROLE" };
+  return {
+    role,
+    registered: true,
+    sourceFontName: fallback.postScriptName,
+    subsetSupported: fallback.subset.supported,
+    subsetUnsupportedReason: fallback.subset.supported ? null : fallback.subset.reason,
+    embedding: fallback.lastEmbedding ?? null
+  };
 }
 
 export class PdfTextEditor {

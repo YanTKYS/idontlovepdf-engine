@@ -290,7 +290,10 @@ test("writes text the document's font cannot express, in a browser, from the shi
     assert.deepEqual(result.reopenedRunTexts, ["申請は", "しょうわ", "です"]);
     assert.equal(result.found, 1);
     assert.equal(result.gone, 0);
-    assert.ok(result.savedBytes > result.originalBytes + 1_000_000, "the font should have been embedded");
+    // With subsetting (src/font-subset.js) only the glyphs actually drawn are embedded --
+    // a small fraction of the whole ~4.7MB font -- so this checks a subset-sized increment
+    // was written, not the multi-megabyte growth full-font embedding used to produce.
+    assert.ok(result.savedBytes > result.originalBytes + 50_000 && result.savedBytes < result.originalBytes + 1_000_000, `expected a subset-sized increment, got +${result.savedBytes - result.originalBytes} bytes`);
     assert.equal(result.digest, FONT_DIGEST);
 
     state.saved = result.saved;
@@ -347,7 +350,10 @@ test("does the same with no Web Crypto, as on a page served over plain HTTP", { 
     assert.deepEqual(result.reopenedRunTexts, ["申請は", "しょうわ", "です"]);
     assert.equal(result.found, 1);
     assert.equal(result.gone, 0);
-    assert.ok(result.savedBytes > result.originalBytes + 1_000_000, "the font should have been embedded");
+    // With subsetting (src/font-subset.js) only the glyphs actually drawn are embedded --
+    // a small fraction of the whole ~4.7MB font -- so this checks a subset-sized increment
+    // was written, not the multi-megabyte growth full-font embedding used to produce.
+    assert.ok(result.savedBytes > result.originalBytes + 50_000 && result.savedBytes < result.originalBytes + 1_000_000, `expected a subset-sized increment, got +${result.savedBytes - result.originalBytes} bytes`);
     // The point of the whole change: the JavaScript digest is the right one, so a font
     // embedded over HTTP is still recognised by a session that has Web Crypto, and back.
     assert.equal(result.digest, FONT_DIGEST);

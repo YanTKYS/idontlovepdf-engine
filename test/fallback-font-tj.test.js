@@ -160,7 +160,10 @@ test("opens in an independent reader, as a well-formed incremental update", { sk
   assert.match(text, /\/Subtype \/Type0 .*\/Encoding \/Identity-H/);
   assert.match(text, /\/Subtype \/CIDFontType2/);
   assert.match(text, /\/CIDToGIDMap \/Identity/);
-  assert.match(text, new RegExp(`/Length1 ${fontBytes.length}\\b`));
+  // /Length1 is the embedded subset's own length (see src/font-subset.js), smaller than
+  // the whole font -- not fontBytes.length, which full-font embedding used to write here.
+  const length1 = Number(text.match(/\/Length1 (\d+)\b/)?.[1]);
+  assert.ok(Number.isInteger(length1) && length1 > 0 && length1 < fontBytes.length);
   // Chromium's own PDF viewer opens the result: see test/browser/fallback-font.test.js.
 });
 
@@ -425,7 +428,9 @@ test("refuses a replacement the fallback font cannot write either, before touchi
 
 /* ------------------------------------------------------ what it costs, and doing it twice */
 
-test("embeds the fallback font once per document, and the update is otherwise small", { skip }, async () => {
+test("embeds one glyph subset covering every fallback glyph in the document, not one per replacement", { skip }, async () => {
+  // Item 12 of the subsetting PoC: several fallback replacements in the same save must
+  // share one subset, not each get their own embedded font.
   const content = body(`[${glyphs("令和")} -50 ${glyphs("8年度")}] TJ ${glyphs("申請")} Tj [${glyphs("令和")} -50 ${glyphs("平成")}] TJ`);
   const editor = await editorFor(content);
   const matches = await editor.searchText("令和");
@@ -435,19 +440,22 @@ test("embeds the fallback font once per document, and the update is otherwise sm
   await editor.replaceTextMatch(matches[1].id, "たい");
 
   const saved = await editor.save();
-  assert.equal(latin1.decode(saved).match(/\/FontFile2/g).length, 1, "the font program must be written once");
+  assert.equal(latin1.decode(saved).match(/\/FontFile2/g).length, 1, "one save, however many replacements it makes, must embed the font once");
 
   const reopened = new PdfTextEditor(saved);
   assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), ["しょ", "8年度", "申請", "たい", "平成"]);
   assert.deepEqual(await reopened.searchText("令和"), []);
 
-  // A second round trip adds the new glyphs, not the font again.
+  // A second, separate save grows the subset to cover め (new) alongside し/ょ/た/い
+  // (already in it) -- one fallback font family throughout, not a second one.
   await reopened.setFallbackFont(Uint8Array.from(fontBytes));
   const [again] = await reopened.searchText("しょ");
   await reopened.replaceTextMatch(again.id, "めい");
   const twice = await reopened.save();
-  assert.equal(latin1.decode(twice).match(/\/FontFile2/g).length, 1);
-  assert.ok(twice.length - saved.length < 100_000, `the second save re-embedded the font: +${twice.length - saved.length} bytes`);
+  assert.equal(latin1.decode(twice).match(/\/FontFile2/g).length, 2, "the second save rewrites the subset once more to add め, but as one more increment, not a duplicate");
+  const digests = new Set([...latin1.decode(twice).matchAll(/\/ILPFallbackFont\s*<\s*([0-9a-f]+)\s*>/g)].map((entry) => entry[1]));
+  assert.equal(digests.size, 1, "still one fallback font family, not two");
+  assert.ok(twice.length - saved.length < 400_000, `the second save added ${twice.length - saved.length} bytes, more than a one-new-glyph subset increment`);
   assert.deepEqual((await new PdfTextEditor(twice).listTextRuns()).map((run) => run.text), ["めい", "8年度", "申請", "たい", "平成"]);
 });
 
