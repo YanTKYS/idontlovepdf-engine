@@ -162,9 +162,9 @@ glyph 自体の追加コストは 1 glyph あたり数十〜百数十 byte 程�
 `docs/descendant-font-diagnosis.md` と同じ egress 制限) ため、実ファイルでの検証は
 `.github/workflows/diagnose-real-pdf.yml`（`run_edit_test: true`、GitHub-hosted runner、
 新しい workflow は追加せず既存 workflow を拡張）で実行した
-([run 34008513349](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34008513349))。
-ローカルでは同一構造・同一文字集合の fixture PDF で engine 経由の save/reopen フローを
-事前に再現・検証している。
+([run 34008785037](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34008785037)、
+全ステップ success)。ローカルでは同一構造・同一文字集合の fixture PDF で engine 経由の
+save/reopen フローを事前に再現・検証している。
 
 v0.5.1 baseline (既知):
 
@@ -211,6 +211,30 @@ embedded fallback font digest: 1種類のみ (両方とも同一 source font と
 以前 fixture で確認していたのと同じ結果を実 `22550.pdf` でも再現した:
 同じ fallback font (BIZ UD明朝) が2回の save にわたり正しく認識・拡張され、
 別 font として重複埋め込みされることはない。
+
+### `22550.pdf` での独立検証 (item 19、全項目 success)
+
+`22550.pdf` に対する GitHub Actions 実行では、engine 自身のテストとは無関係な
+以下のツール・確認をすべて実施し、いずれも問題を検出しなかった:
+
+* **pdfminer.six**（座標比較）: `令和 → しょ` の直後に続く `8年度` の描画位置が
+  `dx=0.0000 dy=0.0000`（tolerance 1.0）と、完全に不動であることを確認。
+* **qpdf `--check`**: 元ファイル・1回目 save 後・2回目 save 後のいずれも
+  exit code 0（構造エラーなし）。
+* **Chromium 自身の PDF viewer**: 1回目・2回目とも編集後ファイルを
+  エラーなく開けることを確認（page error 0）。
+* **fontTools (`checkChecksums=2`, strict)**: 1回目 save 後の PDF に埋め込まれた
+  **全 5 font program**（`22550.pdf` が元々持っていた 4 font 含む）と、
+  2回目 save 後の **全 6 font program** を、それぞれ独立に checksum 検証。
+  今回 subset 化した BIZ UD明朝 (417,824 bytes → 417,976 bytes へ拡張) も含め、
+  すべて strict checksum を通過。
+* **FreeType**: 同じく全 font program をロードし、正しく解析できることを確認
+  （subset 化した font は sample 200 glyph 中 1 glyph のみ outline を持つことも
+  確認 — sparse subset が実際に機能している証拠）。
+* **MuPDF (PyMuPDF)**: 編集後 PDF をレンダリングし、ページテキストとして
+  1回目は `"しょ8 年度\n糸満市放課後児童クラブ運営事業者\n..."`、2回目は
+  `"たい8 年度\n..."` を正しく抽出。別実装 (MuPDF) が engine の埋め込んだ
+  subset font から実際に「しょ」「たい」という文字を読み取れることを確認した。
 
 fixture での事前検証時の save → reopen → glyph 追加 (参考、BIZ UDGothic, sans 側):
 
