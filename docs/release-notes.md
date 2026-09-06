@@ -2,6 +2,24 @@
 
 各versionのリリース内容を新しい順に記載します。H2見出しには、`v`付きversionとGitHub Releaseのtitleを記載します。
 
+## v0.6.0 - fallback fontのsubset embedding (PoC)
+
+- **v0.5.1 まで残っていた課題（fallback font 全体を埋め込むため PDF が数MB膨れる）に対する PoC です。** `令和 → しょ` のように fallback 文字を 1 文字でも使うと font program 全体（BIZ UD明朝で約6MB）を埋め込んでいたのを、実際に使用した glyph だけを含む subset へ置き換えました。詳細な調査記録・実測値は [docs/font-subsetting-poc.md](font-subsetting-poc.md) を参照してください
+- **既存 OSS（fontkit 等）は不採用にしました。** glyph ID を詰め直す (renumber) 設計が共通しており、save → reopen → 追加編集で「以前書いた content stream の glyph ID が指す glyph が変わらない」ことを安全に保証できなかったためです
+- **`src/font-subset.js` を新規追加しました。** glyph ID を一切 renumber しない「sparse subset」方式の自前実装です。`glyf`/`loca` 以外の全テーブルはバイト単位でそのままコピーし、`glyf` は使用する glyph のみ実データを残して未使用 glyph は長さ 0 にします（`loca` は元 font と同じ `numGlyphs+1` エントリを維持）。composite glyph の component は raw `glyf` を自前でパースして再帰的に解決し、循環参照にも安全に対応します。table checksum と `head.checkSumAdjustment` は TrueType 仕様どおり再計算します。対応は TrueType (`glyf`) outline のみで、CFF/CFF2・variable font (`fvar` あり) は非対応と判定し、v0.5.1 と同じ full-font embedding へ自動的にフォールバックします。subset 生成が実行時に失敗した場合も同様に安全側（full-font embedding）へフォールバックし、壊れた PDF は生成しません
+- **`/CIDToGIDMap /Identity` を維持したまま、GID を一切変更しません。** そのため `adoptExistingFallbackFont()`（save → reopen 後に既存 fallback font を認識する仕組み、fingerprint による source font 識別）は無変更です。source font の digest（同一性判定）と、subset font bytes 自体は明確に分離しており、subset を拡張しても source font の識別方法は変わりません
+- **`buildFallbackFontObjects()` は、subset 対応 font の場合、呼ばれるたびにその時点の使用済み glyph 全集合から subset を作り直します。** 同一 `save()` 内の複数 fallback 置換は 1 つの subset にまとまり、save → reopen を挟んだ追加編集では、前回までの glyph 集合（ToUnicode CMap から読み戻し）に新しい glyph を union してから subset を拡張します。最初に書いた fallback 文字の glyph は、subset が拡張されても変わりません
+- **`/BaseFont` に PDF の慣例に沿った subset tag（`ABCDEF+BIZUDMincho-Regular`）を付与します。** tag は source font digest から決定的に導出され、subsetting の成否や glyph 集合の変化に関わらず安定します。ただし fallback font の識別には一切使っておらず（既存の digest マーカーのみで判定）、表示上の慣例に従っただけです
+- **Serif/Sans は完全に独立して subset 化されます。** v0.5.1 の自動選択ロジックは無変更です
+- **実測値（BIZ UDMincho、`令和 → しょ` 相当）。** 元 font 6,153,932 bytes に対し、subset は 417,824 bytes（deflate 後 184,114 bytes）、削減率 93.2%（raw）。BIZ UDGothic も同様に 91.1% 削減。2/10/50/100 glyph でも大部分は他テーブルのベースコストで、glyph 追加自体のコストは 1 glyph あたり数十〜百数十 byte 程度でした
+- **開発者診断用に `diagnoseFallbackFontEmbedding(editor, role)` を追加しました**（`index.js` からは export しない developer/test 専用 helper）。`embedding.mode`（`"subset"`/`"full-font"`）と、requested/included glyph 数、subset/full font のバイト数を確認できます
+- **`test/font-subset.test.js` を新規追加しました。** composite 展開・循環参照・範囲外 glyph・重複 glyph・`.notdef`・checksum 再構築（合成 font、独立した checksum 再計算による検証）、実 font での GID 不変性・subset 拡張の非破壊性・80%以上の削減率・2/10/50/100 glyph の計測、`buildFallbackFontObjects()` の subset/full-font 分岐と実行時フォールバックを確認します。既存の `test/fallback-font*.test.js`・`test/font-classification-diagnosis.test.js`・`test/browser/fallback-font.test.js` は、「font program は1回だけ embed される」という v0.5.1 の assertion を「save ごとに subset が育つ（小さい増分）」という新しい前提へ更新しました（安全性の assertion 自体は緩和していません）
+- **既存の `.github/workflows/diagnose-real-pdf.yml`（manual-only、新規 workflow ではありません）を拡張しました。** save → reopen → 追加 glyph（2 回目の編集）の regression と、fontTools（strict checksum 検証）・FreeType・MuPDF（PyMuPDF）による embedded font の独立検証ステップを追加しています
+- **公開 API の形は変更していません。** `setFallbackFont()`・`setFallbackFonts()`・`searchText()`・`checkTextMatchReplacement()`・`replaceTextMatch()`・`save()`・`ENGINE_VERSION` は無変更です。subsetting は自動的に行われ、利用側が明示的に有効化する API は追加していません。新しい公開 error code も追加していません
+- **新規の外部依存は追加していません。** `src/font-subset.js` は自前実装です。bundle size は約 +11.8KB（`dist/idontlovepdf-engine.js`: 531.5kb → 543.0kb、+2.2%）
+- **layout 安全判定（glyph width の意味・`replacementAdvance`/`availableAdvance`・TJ adjustment・`Tc`/`Tw`・overflow 判定・`FALLBACK_LAYOUT_UNSUPPORTED` 等）は一切変更していません。** subset 前後で同じ fallback font の glyph width は変わりません
+- **残る制約。** CFF/CFF2/variable font は非対応（full-font embedding へ自動フォールバック）。同一 role の font に対し、別セッションでの save を重ねるたびに他テーブルのベースコスト（数百KB程度）を含む subset を再度 embed するため（差分のみの追記はしていません）、非常に多数回の独立した save を繰り返す運用では増加量が累積します。今回対象とした数箇所程度の fallback 編集では baseline を大きく下回る規模です
+
 ## v0.5.1 - 実PDFで判明したSerif分類のinline FontDescriptor対応
 
 - **v0.5.0 が実 PDF `22550.pdf` で BIZ UD明朝ではなく BIZ UDゴシックを選んでいた原因を特定し、修正しました。** 詳細は [docs/serif-classification-diagnosis.md](serif-classification-diagnosis.md) を参照してください

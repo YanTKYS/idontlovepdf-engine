@@ -1550,6 +1550,29 @@ export async function diagnoseFallbackFontSelection(editor, matchId) {
   return { ...base, selectedRole: role };
 }
 
+/**
+ * Developer/test diagnostics only -- not part of the formal public API (see index.js) --
+ * for confirming, after a fallback replacement, whether its font was actually embedded as
+ * a subset (src/font-subset.js) or fell back to the whole program, and how big each was.
+ * Reads `fallback.lastEmbedding`, set by the most recent buildFallbackFontObjects() call for
+ * this role (see there) -- so this reports what was actually embedded, not a guess at it.
+ * Returns `{ code: "NO_SUCH_ROLE" }` for a role that was never registered, and
+ * `{ role, registered: true, embedding: null }` for one that was registered but has not
+ * embedded anything yet (no fallback replacement has used it this session).
+ */
+export function diagnoseFallbackFontEmbedding(editor, role) {
+  const fallback = editor.fallbackFonts.get(role);
+  if (!fallback) return { code: "NO_SUCH_ROLE" };
+  return {
+    role,
+    registered: true,
+    sourceFontName: fallback.postScriptName,
+    subsetSupported: fallback.subset.supported,
+    subsetUnsupportedReason: fallback.subset.supported ? null : fallback.subset.reason,
+    embedding: fallback.lastEmbedding ?? null
+  };
+}
+
 export class PdfTextEditor {
   constructor(input) {
     this.bytes = input instanceof Uint8Array ? input : new Uint8Array(input);

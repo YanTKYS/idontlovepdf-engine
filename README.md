@@ -36,7 +36,7 @@
 - **暗号化 PDF への変更の保存（再暗号化）は未対応**。変更がなければ元 bytes をそのまま返せます
 - ページ座標・フォントサイズは公開していません。置換後の文字幅に応じた再レイアウトはしません
 - 元 PDF の font に無い文字へ置換するには `setFallbackFont()` で font を渡す必要があります。渡さない場合は `FONT_ENCODING_UNSUPPORTED` になります
-- fallback font を使うと font 全体が埋め込まれ、ファイルサイズが数 MB 増えます（subset 化は未対応）
+- fallback font を使うと、対応する font 形式（TrueType `glyf` outline。BIZ UDゴシック/明朝を含む）では実際に使用した glyph だけの subset を埋め込みます（v0.6.0）。CFF/CFF2・variable font 等の非対応形式では従来どおり font 全体を埋め込み、ファイルサイズが数 MB 増えます。詳細は [docs/font-subsetting-poc.md](docs/font-subsetting-poc.md) を参照してください
 - fallback font で置換した箇所は前後と font が変わるため、**保存して開き直した後**は `searchText()` で前後をまたいだ 1 つの文字列としては検索されません（置換した文字列自体は検索できます）。保存前の同じ editor では、その run はまだ 1 つの run として扱われるため前後と連結して検索されます。この差が問題になる場合は `save()` して開き直してください
 - 複数の text run にまたがる一致で文字数が変わる置換は、対象 run 間に他の operator がなく、かつ対象 run 間の `TJ` numeric adjustment の合計が 0 の場合のみ対応します。字間調整が残る場合や `Tc`/`Tw`/`Tz`/`Tr`・色指定・marked content をまたぐ場合は `error.code = "MULTI_RUN_LENGTH_CHANGE_UNSUPPORTED"` として拒否します（同じ文字数への置換と削除は構造によらず可能です）
 - `TJ` 置換で後続位置を維持するために必要な glyph 幅は、PDF 自身の `/Widths`・`/W`・`/DW`（間接 object も解決）からのみ取得します。`/Identity-H` 以外の `/Encoding`、Type 3 font、`/Widths` の無い標準 14 font などは幅を確定できないため `FALLBACK_FONT_METRICS_UNAVAILABLE` で拒否します
@@ -164,8 +164,8 @@ await editor.replaceTextMatch(matches[0].id, "しょうわ");  // 既存 font �
 - font は **TrueType**（`glyf` outline）である必要があります。それ以外は `FALLBACK_FONT_INVALID` で拒否します
 - **一度 fallback font で置換した後は、別の font へ変更できません**（`FALLBACK_FONT_ALREADY_IN_USE`）。置換済みテキストはその font の glyph ID を保持しているためです。まだ使用していなければ変更できます
 - **engine は実行時に外部通信しません。** font は呼び出し側がローカル asset 等から読み込んで渡してください
-- 使用すると **font 全体が PDF へ埋め込まれ、ファイルサイズが増えます**（日本語 font で数 MB）。subset 化は行っていません
-- **font が埋め込まれるのは 1 文書につき 1 回だけ**です。同じ editor 内で何回置換しても、また `save()` して開き直してから置換を続けても、engine は以前埋め込んだ同じ font を見つけて再利用します（2 回目以降の保存で増えるのは数 KB です）。同一判定は **font program の SHA-256** で行うため、名前やサイズが同じでも中身の異なる font を取り違えることはありません（その場合は別 font として追加で埋め込まれます）
+- 対応 font 形式（TrueType `glyf` outline。BIZ UDゴシック/明朝を含む）では、実際に使用した glyph だけを含む subset を埋め込みます（v0.6.0）。glyph ID は変更しないため、後から別の glyph を追加しても以前書いた glyph の意味は変わりません。CFF/CFF2・variable font 等、subset 化に対応していない font 形式では font 全体を埋め込み、ファイルサイズが増えます（日本語 font で数 MB）。詳細は [docs/font-subsetting-poc.md](docs/font-subsetting-poc.md) を参照してください
+- **font が埋め込まれるのは 1 文書につき 1 回だけ**です。同じ editor 内で何回置換しても、また `save()` して開き直してから置換を続けても、engine は以前埋め込んだ同じ font を見つけて再利用します（subset 対応 font では、2 回目以降の保存で増えるのは新しく使った glyph 分の subset のみ）。同一判定は **font program の SHA-256** で行うため、名前やサイズが同じでも中身の異なる font を取り違えることはありません（その場合は別 font として追加で埋め込まれます）
 
 動作確認には [BIZ UDGothic](https://github.com/googlefonts/morisawa-biz-ud-gothic)（SIL Open Font License 1.1）を使用しています。engine には同梱していません。
 

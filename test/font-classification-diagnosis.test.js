@@ -205,7 +205,7 @@ test("22550.pdf's real structure (inline /DescendantFonts + inline /FontDescript
 
   assert.equal(fontFile2Count(saved), 2, "one /FontFile2 from the fixture's own source font, one from the embedded fallback");
   const text = latin1.decode(saved);
-  assert.match(text, /\/BaseFont\s*\/BIZUDMincho-Regular/, "BIZ UD明朝 must be the embedded fallback font's BaseFont");
+  assert.match(text, /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDMincho-Regular/, "BIZ UD明朝 must be the embedded fallback font's BaseFont");
   assert.ok(!text.includes("BIZUDGothic"), "BIZ UDゴシック must not have been embedded for a document that classifies serif");
 });
 
@@ -259,7 +259,7 @@ test("a source font this cannot classify (dangling indirect /Flags) still falls 
   assert.deepEqual(await editor.checkTextMatchReplacement(match.id, "しょ"), { allowed: true, mode: "fallback-font" });
   await editor.replaceTextMatch(match.id, "しょ");
   const saved = await editor.save();
-  assert.match(latin1.decode(saved), /\/BaseFont\s*\/BIZUDGothic-Regular/);
+  assert.match(latin1.decode(saved), /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDGothic-Regular/);
   assert.ok(!latin1.decode(saved).includes("BIZUDMincho"));
 });
 
@@ -289,7 +289,7 @@ test("save -> reopen: BIZ UD明朝 written for an inline-FontDescriptor source d
   if (secondCheck.allowed) {
     await reopened.replaceTextMatch(match.id, "めいじ");
     const twice = await reopened.save();
-    const fontFile2CountAfter = (latin1.decode(twice).match(/\/BaseFont\s*\/BIZUDMincho-Regular/g) ?? []).length;
+    const fontFile2CountAfter = (latin1.decode(twice).match(/\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDMincho-Regular/g) ?? []).length;
     assert.equal(fontFile2CountAfter, 1, "BIZ UD明朝 must be embedded exactly once, reused rather than re-embedded on the second edit");
     assert.ok(!latin1.decode(twice).includes("BIZUDGothic"), "BIZ UDゴシック must never have been embedded across either edit");
   } else {

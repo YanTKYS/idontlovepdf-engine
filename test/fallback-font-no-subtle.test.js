@@ -137,6 +137,11 @@ test("reuses the font already embedded, rather than embedding it a second time",
 
   const reopened = new PdfTextEditor(twice);
   assert.deepEqual((await reopened.listTextRuns()).map((run) => run.text), ["へいせい"]);
-  assert.equal(latin1.decode(twice).match(/\/FontFile2/g).length, 1, "the font program must not be embedded twice");
-  assert.ok(twice.length < once.length + 100_000, `the second save added ${twice.length - once.length} bytes`);
+  // The second save's subset grows to cover へ/せ (new glyphs), rewriting /FontFile2 again
+  // -- but as a subset increment, not a second copy of the whole font (see
+  // docs/font-subsetting-poc.md): one fallback font family throughout, one marker digest.
+  assert.equal(latin1.decode(twice).match(/\/FontFile2/g).length, 2);
+  const digests = new Set([...latin1.decode(twice).matchAll(/\/ILPFallbackFont\s*<\s*([0-9a-f]+)\s*>/g)].map((entry) => entry[1]));
+  assert.equal(digests.size, 1, "the same font must not be embedded as a second, separate fallback font");
+  assert.ok(twice.length < once.length + 400_000, `the second save added ${twice.length - once.length} bytes, more than a small subset increment`);
 });

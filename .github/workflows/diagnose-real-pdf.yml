@@ -48,6 +48,10 @@ on:
         description: "Replacement text expected to be REFUSED (v0.4.4): wider, via the fallback font, than the text it would replace, so it would overrun the following text -- must not be written (edit test only)"
         required: true
         default: "しょうわ"
+      second_fallback_replacement:
+        description: "v0.6.0 subsetting PoC: a second, separate save's replacement of fallback_replacement, adding a new glyph to the same font's subset (item 11 -- save -> reopen -> add glyph must not corrupt the first save's glyphs). Keep it the same length as fallback_replacement so it needs the same layout room."
+        required: true
+        default: "たい"
 
 jobs:
   diagnose:
@@ -123,23 +127,26 @@ jobs:
         if: ${{ inputs.run_edit_test }}
         run: npm run test:font
 
-      - name: Run the edit smoke test (search -> classify -> fallback -> check -> replace -> save -> reopen -> search)
+      - name: Run the edit smoke test (search -> classify -> fallback -> check -> replace -> save -> reopen -> search -> reopen -> add glyph -> save)
         if: ${{ inputs.run_edit_test }}
         env:
           DIAG_TEXT: ${{ inputs.text }}
           FALLBACK_TEXT: ${{ inputs.fallback_replacement }}
           REGRESSION_TEXT: ${{ inputs.regression_replacement }}
           UNSAFE_TEXT: ${{ inputs.unsafe_replacement }}
+          SECOND_FALLBACK_TEXT: ${{ inputs.second_fallback_replacement }}
         run: |
           set -euo pipefail
           edited="$RUNNER_TEMP/edited.pdf"
+          edited_twice="$RUNNER_TEMP/edited-twice.pdf"
           echo "EDITED_PDF_PATH=$edited" >> "$GITHUB_ENV"
+          echo "EDITED_TWICE_PDF_PATH=$edited_twice" >> "$GITHUB_ENV"
           node scripts/verify-real-pdf-edit.js "$PDF_PATH" \
             --font tmp/test-fonts/BIZUDGothic-Regular.ttf \
             --serif-font tmp/test-fonts/BIZUDMincho-Regular.ttf \
             --search "$DIAG_TEXT" --fallback "$FALLBACK_TEXT" --regression "$REGRESSION_TEXT" \
-            --unsafe "$UNSAFE_TEXT" \
-            --out "$edited"
+            --unsafe "$UNSAFE_TEXT" --second-fallback "$SECOND_FALLBACK_TEXT" \
+            --out "$edited" --out-second "$edited_twice"
 
       # An independent reader (pdfminer.six shares no code with src/) confirms the text
       # drawn after the match was not moved by the TJ adjustment the engine wrote --
@@ -189,6 +196,11 @@ jobs:
           status=0
           check_one "original" "$PDF_PATH" || status=1
           check_one "edited" "$EDITED_PDF_PATH" || status=1
+          if [ -s "$EDITED_TWICE_PDF_PATH" ]; then
+            check_one "edited-twice" "$EDITED_TWICE_PDF_PATH" || status=1
+          else
+            echo "note: no twice-edited PDF (the second-fallback replacement was refused for this document/text -- see the edit smoke test's own log); skipping"
+          fi
           exit "$status"
 
       - name: Verify the edited PDF opens in Chromium's own PDF viewer (independent of this engine)
@@ -197,6 +209,32 @@ jobs:
           set -euo pipefail
           npx playwright install --with-deps chromium
           node scripts/verify-real-pdf-viewer.js "$EDITED_PDF_PATH"
+          if [ -s "$EDITED_TWICE_PDF_PATH" ]; then
+            node scripts/verify-real-pdf-viewer.js "$EDITED_TWICE_PDF_PATH"
+          fi
+
+      # v0.6.0 subsetting PoC (item 19): independently confirms the embedded /FontFile2
+      # program(s) are correct, using tools that share no code with this engine and none
+      # with each other -- fontTools (strict checksum verification: item 7's "did we
+      # actually rebuild a valid TrueType font" question, not just "did Chromium happen to
+      # render it"), FreeType (the rasterizer most PDF viewers, including Chromium's own
+      # PDFium, are built on), and MuPDF/PyMuPDF (extracts and renders the page through yet
+      # another, unrelated PDF implementation).
+      - name: Verify the embedded font subset with fontTools/FreeType/MuPDF (independent of this engine)
+        if: ${{ inputs.run_edit_test }}
+        env:
+          FALLBACK_TEXT: ${{ inputs.fallback_replacement }}
+          SECOND_FALLBACK_TEXT: ${{ inputs.second_fallback_replacement }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/fontcheck-venv"
+          "$RUNNER_TEMP/fontcheck-venv/bin/pip" install --quiet pikepdf fonttools freetype-py pymupdf
+          echo "--- first save ---"
+          "$RUNNER_TEMP/fontcheck-venv/bin/python3" scripts/verify-real-pdf-font-subset.py "$EDITED_PDF_PATH" --expect-text "$FALLBACK_TEXT"
+          if [ -s "$EDITED_TWICE_PDF_PATH" ]; then
+            echo "--- second save (subset extended with a new glyph) ---"
+            "$RUNNER_TEMP/fontcheck-venv/bin/python3" scripts/verify-real-pdf-font-subset.py "$EDITED_TWICE_PDF_PATH" --expect-text "$SECOND_FALLBACK_TEXT"
+          fi
 
       # The PDF itself is never uploaded, cached, or committed -- only ever written to
       # $RUNNER_TEMP, which is discarded with the runner at the end of the job.

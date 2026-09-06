@@ -614,10 +614,14 @@ test("refuses a replacement containing a space where word spacing is in force", 
   }
 });
 
-test("embeds the font once across repeated save and reopen cycles", { skip }, async () => {
+test("embeds only a glyph subset across repeated save and reopen cycles, not the whole font each time", { skip }, async () => {
   // A caller that saves and reopens between edits -- which is how this engine is meant to
-  // be driven -- would otherwise get another copy of a multi-megabyte font every round.
-  // A later session recognises the font an earlier one embedded and adds to it instead.
+  // be driven -- would, with the whole font embedded on every save, get another multi-
+  // megabyte copy every round. With subsetting (src/font-subset.js), each save instead
+  // embeds a subset covering every glyph drawn so far -- built fresh each time from the
+  // full glyph set (see buildFallbackFontObjects() in src/fallback-font.js), not a
+  // from-scratch full font -- so each increment stays bounded by the subset's own size, an
+  // order of magnitude below the font's ~6MB, however many separate saves there are.
   let pdf = makePdf(body(`${glyphs("令和令和令和")} Tj`));
   const original = pdf.length;
   const replacements = ["しょうわ", "たいしょう", "めいじ"];
@@ -633,10 +637,13 @@ test("embeds the font once across repeated save and reopen cycles", { skip }, as
     growth.push(pdf.length - previous);
   }
 
-  assert.equal(latin1.decode(pdf).match(/\/FontFile2/g).length, 1, "the font program must be written exactly once");
-  assert.ok(growth[0] > 1_000_000, "the first save embeds the font");
-  assert.ok(growth[1] < 100_000 && growth[2] < 100_000, `later saves must not re-embed it, but grew by ${growth.slice(1)}`);
-  assert.ok(pdf.length < original + growth[0] + 100_000);
+  // /FontFile2 appears once per save here (each save rewrites the FontDescriptor to grow
+  // the subset -- see the comment above), not once total as full-font embedding would.
+  assert.equal(latin1.decode(pdf).match(/\/FontFile2/g).length, replacements.length);
+  for (const [index, bytes] of growth.entries()) {
+    assert.ok(bytes < 400_000, `save ${index} grew the file by ${bytes} bytes, which is not a subset-sized increment`);
+  }
+  assert.ok(pdf.length < original + 1_000_000, `three separate saves grew the file to ${pdf.length} bytes, more than the whole font would have cost once`);
 
   // All three replacements survived, and each is searchable as Unicode.
   const reopened = new PdfTextEditor(pdf);
@@ -677,8 +684,12 @@ test("adopts an embedded font only when it is the same program byte for byte", {
   assert.deepEqual((await new PdfTextEditor(twice).listTextRuns()).map((run) => run.text), ["たいしょう"]);
 });
 
-test("adopts the embedded font when the same program is supplied again", { skip }, async () => {
-  // The other half of the rule above: the identical program is recognised and reused.
+test("adopts the embedded font when the same program is supplied again, and extends its subset rather than starting a second one", { skip }, async () => {
+  // The other half of the rule above: the identical program is recognised and reused --
+  // adoptExistingFallbackFont() in pdf-document.js needs no changes for this (see
+  // docs/font-subsetting-poc.md): it already reads the previously-drawn glyphs back from
+  // the ToUnicode CMap by glyph id, which subsetting never renumbers, so those glyph ids
+  // flow straight into the union buildFallbackFontObjects() subsets from next.
   const first = await editorFor(REIWA);
   const [firstMatch] = await first.searchText("令和");
   await first.replaceTextMatch(firstMatch.id, "しょうわ");
@@ -691,9 +702,22 @@ test("adopts the embedded font when the same program is supplied again", { skip 
   await reopened.replaceTextMatch(again.id, "たいしょう");
   const twice = await reopened.save();
 
-  assert.equal(latin1.decode(twice).match(/\/FontFile2/g).length, 1, "the same program must be embedded once");
-  assert.ok(twice.length - saved.length < 100_000, `the second save re-embedded the font: +${twice.length - saved.length} bytes`);
-  assert.deepEqual((await new PdfTextEditor(twice).listTextRuns()).map((run) => run.text), ["たいしょう"]);
+  // One Type0/CIDFont family throughout -- not a second one alongside it (a single marker
+  // digest, not two -- see "adopts an embedded font only when it is the same program byte
+  // for byte" above for the case where it must NOT be adopted).
+  const digests = new Set([...latin1.decode(twice).matchAll(/\/ILPFallbackFont <([0-9a-f]{64})>/g)].map((entry) => entry[1]));
+  assert.equal(digests.size, 1, "the same source font must be recognised as one fallback font, not embedded a second time alongside it");
+  assert.ok(twice.length - saved.length < 400_000, `the second save's subset increment was ${twice.length - saved.length} bytes, larger than a two-new-glyph subset should be`);
+  assert.ok(twice.length < 700_000, `two separate saves of a two/four-glyph subset totalled ${twice.length} bytes, which is not far below the ~6MB whole font`);
+
+  const reopenedTwice = new PdfTextEditor(twice);
+  assert.deepEqual((await reopenedTwice.listTextRuns()).map((run) => run.text), ["たいしょう"]);
+  // し/ょ/う (the first save's own glyphs) are still part of the text and searchable
+  // together with た/い (added by the second save) -- not disturbed by the subset growing
+  // to add them. This is the save -> reopen -> add-glyph invariant this whole PoC exists
+  // to prove (see the module doc comment on src/font-subset.js).
+  assert.equal((await reopenedTwice.searchText("たいしょう")).length, 1);
+  assert.equal((await reopenedTwice.searchText("しょう")).length, 1);
 });
 
 /**
@@ -759,7 +783,13 @@ test("writes font objects a reader can resolve, and saves incrementally", { skip
   assert.match(text, /\/Subtype \/Type0 .*\/Encoding \/Identity-H/);
   assert.match(text, /\/Subtype \/CIDFontType2/);
   assert.match(text, /\/CIDToGIDMap \/Identity/);
-  assert.match(text, new RegExp(`/Length1 ${fontBytes.length}\\b`));
+  // /Length1 is the embedded (subset) program's own decompressed length, not the full
+  // font's -- BIZ UDGothic supports subsetting (src/font-subset.js), so this must be
+  // (much) smaller than the whole font, proving a subset -- not the whole program -- was
+  // embedded.
+  const length1 = Number(text.match(/\/Length1 (\d+)\b/)?.[1]);
+  assert.ok(Number.isInteger(length1) && length1 > 0 && length1 < fontBytes.length, `/Length1 was ${length1}, expected a subset smaller than the full font's ${fontBytes.length} bytes`);
+  assert.match(text, /\/BaseFont \/[A-Z]{6}\+BIZUDGothic-Regular\b/, "a subset font's BaseFont should carry the conventional subset-tag prefix");
   assert.match(text, /\/DW 1000 \/W \[\d+ \[\d+\]/);
   // The original bytes are still the head of the file: this is an incremental update.
   assert.deepEqual(saved.subarray(0, original.length), original);

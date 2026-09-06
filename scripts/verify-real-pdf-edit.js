@@ -38,7 +38,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 
 import { PdfTextEditor } from "../src/index.js";
-import { diagnoseFallbackFontSelection } from "../src/pdf-document.js";
+import { diagnoseFallbackFontEmbedding, diagnoseFallbackFontSelection } from "../src/pdf-document.js";
 
 const args = process.argv.slice(2);
 const file = args.find((argument) => !argument.startsWith("--"));
@@ -63,7 +63,14 @@ const searchQuery = optionOf("search", "令和");
 const fallbackReplacement = optionOf("fallback", "しょ");
 const regressionReplacement = optionOf("regression", "平成");
 const unsafeReplacement = optionOf("unsafe", "しょうわ");
+// Two characters, like `fallback` itself (default しょ) -- BIZ UD's CJK glyphs are
+// full-width, so a same-length replacement needs the same advance and is about as likely
+// to fit wherever the first one already did (see item 11 of the subsetting PoC: pick a
+// fixture/replacement pair that is confidently allowed, rather than one this script has to
+// special-case around a refusal).
+const secondFallbackReplacement = optionOf("second-fallback", "たい");
 const outPath = optionOf("out", null);
+const outSecondPath = optionOf("out-second", null);
 
 const originalBytes = new Uint8Array(readFileSync(file));
 const fontBytes = new Uint8Array(readFileSync(fontPath));
@@ -126,21 +133,37 @@ if (fallbackCheck.mode !== "fallback-font") {
 heading(`replaceTextMatch(${JSON.stringify(fallbackReplacement)}) -> save()`);
 await editor.replaceTextMatch(target.id, fallbackReplacement);
 const saved = await editor.save();
-console.log(`saved: ${saved.length} bytes (original was ${originalBytes.length}, +${saved.length - originalBytes.length} bytes)`);
+const increase = saved.length - originalBytes.length;
+console.log(`saved: ${saved.length} bytes (original was ${originalBytes.length}, +${increase} bytes)`);
 const isIncrementalUpdate = saved.length >= originalBytes.length
   && saved.subarray(0, originalBytes.length).every((byte, index) => byte === originalBytes[index]);
 console.log(`incremental update (original bytes preserved as a prefix): ${isIncrementalUpdate}`);
 if (!isIncrementalUpdate) fail("the saved file's head is not byte-identical to the original -- this should be an incremental update");
 
+let embeddedRole = null;
 if (serifFontBytes) {
   // Which of the two fallback fonts actually got embedded -- the real-world symptom this
   // whole diagnosis exists for (see docs/serif-classification-diagnosis.md): a serif-looking
   // document ending up with BIZ UDゴシック embedded instead of BIZ UD明朝.
   const savedText = new TextDecoder("latin1").decode(saved);
-  const embeddedMincho = /\/BaseFont\s*\/BIZUDMincho-Regular/.test(savedText);
-  const embeddedGothic = /\/BaseFont\s*\/BIZUDGothic-Regular/.test(savedText);
+  const embeddedMincho = /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDMincho-Regular/.test(savedText);
+  const embeddedGothic = /\/BaseFont\s*\/(?:[A-Z]{6}\+)?BIZUDGothic-Regular/.test(savedText);
+  embeddedRole = embeddedMincho ? "serif" : (embeddedGothic ? "sans" : null);
   console.log(`embedded fallback font BaseFont: ${embeddedMincho ? "BIZUDMincho-Regular" : embeddedGothic ? "BIZUDGothic-Regular" : "(neither found)"}`);
+} else {
+  embeddedRole = "sans";
 }
+
+heading("diagnoseFallbackFontEmbedding() -- subset vs full-font, and the byte counts behind the size this edit cost (v0.6.0 PoC)");
+const embeddingDiagnosis = embeddedRole ? diagnoseFallbackFontEmbedding(editor, embeddedRole) : null;
+console.log(JSON.stringify(embeddingDiagnosis, null, 2));
+if (embeddingDiagnosis?.embedding?.mode === "subset") {
+  const { subsetBytes, fullFontBytes } = embeddingDiagnosis.embedding.subset;
+  console.log(`subset: ${subsetBytes} bytes of a ${fullFontBytes}-byte font (${(100 * (1 - subsetBytes / fullFontBytes)).toFixed(1)}% smaller than the whole program)`);
+} else if (embeddingDiagnosis?.embedding?.mode === "full-font") {
+  console.log(`note: embedded as the whole font program, not a subset (reason: ${embeddingDiagnosis.subsetUnsupportedReason ?? "unknown"})`);
+}
+console.log(`file size: original=${originalBytes.length} saved=${saved.length} increase=${increase} bytes`);
 
 if (outPath) {
   writeFileSync(outPath, saved);
@@ -161,6 +184,54 @@ const remaining = await reopened.searchText(searchQuery);
 console.log(`${remaining.length} match(es) (before the edit: ${matches.length})`);
 if (remaining.length !== matches.length - 1) {
   fail(`expected ${matches.length - 1} remaining match(es) of ${JSON.stringify(searchQuery)}, found ${remaining.length}`);
+}
+
+heading(`second round: reopen -> setFallbackFonts() again -> ${JSON.stringify(fallbackReplacement)} -> ${JSON.stringify(secondFallbackReplacement)} -> save() -> reopen (v0.6.0 subsetting PoC, item 11)`);
+console.log("this is the central regression this PoC exists for: a second, separate save must extend the same font's subset, not corrupt the first save's glyphs, and not embed the font a second time");
+let secondEditedBytes = null;
+{
+  const round2 = new PdfTextEditor(saved);
+  await round2.listTextRuns();
+  await registerFallbackFonts(round2);
+  const [round2Target] = await round2.searchText(fallbackReplacement);
+  if (!round2Target) {
+    fail(`${JSON.stringify(fallbackReplacement)} was not found in the reopened document for the second edit`);
+  } else {
+    const round2Check = await round2.checkTextMatchReplacement(round2Target.id, secondFallbackReplacement);
+    console.log(JSON.stringify(round2Check));
+    if (!round2Check.allowed) {
+      console.log(`note: ${JSON.stringify(secondFallbackReplacement)} was refused (${round2Check.code}) -- this document's layout may not have room for it here; the save/reopen/extend claim is still checked by the engine's own test suite (test/fallback-font*.test.js) regardless`);
+    } else {
+      await round2.replaceTextMatch(round2Target.id, secondFallbackReplacement);
+      const twice = await round2.save();
+      const secondIncrease = twice.length - saved.length;
+      console.log(`second save: ${twice.length} bytes (first save was ${saved.length}, +${secondIncrease} bytes)`);
+      secondEditedBytes = twice;
+
+      const twiceText = new TextDecoder("latin1").decode(twice);
+      const fontFileCount = (twiceText.match(/\/FontFile2/g) ?? []).length;
+      const digests = new Set([...twiceText.matchAll(/\/ILPFallbackFont\s*<\s*([0-9a-f]+)\s*>/g)].map((entry) => entry[1]));
+      console.log(`/FontFile2 occurrences across both saves: ${fontFileCount}; distinct fallback font digests: ${digests.size} (must be 1 -- the same font, not a second copy)`);
+      if (digests.size !== 1) fail(`expected exactly one fallback font digest across both saves, found ${digests.size}`);
+
+      const reopenedTwice = new PdfTextEditor(twice);
+      await reopenedTwice.listTextRuns();
+      const foundSecond = await reopenedTwice.searchText(secondFallbackReplacement);
+      console.log(`searchText(${JSON.stringify(secondFallbackReplacement)}) on the twice-reopened document: ${foundSecond.length} match(es)`);
+      if (!foundSecond.length) fail(`${JSON.stringify(secondFallbackReplacement)} was not found after the second save/reopen`);
+      const stillGoneFirst = await reopenedTwice.searchText(fallbackReplacement);
+      // The first replacement's own text no longer appears as such (it was itself replaced
+      // by the second edit) -- what matters is that the second edit's own glyphs are
+      // correct and searchable, proving the extended subset did not corrupt anything the
+      // first save wrote it depends on the same underlying font glyphs.
+      console.log(`searchText(${JSON.stringify(fallbackReplacement)}) on the twice-reopened document: ${stillGoneFirst.length} match(es) (expected 0 -- it was itself replaced)`);
+
+      if (outSecondPath) {
+        writeFileSync(outSecondPath, twice);
+        console.log(`wrote twice-edited PDF to ${outSecondPath} (not committed, not uploaded as a CI artifact)`);
+      }
+    }
+  }
 }
 
 heading(`checkTextMatchReplacement(${JSON.stringify(unsafeReplacement)}) on the same match, original bytes -- must be refused, not written (v0.4.4)`);
@@ -202,6 +273,11 @@ if (!regressionCheck.allowed) {
   const foundRegression = await regressionReopened.searchText(regressionReplacement);
   console.log(`reopened and found ${JSON.stringify(regressionReplacement)}: ${foundRegression.length} match(es)`);
   if (!foundRegression.length) fail(`${JSON.stringify(regressionReplacement)} was not found after reopening (regression check)`);
+  // Item 14 of the subsetting PoC: when the document's own font can already write the
+  // replacement, neither fallback font is embedded at all, and the file stays small.
+  const noFallbackEmbedded = !/\/FontFile2/.test(new TextDecoder("latin1").decode(regressionSaved));
+  console.log(`no fallback font embedded for an own-font replacement: ${noFallbackEmbedded} (+${regressionSaved.length - originalBytes.length} bytes)`);
+  if (!noFallbackEmbedded) fail(`${JSON.stringify(regressionReplacement)} unexpectedly embedded a fallback font -- it should have been written through the document's own font`);
 }
 
 heading("summary");
@@ -209,6 +285,12 @@ const summary = {
   ok: !failed,
   originalBytes: originalBytes.length,
   savedBytes: saved.length,
+  increaseBytes: increase,
+  embeddingMode: embeddingDiagnosis?.embedding?.mode ?? null,
+  subsetBytes: embeddingDiagnosis?.embedding?.subset?.subsetBytes ?? null,
+  fullFontBytes: embeddingDiagnosis?.embedding?.subset?.fullFontBytes ?? null,
+  secondSaveBytes: secondEditedBytes ? secondEditedBytes.length : null,
+  secondSaveIncreaseBytes: secondEditedBytes ? secondEditedBytes.length - saved.length : null,
   runs: runs.length,
   matchesBefore: matches.length,
   matchesAfterFallbackEdit: remaining.length,
