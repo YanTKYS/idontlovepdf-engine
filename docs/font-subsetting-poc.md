@@ -291,15 +291,34 @@ MuPDF page text: "しょ8年度\nたい8年度\n令和8年度\n"
   (1回目の置換・2回目の置換・未編集の3箇所目、いずれも正しく共存)
 ```
 
-実 `22550.pdf` に対する修正後の再検証結果は、後続の実行結果セクションに
-追記する (§実行結果参照)。
+### `22550.pdf` 実ファイルでの修正後の再検証結果
 
-### `22550.pdf` での独立検証 (item 19、初回 run 34008785037 の結果)
+[run 34011896819](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34011896819)
+(全ステップ success)。`scripts/verify-real-pdf-edit.js` の2回目編集を
+「1回目とは別の、未編集のまま残っている `令和` 出現箇所」へ書き直した上で
+再実行した:
 
-初回の実 `22550.pdf` 検証 (2回目編集が同じ場所への上書きだった時点) では、
-engine 自身のテストとは無関係な以下のツール・確認を実施し、いずれも
-「ファイルとして壊れていない」ことは確認できていた
-(ただし上記のとおり「fallback font が1系統だけか」は検証できていなかった):
+```text
+1st save (令和 → しょ, BIZ UD明朝):
+  saved: 802,131 bytes (+186,441 bytes; v0.5.1 baseline比 95.3%削減)
+  subset: 417,824 / 6,153,932 bytes (93.2% smaller)
+
+2nd save (別の令和出現箇所 → たい, 1回目とは別の場所):
+  saved: 803,033 bytes (+902 bytes -- 1回目 save からの増分)
+  live Type0 object number: 72 (1回目と同一)
+  live FontFile2 object number: 75 (1回目が作成した object と同一 --
+    新規 object を割り当てていない)
+  distinct fallback font digest: 1種類のみ
+```
+
+2回目の増分が **わずか +902 bytes** だったのは、修正前の「別系列を
+まるごと作り直す」動作 (+186,543 bytes) とは対照的で、既存 subset へ
+2 glyph (た・い) を追加しただけの、本来あるべき差分に近い増分になった
+ことを裏付けている (§10 のとおり、baseline table 込みの subset を毎回
+丸ごと再 deflate する設計のため、増分は必ずしも新規 glyph のみのコストに
+一致するとは限らないが、今回のケースでは非常に小さく収まった)。
+
+**独立検証 (item 19、全項目 success)**:
 
 * **pdfminer.six**（座標比較）: `令和 → しょ` の直後に続く `8年度` の描画位置が
   `dx=0.0000 dy=0.0000`（tolerance 1.0）と、完全に不動であることを確認。
@@ -307,14 +326,20 @@ engine 自身のテストとは無関係な以下のツール・確認を実施�
   exit code 0（構造エラーなし）。
 * **Chromium 自身の PDF viewer**: 1回目・2回目とも編集後ファイルを
   エラーなく開けることを確認（page error 0）。
-* **fontTools (`checkChecksums=2`, strict) / FreeType**: 埋め込まれた
-  全 font program (1回目5個・2回目6個 -- この「6個」自体がバグの兆候
-  だったことは前述のとおり) を独立に checksum 検証、いずれも通過。
-* **MuPDF (PyMuPDF)**: 編集後 PDF をレンダリングし、ページテキストとして
-  「しょ」「たい」をそれぞれ正しく抽出。
+* **fontTools (`checkChecksums=2`, strict) / FreeType**: 1回目・2回目
+  save 後、いずれも **全 5 font program**（`22550.pdf` が元々持っていた
+  4 font + 今回の BIZ UD明朝 subset 1つ、object 番号は共通）を独立に
+  checksum 検証、すべて通過。「5個のまま変わらない」こと自体が、
+  2回目の編集で別 font resource が追加されなかったことの証拠になっている。
+* **MuPDF (PyMuPDF)**: 1回目 save 後は `"しょ8 年度\n...令和8 年8 月\n"`、
+  2回目 save 後は `"しょ8 年度\n...たい8 年8 月\n"` を正しく抽出。
+  **1回目の置換 (しょ) が2回目の save でも壊れずに残り**、かつ2回目の
+  置換 (たい、別の元「令和8 年8 月」箇所) も同時に正しく描画されている
+  ことを、engine と無関係な実装 (MuPDF) で確認した。
 
-これらは修正後の再実行でも維持されるべき結果であり、上記の
-object 番号レベルの検証を追加した上で再実行する。
+以上により、「reopen 後に glyph 集合を union して、別 font resource として
+重複埋め込みしない」という最重要要件を、実 `22550.pdf` に対して object 番号
+レベルで確認できた。
 
 ## 8. bundle size
 
@@ -366,10 +391,13 @@ object 番号レベルの検証を追加した上で再実行する。
 
 ## 11. Go / No-Go
 
-**Go (v0.6.0 候補)。** ただし PR レビューで、初回実装が「save → reopen → 別箇所への
+**Go (v0.6.0 候補)。** PR レビューで、初回実装が「save → reopen → 別箇所への
 追加編集で、既存 subset を正しく拡張し、別 font resource として重複埋め込みしない」
-という最重要要件を実際には満たしていなかったことが判明し、修正した (§save →
-reopen → glyph 追加を参照)。この修正がなければ **No-Go** だった。
+という最重要要件を実際には満たしていなかったことが判明した (この修正がなければ
+**No-Go** だった)。修正後、実 `22550.pdf` に対する再検証
+([run 34011896819](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34011896819))
+で、live な Type0/FontFile2 object 番号が2回の save で同一であること
+(重複埋め込みされていないこと) を object 番号レベルで確認した。
 
 * BIZ UDゴシック/明朝ともに subset 生成成功、GID 不変、composite 依存 (diamond)
   を正しく解決し、真の循環参照は `FONT_SUBSET_INVALID` として拒否する。
@@ -379,9 +407,11 @@ reopen → glyph 追加を参照)。この修正がなければ **No-Go** だっ
 * save → reopen → **別箇所への** glyph 追加で、最初に書いた fallback 文字を
   壊さず、live な Type0/FontFile2 object 番号が2回の save で同一である
   (別 font resource として重複埋め込みしていない) ことを、修正後のコードに
-  対して直接検証した (合成 fixture テスト、実 `22550.pdf` 相当のローカル
-  複数箇所 fixture の両方で確認済み；実 `22550.pdf` そのものでの
-  最終確認は GitHub Actions 再実行結果を参照)。
+  対して直接検証した -- 合成 fixture テスト (`test/fallback-font.test.js`、
+  修正前のコードに対しては実際に失敗することも確認済み)、ローカルの
+  複数箇所 fixture、そして **実 `22550.pdf` そのもの** (1回目 +186,441 bytes、
+  2回目は既存 subset への追加のみで +902 bytes、両箇所とも fontTools/FreeType/
+  MuPDF で正しく検証) の3段階で確認した。
 * Serif/Sans 双方が独立して subset 化され、v0.5.1 の自動選択・fail-closed 安全性
   (`FALLBACK_LAYOUT_UNSUPPORTED` 等) は無変更。
 * bundle size 増加は +13.9KB (+2.6%) と小さく、新規外部依存もなし。
