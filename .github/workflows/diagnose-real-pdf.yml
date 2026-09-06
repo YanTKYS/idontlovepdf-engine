@@ -49,7 +49,7 @@ on:
         required: true
         default: "しょうわ"
       second_fallback_replacement:
-        description: "v0.6.0 subsetting PoC: a second, separate save's replacement of fallback_replacement, adding a new glyph to the same font's subset (item 11 -- save -> reopen -> add glyph must not corrupt the first save's glyphs). Keep it the same length as fallback_replacement so it needs the same layout room."
+        description: "v0.6.0 subsetting PoC, item 11: a HINT only, tried first at a second, untouched match location. verify-real-pdf-edit.js preflights this (and, if it does not actually route through the fallback font, several built-in fallback candidates) against checkTextMatchReplacement() and only proceeds with one whose mode is fallback-font/fallback-font-partial/fallback-font-multi-run -- a same-length replacement the document's own font can already write proves nothing about subset extension. Keep it the same character count as fallback_replacement."
         required: true
         default: "たい"
 
@@ -139,6 +139,7 @@ jobs:
           set -euo pipefail
           edited="$RUNNER_TEMP/edited.pdf"
           edited_twice="$RUNNER_TEMP/edited-twice.pdf"
+          second_fallback_actual="$RUNNER_TEMP/second-fallback-actual.txt"
           echo "EDITED_PDF_PATH=$edited" >> "$GITHUB_ENV"
           echo "EDITED_TWICE_PDF_PATH=$edited_twice" >> "$GITHUB_ENV"
           node scripts/verify-real-pdf-edit.js "$PDF_PATH" \
@@ -146,7 +147,14 @@ jobs:
             --serif-font tmp/test-fonts/BIZUDMincho-Regular.ttf \
             --search "$DIAG_TEXT" --fallback "$FALLBACK_TEXT" --regression "$REGRESSION_TEXT" \
             --unsafe "$UNSAFE_TEXT" --second-fallback "$SECOND_FALLBACK_TEXT" \
-            --out "$edited" --out-second "$edited_twice"
+            --out "$edited" --out-second "$edited_twice" --second-fallback-out "$second_fallback_actual"
+          # The preflight inside verify-real-pdf-edit.js may have used a different
+          # replacement than the hint above (see item 11 in docs/font-subsetting-poc.md) --
+          # later steps that need to look for it in the twice-edited file read the text it
+          # actually used, not the hint.
+          if [ -s "$second_fallback_actual" ]; then
+            echo "SECOND_FALLBACK_TEXT_ACTUAL=$(cat "$second_fallback_actual")" >> "$GITHUB_ENV"
+          fi
 
       # An independent reader (pdfminer.six shares no code with src/) confirms the text
       # drawn after the match was not moved by the TJ adjustment the engine wrote --
@@ -224,7 +232,9 @@ jobs:
         if: ${{ inputs.run_edit_test }}
         env:
           FALLBACK_TEXT: ${{ inputs.fallback_replacement }}
-          SECOND_FALLBACK_TEXT: ${{ inputs.second_fallback_replacement }}
+          # Set by the edit smoke test step above from what its preflight actually used --
+          # see the comment there. Empty if that step never got as far as picking one.
+          SECOND_FALLBACK_TEXT_ACTUAL: ${{ env.SECOND_FALLBACK_TEXT_ACTUAL }}
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/fontcheck-venv"
@@ -233,7 +243,12 @@ jobs:
           "$RUNNER_TEMP/fontcheck-venv/bin/python3" scripts/verify-real-pdf-font-subset.py "$EDITED_PDF_PATH" --expect-text "$FALLBACK_TEXT"
           if [ -s "$EDITED_TWICE_PDF_PATH" ]; then
             echo "--- second save (subset extended with a new glyph) ---"
-            "$RUNNER_TEMP/fontcheck-venv/bin/python3" scripts/verify-real-pdf-font-subset.py "$EDITED_TWICE_PDF_PATH" --expect-text "$SECOND_FALLBACK_TEXT"
+            if [ -n "${SECOND_FALLBACK_TEXT_ACTUAL:-}" ]; then
+              "$RUNNER_TEMP/fontcheck-venv/bin/python3" scripts/verify-real-pdf-font-subset.py "$EDITED_TWICE_PDF_PATH" --expect-text "$SECOND_FALLBACK_TEXT_ACTUAL"
+            else
+              echo "note: no actual second-round replacement text was recorded; checking font validity only, without --expect-text"
+              "$RUNNER_TEMP/fontcheck-venv/bin/python3" scripts/verify-real-pdf-font-subset.py "$EDITED_TWICE_PDF_PATH"
+            fi
           fi
 
       # The PDF itself is never uploaded, cached, or committed -- only ever written to

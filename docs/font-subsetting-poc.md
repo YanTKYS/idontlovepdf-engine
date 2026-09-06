@@ -291,55 +291,55 @@ MuPDF page text: "しょ8年度\nたい8年度\n令和8年度\n"
   (1回目の置換・2回目の置換・未編集の3箇所目、いずれも正しく共存)
 ```
 
-### `22550.pdf` 実ファイルでの修正後の再検証結果
+### `22550.pdf` 実ファイルでの再検証 -- 2回目の false positive とその修正
 
 [run 34011896819](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34011896819)
-(全ステップ success)。`scripts/verify-real-pdf-edit.js` の2回目編集を
-「1回目とは別の、未編集のまま残っている `令和` 出現箇所」へ書き直した上で
-再実行した:
+の結果 (2回目編集を「1回目とは別の `令和` 出現箇所」へ変更した直後の実行) を
+「object 番号レベルで確認できた」として一度報告したが、**これも誤りだった**。
+再度の PR レビューで指摘された:
 
-```text
-1st save (令和 → しょ, BIZ UD明朝):
-  saved: 802,131 bytes (+186,441 bytes; v0.5.1 baseline比 95.3%削減)
-  subset: 417,824 / 6,153,932 bytes (93.2% smaller)
+2回目の `checkTextMatchReplacement()` の結果は
+`{"allowed":true,"mode":"same-length"}` であり、**fallback font を一切
+経由していなかった**。`令和 → たい` は `22550.pdf` 自身の埋め込み font
+(`/F3`) に `た`・`い` の glyph が既にあったため、通常の「元 font で書ける
+置換」経路 (`same-length`) で成功していた。このため、
 
-2nd save (別の令和出現箇所 → たい, 1回目とは別の場所):
-  saved: 803,033 bytes (+902 bytes -- 1回目 save からの増分)
-  live Type0 object number: 72 (1回目と同一)
-  live FontFile2 object number: 75 (1回目が作成した object と同一 --
-    新規 object を割り当てていない)
-  distinct fallback font digest: 1種類のみ
-```
+* 2回目 save の +902 bytes
+* live Type0 object 72 のまま
+* live FontFile2 object 75 のまま
+* font program 数が5個のまま
+* 独立検証ログの BIZ UD明朝 subset の `/Length1` が 417,824 bytes のまま
+  (1回目から **変化していない**)
 
-2回目の増分が **わずか +902 bytes** だったのは、修正前の「別系列を
-まるごと作り直す」動作 (+186,543 bytes) とは対照的で、既存 subset へ
-2 glyph (た・い) を追加しただけの、本来あるべき差分に近い増分になった
-ことを裏付けている (§10 のとおり、baseline table 込みの subset を毎回
-丸ごと再 deflate する設計のため、増分は必ずしも新規 glyph のみのコストに
-一致するとは限らないが、今回のケースでは非常に小さく収まった)。
+という一連の観測結果は、**「fallback font を経由せずに置換できたので、
+そもそも subset を触っていない」ことの証拠**であり、「既存 subset へ
+`た`・`い` を追加できた」証拠には全くなっていなかった。検証スクリプトが
+`round2Check.allowed` だけを見て `round2Check.mode` を確認していなかった
+ため、この false positive を検出できなかった。
 
-**独立検証 (item 19、全項目 success)**:
+**修正内容 (`scripts/verify-real-pdf-edit.js`):**
 
-* **pdfminer.six**（座標比較）: `令和 → しょ` の直後に続く `8年度` の描画位置が
-  `dx=0.0000 dy=0.0000`（tolerance 1.0）と、完全に不動であることを確認。
-* **qpdf `--check`**: 元ファイル・1回目 save 後・2回目 save 後のいずれも
-  exit code 0（構造エラーなし）。
-* **Chromium 自身の PDF viewer**: 1回目・2回目とも編集後ファイルを
-  エラーなく開けることを確認（page error 0）。
-* **fontTools (`checkChecksums=2`, strict) / FreeType**: 1回目・2回目
-  save 後、いずれも **全 5 font program**（`22550.pdf` が元々持っていた
-  4 font + 今回の BIZ UD明朝 subset 1つ、object 番号は共通）を独立に
-  checksum 検証、すべて通過。「5個のまま変わらない」こと自体が、
-  2回目の編集で別 font resource が追加されなかったことの証拠になっている。
-* **MuPDF (PyMuPDF)**: 1回目 save 後は `"しょ8 年度\n...令和8 年8 月\n"`、
-  2回目 save 後は `"しょ8 年度\n...たい8 年8 月\n"` を正しく抽出。
-  **1回目の置換 (しょ) が2回目の save でも壊れずに残り**、かつ2回目の
-  置換 (たい、別の元「令和8 年8 月」箇所) も同時に正しく描画されている
-  ことを、engine と無関係な実装 (MuPDF) で確認した。
+* 2回目の置換候補を固定文字列ではなく、**preflight で選ぶ**方式に変更した。
+  1回目とは別の残存 `令和` 出現箇所それぞれに対し、候補文字列 (CLI 指定の
+  ヒント文字列に加え、`ゐゑ`・`麒麟`・`檸檬`・`蜥蜴`・`鴛鴦`・`薔薇`・`躑躅`
+  等、現代の行政文書には通常現れない仮名・漢字) を順に
+  `checkTextMatchReplacement()` へ渡し、**`allowed` かつ `mode` が
+  `fallback-font`/`fallback-font-partial`/`fallback-font-multi-run` の
+  いずれかで始まる**組み合わせを実際に見つけてから採用するようにした。
+  該当する組み合わせが1つも見つからない場合は、成功扱いにせず `FAIL` して
+  終了する。
+* 2回目の置換を実行した直後 (save 前) に `diagnoseFallbackFontEmbedding()`
+  で `embedding.mode === "subset"` であること、かつ2回目の subset バイト数が
+  **1回目より厳密に大きい**ことをその場で assert するようにした。
+* save 後、live な `/FontFile2` object の `/Length1` 自体が1回目の subset
+  サイズより厳密に大きいことも直接確認するようにした (object 番号が同じ
+  だけでは、中身が変わっていない可能性を排除できないため)。
 
-以上により、「reopen 後に glyph 集合を union して、別 font resource として
-重複埋め込みしない」という最重要要件を、実 `22550.pdf` に対して object 番号
-レベルで確認できた。
+修正後のローカル検証 (合成 fixture で、意図的に「たい」を文書自身の font
+へ追加して、実 `22550.pdf` と同じ状況を再現): preflight が正しく `たい`
+を** skip し**、`ゐゑ` を選んで fallback 経由での2回目編集に成功することを
+確認した (`subset grew from 417620 to 418244 bytes (+624)`)。実
+`22550.pdf` に対する最終的な再実行結果は、次のセクションに追記する。
 
 ## 8. bundle size
 
@@ -391,13 +391,30 @@ MuPDF page text: "しょ8年度\nたい8年度\n令和8年度\n"
 
 ## 11. Go / No-Go
 
-**Go (v0.6.0 候補)。** PR レビューで、初回実装が「save → reopen → 別箇所への
-追加編集で、既存 subset を正しく拡張し、別 font resource として重複埋め込みしない」
-という最重要要件を実際には満たしていなかったことが判明した (この修正がなければ
-**No-Go** だった)。修正後、実 `22550.pdf` に対する再検証
-([run 34011896819](https://github.com/YanTKYS/idontlovepdf-engine/actions/runs/34011896819))
-で、live な Type0/FontFile2 object 番号が2回の save で同一であること
-(重複埋め込みされていないこと) を object 番号レベルで確認した。
+**実装 (src/) は Go 相当だが、実 `22550.pdf` での save → reopen → 別箇所
+subset 拡張の実地検証は再実行待ち (このドキュメント時点)。**
+
+PR レビューで、初回実装が「save → reopen → 別箇所への追加編集で、既存
+subset を正しく拡張し、別 font resource として重複埋め込みしない」という
+最重要要件を実際には満たしていなかったことが判明し、修正した (この修正が
+なければ **No-Go**、§save → reopen → glyph 追加参照)。
+
+その修正の実 `22550.pdf` 上での検証も、**2度目の PR レビューで別の false
+positive だったと指摘された**: 検証スクリプトの2回目編集が
+`checkTextMatchReplacement()` の結果 `mode` を確認しておらず、`令和 → たい`
+が実際には `22550.pdf` 自身の font で書けてしまい (`mode: "same-length"`)、
+fallback font を一切経由していなかった。object 番号が同一だった・font
+program 数が5個のままだった等の観測は、この場合「そもそも subset を
+拡張する処理が走っていない」ことの帰結であり、拡張が成功した証拠には
+なっていなかった (§前セクション参照)。
+
+検証スクリプトを、実際に fallback 経路 (`mode` が `fallback-font` で
+始まる) に入る候補文字列を preflight で選ぶよう修正し、ローカルの合成
+fixture (意図的に「たい」を文書自身の font へ追加し、実 `22550.pdf` と
+同じ状況を再現したもの) では、preflight が正しく `たい` を skip して
+`ゐゑ` を選び、subset が実際に拡張されることを確認した。**実
+`22550.pdf` に対するこの修正版検証スクリプトでの最終確認は、次回の
+GitHub Actions 実行結果を待って追記する。**
 
 * BIZ UDゴシック/明朝ともに subset 生成成功、GID 不変、composite 依存 (diamond)
   を正しく解決し、真の循環参照は `FONT_SUBSET_INVALID` として拒否する。
@@ -406,13 +423,13 @@ MuPDF page text: "しょ8年度\nたい8年度\n令和8年度\n"
   実装バグも1件発見・修正した)。
 * save → reopen → **別箇所への** glyph 追加で、最初に書いた fallback 文字を
   壊さず、live な Type0/FontFile2 object 番号が2回の save で同一である
-  (別 font resource として重複埋め込みしていない) ことを、修正後のコードに
-  対して直接検証した -- 合成 fixture テスト (`test/fallback-font.test.js`、
-  修正前のコードに対しては実際に失敗することも確認済み)、ローカルの
-  複数箇所 fixture、そして **実 `22550.pdf` そのもの** (1回目 +186,441 bytes、
-  2回目は既存 subset への追加のみで +902 bytes、両箇所とも fontTools/FreeType/
-  MuPDF で正しく検証) の3段階で確認した。
+  (別 font resource として重複埋め込みしていない) ことを、合成 fixture
+  テスト (`test/fallback-font.test.js`、修正前のコードに対しては実際に
+  失敗することも確認済み) で直接検証した。**実 `22550.pdf` でのこの主張の
+  最終確認は上記のとおり再実行待ち。**
 * Serif/Sans 双方が独立して subset 化され、v0.5.1 の自動選択・fail-closed 安全性
   (`FALLBACK_LAYOUT_UNSUPPORTED` 等) は無変更。
 * bundle size 増加は +13.9KB (+2.6%) と小さく、新規外部依存もなし。
-* 削減率は実測で 91〜95% 前後 (目標の80%を大きく上回る、1回目 save 単体の値)。
+* 削減率は実測で 91〜95% 前後 (目標の80%を大きく上回る、1回目 save 単体の値、
+  これは fallback 経路が確実に使われた実測であり、今回の false positive の
+  影響を受けていない)。
